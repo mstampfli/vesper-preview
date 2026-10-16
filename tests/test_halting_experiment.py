@@ -35,6 +35,7 @@ from vesper.synthetic import (
     BACKS,
     CLASSES,
     HOP_QUERIES,
+    MIX_SCHEDULES,
     READ_POSITION,
     SEQUENCE_TOKENS,
     TERMINAL_MIX,
@@ -308,13 +309,41 @@ def test_a_run_writes_its_record_once(tmp_path: Path) -> None:
     assert record["eval_sequences"] == 2
     assert (record["eval_batches"], record["eval_size"]) == (1, 2)
     assert record["eval_split"] == "validation"
+    # the default mix recipe, named and spelled out, so a report binds gates to what ran
+    assert record["mix_schedule"] == "v1"
+    assert record["mix_stages"] == [[s, list(m)] for s, m in MIX_SCHEDULES["v1"]]
     assert result["summary"] == record["summary"]
     with pytest.raises(FileExistsError):
         _ = run(CONFIG, "fixed", 0, out, steps=1, eval_batches=1, eval_size=2)
-    # an unknown split is refused before a run directory exists
+    # an unknown split or mix is refused before a run directory exists
     with pytest.raises(ValueError, match="split must be one of"):
         _ = run(CONFIG, "fixed", 0, tmp_path / "other", steps=1, eval_split="test")
+    with pytest.raises(ValueError, match="unknown mix schedule"):
+        _ = run(CONFIG, "fixed", 0, tmp_path / "other", steps=1, mix="v3")
     assert not (tmp_path / "other").exists()
+
+
+def test_a_run_trains_and_records_the_named_mix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the stages differ only from update 1000 on, so the driver's calls are what is checked:
+    # every step draws its batch under the run's named recipe, and the record says which
+    calls: list[tuple[int, str]] = []
+
+    def spy(step: int, schedule: str = "v1") -> tuple[float, ...]:
+        calls.append((step, schedule))
+        return hop_mix(step, schedule)
+
+    monkeypatch.setattr("vesper.halting_experiment.hop_mix", spy)
+    out = tmp_path / "slow"
+    result = run(CONFIG, "fixed", 0, out, steps=3, eval_batches=1, eval_size=2, mix="v2-slow")
+    assert calls == [(0, "v2-slow"), (1, "v2-slow"), (2, "v2-slow")]
+    assert result["mix_schedule"] == "v2-slow"
+    assert result["mix_stages"] == [
+        [0, [0.7, 0.1, 0.1, 0.1]],
+        [8000, [0.4, 0.3, 0.15, 0.15]],
+        [16000, [0.25, 0.25, 0.25, 0.25]],
+    ]
 
 
 def test_weight_snapshots_are_the_weights_after_their_update(tmp_path: Path) -> None:

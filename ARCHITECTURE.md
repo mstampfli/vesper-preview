@@ -35,7 +35,9 @@ protocol is docs/registry.md.
       synthetic.py   the halting experiment's stage-1 task: per-sequence graphs whose useful
                      depth differs by token (hops, copies, a register read beyond the window)
       halting_experiment.py  the stage-1 driver (python -m vesper.halting_experiment): one
-                     condition and seed trained on the CPU, evaluated under every state policy
+                     condition and seed trained on the CPU or on CUDA (fused scan, optionally
+                     one captured step replayed), evaluated on the CPU under every state policy
+      graphs.py      one training step captured as a CUDA graph and replayed (CapturedStep)
       halting_report.py  the stage-1 report (python -m vesper.halting_report): result records
                      pooled per condition into one Markdown page with the plan's verdicts
       tokenizer.py   byte-level BPE training under a named pre-tokenization rule (words-v1 the
@@ -75,7 +77,8 @@ protocol is docs/registry.md.
     docs/            spec.md (design), registry.md (contracts and status), threat-model.md,
                      PRIMITIVES.md, reviews/ (dated review records with their outcomes)
     gate.sh          the build gate; CI runs exactly this file
-    kernels/         empty; Triton kernels land here and are tested against vesper/recurrence.py
+    vesper/kernels/  delta_scan.py: the fused CUDA scan (fla-core's Triton kernels, gpu extra),
+                     tested against vesper/recurrence.py; chosen per run by column.set_scan
 
 Not yet written (rows marked "specified" in docs/registry.md): retrieval, ledger, dusk, the
 rest of the evaluation suite (`eval/run_all.py`), the int4 state cast at inference, the
@@ -91,11 +94,13 @@ bounded-cost resume (`Mixer.restore`); docs/reviews/2026-10-15-training-loop.md,
     config.py  ->  (nothing in vesper)        reads YAML, produces frozen dataclasses
     contracts.py, keys.py -> (nothing in vesper)
     recurrence.py, modulator.py, quant.py, attention.py, ffn.py, embedding.py -> contracts.py
-    column.py -> recurrence, attention, ffn, contracts;  exits.py -> contracts;  loop.py ->
+    column.py -> recurrence, kernels, attention, ffn, contracts;  kernels -> contracts;
+    graphs.py -> contracts;  exits.py -> contracts;  loop.py ->
     column, exits;  model.py -> loop, exits, embedding, learning, config (the one compute
     module that reads the config, to build itself)
-    synthetic.py -> data;  halting_experiment.py -> config, exits, learning, loop, model,
-    provenance, synthetic, train (optimizer, schedule, head freeze);  halting_report.py ->
+    synthetic.py -> data;  halting_experiment.py -> column (scan), config, data, exits, graphs,
+    learning, loop, model, provenance, synthetic, train (optimizer, schedule, head freeze);
+    halting_report.py ->
     config, halting_experiment (summarize), synthetic
     tokenizer.py -> (nothing in vesper);  data.py -> contracts
     corpus.py -> data, keys, tokenizer;  books.py -> (nothing in vesper)

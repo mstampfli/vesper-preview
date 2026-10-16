@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from vesper.contracts import ContractError, Dims, check_shape
+from vesper.contracts import ContractError, Dims, check_shape, require
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,9 +199,9 @@ class WindowedAttention(nn.Module):
         dims: Dims = {}
         check_shape("x", x, ("b", "n", "d"), dims)
         check_shape("pos", pos, ("b", "n"), dims, dtype=torch.long)
-        if pos.shape[1] > 1 and not bool((pos[:, 1:] - pos[:, :-1] == 1).all().item()):
-            msg = "pos: positions must be consecutive within a chunk"
-            raise ContractError(msg)
+        if pos.shape[1] > 1:
+            consecutive = (pos[:, 1:] - pos[:, :-1] == 1).all()
+            require(consecutive, "pos: positions must be consecutive within a chunk")
         b, n = x.shape[0], x.shape[1]
         q = F.linear(x, self.w_q).view(b, n, self.heads, self.head_dim)
         k = F.linear(x, self.w_k).view(b, n, self.kv_heads, self.head_dim)

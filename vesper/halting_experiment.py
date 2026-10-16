@@ -4,6 +4,11 @@ Plan: docs/reviews/2026-10-15-halting-experiment-plan.md (stage 1); task: ``vesp
 
     python -m vesper.halting_experiment --condition fixed --seed 0 --out RUN_DIR \
         [--config configs/halting-stage1.yaml] [--steps N] [--beta 0.1] [--eval-batches 8]
+        [--mix v1|v2-slow] [--device cpu|cuda] [--scan reference|fused] [--cuda-graph]
+
+Training runs on ``--device`` with the recurrent ``--scan``; ``--cuda-graph`` (on CUDA)
+captures one step and replays it (``vesper.graphs``). Probes and the evaluation always run on
+a CPU copy with the reference scan.
 
 Conditions (the plan's table): ``act`` (A: ACT with its mixture readout and ponder cost, the
 trainer's own phase schedule and head freeze, its copy-forward state policy), ``fixed`` (B:
@@ -45,22 +50,28 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
 import torch
 from torch import Tensor, nn
 
-from vesper.column import Column
+from vesper.column import SCAN_IMPLS, Column, check_scan, scan_of, set_scan
 from vesper.config import VesperConfig, parse_bytes
+from vesper.data import Chunk
 from vesper.exits import exit_log_probs, hazard_cdf_exits, hazard_logits
+from vesper.graphs import CapturedStep, side_stream
 from vesper.learning import LossWeights
 from vesper.loop import CdfRule, DenseRule, ExitRule, TraceRule
 from vesper.model import Vesper
 from vesper.provenance import environment, write_json
 from vesper.synthetic import (
     CLASSES,
+    DEFAULT_MIX,
     GAP,
+    MIX_NAMES,
+    MIX_SCHEDULES,
     READ_POSITION,
     REGISTER_POSITION,
     ROLES,
@@ -72,7 +83,14 @@ from vesper.synthetic import (
     generator_for,
     hop_mix,
 )
-from vesper.train import optimizer, phase_schedule, set_halting, set_learning_rate, total_steps
+from vesper.train import (
+    Phase,
+    optimizer,
+    phase_schedule,
+    set_halting,
+    set_learning_rate,
+    total_steps,
+)
 
 CONDITIONS = ("act", "fixed", "local", "aggregate")  # the plan's A, B, C, D
 Q_GRID = tuple(k / 10 for k in range(1, 11))
@@ -85,6 +103,7 @@ WEIGHTS_EVERY = 1000  # updates between diagnostic weight snapshots
 SNAPSHOT = "config.yaml"
 EVAL_BATCH = 32  # 32 batches of 32: the probe's 1024 fixed validation episodes
 CPU = torch.device("cpu")
+DEVICES = ("cpu", "cuda")
 
 RuleFor = Callable[[int, int], ExitRule | None]
 
@@ -139,36 +158,245 @@ def train_step(
     ep: Episodes,
     step: int,
 ) -> dict[str, object]:
-    """One optimizer step on one batch; returns the step's record."""
-    c = ep.chunk
-    b = int(c.tokens.shape[0])
-    phase = phase_schedule(step * b * SEQUENCE_TOKENS, step, cfg)
-    states = model.init_states(b, torch.float32, CPU)
+    """One optimizer step on one batch, eagerly, on the model's device; returns its record."""
+    c = _on(ep.chunk, _device_of(model))
+    phase = phase_schedule(step * int(c.tokens.shape[0]) * SEQUENCE_TOKENS, step, cfg)
+    set_learning_rate(opt, phase.lr)
+    return _record(step, phase.lr, _update(model, opt, cfg, condition, beta, c, phase), c)
+
+
+@dataclass(frozen=True, slots=True)
+class StepOutputs:
+    """What one update leaves on the device; ``_record`` reads it after the step."""
+
+    loss: Tensor
+    grad_norm: Tensor
+    n_iters: Tensor
+    parts: dict[str, Tensor]
+
+
+def _update(  # noqa: PLR0913
+    model: Vesper,
+    opt: torch.optim.AdamW,
+    cfg: VesperConfig,
+    condition: str,
+    beta: float,
+    chunk: Chunk,
+    phase: Phase,
+    *,
+    lambda_h: Tensor | None = None,
+) -> StepOutputs:
+    """Forward, objective, backward, clipping and the optimizer's step, with no host read-back.
+
+    The one update both training paths run: eagerly (``train_step``) and captured as a CUDA
+    graph (``GraphedTraining``). The learning rate is set before it. For B-D nothing here
+    depends on the step but the batch; ``act`` also reads ``phase``: its head freeze and
+    ``T_max`` are fixed within a capture (``_signature``), and its ponder weight is read from
+    ``lambda_h``, a device tensor filled before each replay, when one is given (else the
+    phase's float, eagerly).
+    """
+    states = model.init_states(int(chunk.tokens.shape[0]), torch.float32, _device_of(model))
     if condition == "act":
         set_halting(model, phase)
-        result = model.run(c.tokens, c.pos, states, None, phase.t_max)
-        weights = LossWeights(lambda_h=phase.lambda_h, lambda_g=cfg.learning.lambda_g)
-        loss, parts = model.objective(c, result, cfg, weights)
+        result = model.run(chunk.tokens, chunk.pos, states, None, phase.t_max)
+        ponder_weight = phase.lambda_h if lambda_h is None else lambda_h
+        weights = LossWeights(lambda_h=ponder_weight, lambda_g=cfg.learning.lambda_g)
+        loss, parts = model.objective(chunk, result, cfg, weights)
     else:
-        result = model.run(c.tokens, c.pos, states, exit_rule=DenseRule())
-        loss, parts = model.all_pass_objective(c, result, condition=condition, beta=beta)
+        result = model.run(chunk.tokens, chunk.pos, states, exit_rule=DenseRule())
+        loss, parts = model.all_pass_objective(chunk, result, condition=condition, beta=beta)
     opt.zero_grad(set_to_none=True)
     torch.autograd.backward([loss])
     parameters = [p for p in model.parameters() if p.requires_grad]
-    grad_norm = float(nn.utils.clip_grad_norm_(parameters, cfg.optimizer.grad_clip).item())
-    set_learning_rate(opt, phase.lr)
+    grad_norm = nn.utils.clip_grad_norm_(parameters, cfg.optimizer.grad_clip)
     # the optimizer's step is untyped in torch; its result (a closure's loss) is not used here
     _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
+    return StepOutputs(loss.detach(), grad_norm.detach(), result.n_iters, parts)
+
+
+def _record(step: int, lr: float, out: StepOutputs, chunk: Chunk) -> dict[str, object]:
+    """The step's log record, read from its outputs after the step (the only host read-back)."""
+    mask = chunk.loss_mask.to(out.n_iters.device)
     record: dict[str, object] = {
         "step": step,
-        "loss": float(loss.item()),
-        "lr": phase.lr,
-        "grad_norm": grad_norm,
-        "loss_depth": float(result.n_iters[c.loss_mask].float().mean().item()),
+        "loss": float(out.loss.item()),
+        "lr": lr,
+        "grad_norm": float(out.grad_norm.item()),
+        "loss_depth": float(out.n_iters[mask].float().mean().item()),
     }
-    for name, value in parts.items():
+    for name, value in out.parts.items():
         record[name] = [float(v) for v in value.unbind()] if value.dim() else float(value.item())
     return record
+
+
+GRAPH_WARM_STEPS = 3  # eager steps on a side stream before the capture (lazy init, autotuning)
+
+
+def _device_of(model: nn.Module) -> torch.device:
+    return next(model.parameters()).device
+
+
+def _check_backend(device: str, scan: str, condition: str, *, cuda_graph: bool) -> torch.device:
+    """The training device, after checking the device, scan and capture choices together.
+
+    Raises:
+        ValueError: on an unknown condition, a device outside ``DEVICES``, a scan it cannot
+            run, or ``cuda_graph`` off CUDA.
+    """
+    if condition not in CONDITIONS:
+        msg = f"condition must be one of {CONDITIONS}, got {condition!r}"
+        raise ValueError(msg)
+    if device not in DEVICES:
+        msg = f"device must be one of {DEVICES}, got {device!r}"
+        raise ValueError(msg)
+    target = torch.device(device)
+    _ = check_scan(scan, target)
+    if cuda_graph and target.type != "cuda":
+        msg = f"cuda_graph needs device cuda, got {device}"
+        raise ValueError(msg)
+    return target
+
+
+def _cpu_state(model: nn.Module) -> dict[str, Tensor]:
+    """The model's weights as CPU tensors, whatever device it trains on (portable snapshots)."""
+    state = cast("dict[str, Tensor]", model.state_dict())
+    return {name: tensor.detach().cpu() for name, tensor in state.items()}
+
+
+def _evaluation_model(model: Vesper) -> Vesper:
+    """The model as every evaluation sees it: on the CPU with the reference scan.
+
+    A CPU model with the reference scan is returned itself (CPU runs evaluate exactly as
+    before); any other is copied, so training continues untouched on its device.
+    """
+    if _device_of(model).type == "cpu" and scan_of(model) == "reference":
+        return model
+    copy_ = copy.deepcopy(model).cpu()
+    _ = set_scan(copy_, "reference")
+    return copy_
+
+
+def _tensors(chunk: Chunk) -> list[Tensor]:
+    """The chunk's tensors in ``CHUNK_TENSORS`` order (a captured step's static inputs)."""
+    c = chunk
+    return [c.tokens, c.targets, c.valid, c.doc_start, c.segment, c.loss_mask, c.pos]
+
+
+def _mapped(chunk: Chunk, f: Callable[[Tensor], Tensor]) -> Chunk:
+    """``chunk`` with ``f`` applied to each of its tensors; the document lists are kept."""
+    tokens, targets, valid, doc_start, segment, loss_mask, pos = (f(t) for t in _tensors(chunk))
+    return replace(
+        chunk,
+        tokens=tokens,
+        targets=targets,
+        valid=valid,
+        doc_start=doc_start,
+        segment=segment,
+        loss_mask=loss_mask,
+        pos=pos,
+    )
+
+
+def _on(chunk: Chunk, device: torch.device) -> Chunk:
+    """``chunk`` with its tensors on ``device`` (the chunk itself on its own device)."""
+    if chunk.tokens.device == device:
+        return chunk
+    return _mapped(chunk, lambda t: t.to(device))
+
+
+def _signature(condition: str, phase: Phase) -> tuple[bool, int] | None:
+    """What a capture of ``condition``'s update fixes besides the batch, rate and ponder weight.
+
+    B-D: nothing (their update reads the batch only). ``act``: the head freeze, which decides
+    which parameters train, and the pass count; a new signature needs a new capture.
+    """
+    return (phase.halting_frozen, phase.t_max) if condition == "act" else None
+
+
+class GraphedTraining:
+    """Training steps on CUDA as captured graphs (``vesper.graphs``), every condition.
+
+    One capture per signature (``_signature``): after a run starts and after every change of
+    signature, ``GRAPH_WARM_STEPS`` steps run eagerly on a side stream (real steps, logged as
+    any other; a newly trained parameter's optimizer state is created there, never during a
+    capture), then the next step captures ``_update`` over a static batch and every step with
+    the same signature copies its batch in and replays. The learning rate and the ponder weight
+    are device tensors filled before each step. The records are read from the same outputs as
+    the eager ones, so the log has one format.
+    """
+
+    def __init__(
+        self,
+        model: Vesper,
+        opt: torch.optim.AdamW,
+        cfg: VesperConfig,
+        condition: str,
+        beta: float,
+    ) -> None:
+        """Hold the run's model and optimizer; nothing is captured yet.
+
+        Raises:
+            ValueError: for a model off CUDA.
+        """
+        device = _device_of(model)
+        if device.type != "cuda":
+            msg = f"a captured step needs the model on CUDA, got {device}"
+            raise ValueError(msg)
+        self.model: Vesper = model
+        self.opt: torch.optim.AdamW = opt
+        self.cfg: VesperConfig = cfg
+        self.condition: str = condition
+        self.beta: float = beta
+        self.lambda_h: Tensor = torch.zeros((), device=device)  # read by a captured act update
+        self.captures: int = 0
+        self._captured: CapturedStep | None = None
+        self._static: Chunk | None = None
+        self._names: tuple[str, ...] = ()
+        self._signature: tuple[bool, int] | None = None
+        self._warm: int = 0  # eager steps since the run started or the signature changed
+
+    def step(self, ep: Episodes, step: int) -> dict[str, object]:
+        """One training step: eager while warming, then a replay; returns the step's record."""
+        device = _device_of(self.model)
+        phase = phase_schedule(
+            step * int(ep.chunk.tokens.shape[0]) * SEQUENCE_TOKENS, step, self.cfg
+        )
+        set_learning_rate(self.opt, phase.lr)
+        _ = self.lambda_h.fill_(phase.lambda_h)
+        signature = _signature(self.condition, phase)
+        if self._warm == 0 or signature != self._signature:
+            self._captured, self._static, self._signature = None, None, signature
+            self._warm = 0
+        if self._warm < GRAPH_WARM_STEPS:
+            self._warm += 1
+            c = _on(ep.chunk, device)
+            with side_stream():
+                out = _update(self.model, self.opt, self.cfg, self.condition, self.beta, c, phase)
+            return _record(step, phase.lr, out, c)
+        if self._captured is None or self._static is None:
+            static = _mapped(ep.chunk, lambda t: t.to(device, copy=True))  # owned buffers
+
+            def captured() -> list[Tensor]:
+                out = _update(
+                    self.model,
+                    self.opt,
+                    self.cfg,
+                    self.condition,
+                    self.beta,
+                    static,
+                    phase,
+                    lambda_h=self.lambda_h,
+                )
+                self._names = tuple(out.parts)
+                return [out.loss, out.grad_norm, out.n_iters, *out.parts.values()]
+
+            self._static = static
+            self._captured = CapturedStep(captured, _tensors(static))
+            self.captures += 1
+        values = self._captured.replay(_tensors(ep.chunk))
+        parts = dict(zip(self._names, values[3:], strict=True))
+        out = StepOutputs(values[0], values[1], values[2], parts)
+        return _record(step, phase.lr, out, self._static)
 
 
 def class_counts(model: Vesper, y: Tensor, ep: Episodes) -> Tensor:
@@ -620,8 +848,20 @@ def run(  # noqa: PLR0913
     log_every: int = 50,
     probe_every: int = 250,
     weights_every: int = WEIGHTS_EVERY,
+    mix: str = DEFAULT_MIX,
+    device: str = "cpu",
+    scan: str = "reference",
+    cuda_graph: bool = False,
 ) -> dict[str, object]:
     """Train one condition and seed, evaluate it, write the run directory ``out``.
+
+    Training runs on ``device`` with the recurrent ``scan`` (``vesper.column.set_scan``); on
+    CUDA the optimizer is the capturable one, and ``cuda_graph`` replays a captured step, one
+    capture per signature (``GraphedTraining``). The probes and the final evaluation always run
+    on a CPU copy with the reference scan, so every run's evaluation is computed the same way;
+    a CPU run evaluates
+    the model itself, as before. Weights are saved as CPU tensors. The result records
+    ``device``, ``scan`` (read back from the model) and ``cuda_graph``.
 
     ``out`` receives ``config.yaml`` (``SNAPSHOT``, recorded relative to ``result.json``: the
     config's bytes as read once, before the first step; the run parses and hashes exactly these
@@ -630,32 +870,46 @@ def run(  # noqa: PLR0913
     after every ``weights_every`` updates: the model's weights only, DIAGNOSTIC snapshots for
     learning curves and interventions, not recovery checkpoints (no optimizer, generator or
     progress state; an interrupted run starts again). The probe's gates use only the final result.
+    ``mix`` names the training mix recipe of ``MIX_SCHEDULES``; the result records the name and
+    its stages, so a report can bind its gates to the recipe that actually ran.
 
     Raises:
         FileExistsError: if ``out`` exists (a run directory is written once).
+        ValueError: on an unknown ``mix``, evaluation split or device, a scan the device cannot
+            run, or ``cuda_graph`` off CUDA or for ``act``, before anything is written.
     """
+    if mix not in MIX_SCHEDULES:
+        msg = f"unknown mix schedule {mix!r}; known: {sorted(MIX_SCHEDULES)}"
+        raise ValueError(msg)
+    target = _check_backend(device, scan, condition, cuda_graph=cuda_graph)
     evaluation_set = held_out(eval_batches, eval_size, eval_split)  # refuses a bad split first
     out.mkdir(parents=True, exist_ok=False)
     recipe = config.read_bytes()
     snapshot = out / SNAPSHOT
     _ = snapshot.write_bytes(recipe)
     cfg = parse_bytes(recipe, str(snapshot))
-    model = build(cfg, condition, seed)
+    model = build(cfg, condition, seed).to(target)
+    _ = set_scan(model, scan)
     planned = total_steps(cfg)
     steps = planned if steps is None else steps
-    opt = optimizer(model, cfg)
+    opt = optimizer(model, cfg, capturable=target.type == "cuda")
+    graphed = GraphedTraining(model, opt, cfg, condition, beta) if cuda_graph else None
     data = generator_for("train", seed)
     probe_set = episodes(generator_for("probe", 0), eval_size, "probe")
     started = time.monotonic()
     with (out / "train.jsonl").open("w", encoding="utf-8") as log:
         for step in range(steps):
-            ep = episodes(data, cfg.training.batch_chunks, f"train-{seed}-{step}", hop_mix(step))
-            record = train_step(model, opt, cfg, condition, beta, ep, step)
+            ep = episodes(
+                data, cfg.training.batch_chunks, f"train-{seed}-{step}", hop_mix(step, mix)
+            )
+            if graphed is None:
+                record = train_step(model, opt, cfg, condition, beta, ep, step)
+            else:
+                record = graphed.step(ep, step)
             if (step + 1) % weights_every == 0:
                 weights = out / "weights"
                 weights.mkdir(exist_ok=True)
-                state = cast("dict[str, Tensor]", model.state_dict())
-                torch.save(state, weights / f"after-{step + 1:05d}.pt")
+                torch.save(_cpu_state(model), weights / f"after-{step + 1:05d}.pt")
             last = step == steps - 1
             if step % log_every == 0 or last:
                 record["seconds"] = time.monotonic() - started
@@ -663,12 +917,12 @@ def run(  # noqa: PLR0913
                 labels = torch.bincount(ep.task[ep.task >= 0], minlength=len(CLASSES))
                 record["labels"] = [int(v) for v in labels.unbind()]
                 if step % probe_every == 0 or last:
-                    record["probe"] = _probe(model, condition, probe_set)
+                    record["probe"] = _probe(_evaluation_model(model), condition, probe_set)
                 _ = log.write(json.dumps(record) + "\n")
                 log.flush()
-    torch.save(cast("dict[str, Tensor]", model.state_dict()), out / "model.pt")
+    torch.save(_cpu_state(model), out / "model.pt")
     trained = time.monotonic()
-    evaluation = evaluate(model, condition, evaluation_set)
+    evaluation = evaluate(_evaluation_model(model), condition, evaluation_set)
     result: dict[str, object] = {
         "plan": "docs/reviews/2026-10-15-halting-experiment-plan.md",
         "condition": condition,
@@ -684,6 +938,11 @@ def run(  # noqa: PLR0913
         "eval_batches": eval_batches,
         "eval_size": eval_size,
         "eval_split": eval_split,
+        "mix_schedule": mix,
+        "mix_stages": [[start, list(stage)] for start, stage in MIX_SCHEDULES[mix]],
+        "device": device,
+        "scan": scan_of(model),
+        "cuda_graph": cuda_graph,
         "train_seconds": trained - started,
         "eval_seconds": time.monotonic() - trained,
         "environment": environment(),
@@ -705,7 +964,15 @@ def _parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--beta", type=float, default=0.1)
     _ = parser.add_argument("--eval-batches", type=int, default=32)
     _ = parser.add_argument("--eval-split", choices=EVAL_SPLITS, default="validation")
+    _ = parser.add_argument("--mix", choices=MIX_NAMES, default=DEFAULT_MIX)
     _ = parser.add_argument("--threads", type=int, default=4)
+    _ = parser.add_argument("--device", choices=DEVICES, default="cpu")
+    _ = parser.add_argument("--scan", choices=SCAN_IMPLS, default="reference")
+    _ = parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="B-D on CUDA: capture one training step as a CUDA graph and replay it",
+    )
     return parser
 
 
@@ -722,6 +989,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         beta=cast("float", args.beta),
         eval_batches=cast("int", args.eval_batches),
         eval_split=cast("str", args.eval_split),
+        mix=cast("str", args.mix),
+        device=cast("str", args.device),
+        scan=cast("str", args.scan),
+        cuda_graph=cast("bool", args.cuda_graph),
     )
     return 0
 

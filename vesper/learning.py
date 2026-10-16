@@ -29,9 +29,14 @@ Mode = Literal["e2e", "local"]
 
 @dataclass(frozen=True)
 class LossWeights:
-    """The objective's weights, which travel together from the configuration."""
+    """The objective's weights, which travel together from the configuration.
 
-    lambda_h: float
+    ``lambda_h`` may be a zero-dimensional device tensor: a captured training step reads the
+    ramp's current value from it, filled in place before each replay (a float would be frozen
+    into the graph at capture, ``vesper.halting_experiment.GraphedTraining``).
+    """
+
+    lambda_h: float | Tensor
     lambda_g: float
 
 

@@ -31,7 +31,14 @@ import torch
 from torch import Tensor, nn
 
 from vesper.attention import KVCache
-from vesper.column import ColumnState, check_column_state, map_state
+from vesper.column import (
+    SCAN_IMPLS,
+    ColumnState,
+    check_column_state,
+    map_state,
+    scan_of,
+    set_scan,
+)
 from vesper.config import VesperConfig, load
 from vesper.corpus import (
     FINALIZE_RULE,
@@ -280,25 +287,48 @@ def decays(name: str) -> bool:
     raise ValueError(msg)
 
 
-def optimizer(model: nn.Module, cfg: VesperConfig) -> torch.optim.AdamW:
-    """AdamW with two groups by role: decayed linear maps, undecayed gates, norms and ``u``."""
+def optimizer(
+    model: nn.Module, cfg: VesperConfig, *, capturable: bool = False
+) -> torch.optim.AdamW:
+    """AdamW with two groups by role: decayed linear maps, undecayed gates, norms and ``u``.
+
+    ``capturable`` builds the variant a CUDA graph can capture: its step keeps every count on
+    the device, and the learning rate is a device tensor shared by the groups, so a captured step
+    reads the rate ``set_learning_rate`` writes into it before each replay (a Python float would
+    be frozen into the graph at capture). Every parameter must then be on one CUDA device.
+
+    Raises:
+        ValueError: if ``capturable`` and a parameter is not on CUDA.
+    """
     decayed = [p for name, p in model.named_parameters() if decays(name)]
     plain = [p for name, p in model.named_parameters() if not decays(name)]
     o = cfg.optimizer
-    return torch.optim.AdamW(
-        [
-            {"params": decayed, "weight_decay": o.weight_decay},
-            {"params": plain, "weight_decay": 0.0},
-        ],
-        lr=o.peak_lr,
-        betas=(o.beta1, o.beta2),
-    )
+    groups = [
+        {"params": decayed, "weight_decay": o.weight_decay},
+        {"params": plain, "weight_decay": 0.0},
+    ]
+    if not capturable:
+        return torch.optim.AdamW(groups, lr=o.peak_lr, betas=(o.beta1, o.beta2))
+    devices = {p.device for p in model.parameters()}
+    if len(devices) != 1 or next(iter(devices)).type != "cuda":
+        msg = f"a capturable optimizer needs every parameter on one CUDA device, got {devices}"
+        raise ValueError(msg)
+    lr = torch.tensor(o.peak_lr, device=next(iter(devices)))
+    return torch.optim.AdamW(groups, lr=lr, betas=(o.beta1, o.beta2), capturable=True)
 
 
 def set_learning_rate(opt: torch.optim.AdamW, lr: float) -> None:
-    """Write the phase's learning rate into every parameter group."""
+    """Write the phase's learning rate into every parameter group.
+
+    A capturable optimizer's rate is a device tensor that a captured step reads: it is filled in
+    place, never replaced.
+    """
     for group in cast("list[dict[str, object]]", opt.param_groups):
-        group["lr"] = lr
+        current = group["lr"]
+        if isinstance(current, float):
+            group["lr"] = lr
+        else:  # the capturable optimizer's device tensor (``optimizer``)
+            _ = cast("Tensor", current).fill_(lr)
 
 
 def set_halting(model: Vesper, phase: Phase) -> None:
@@ -884,6 +914,12 @@ def _parser() -> argparse.ArgumentParser:
         default=1,
         help="compute the head and the loss over this many position slices: same objective",
     )
+    _ = parser.add_argument(
+        "--scan",
+        choices=SCAN_IMPLS,
+        default="reference",
+        help="the recurrent scan: the reference, or the fused CUDA kernel (bf16 intermediates)",
+    )
     return parser
 
 
@@ -902,8 +938,14 @@ def run(  # noqa: C901, PLR0913, PLR0915
     device: torch.device,
     recompute: bool = False,
     slices: int = 1,
+    scan: str = "reference",
 ) -> Path:
     """The run: streams, schedule, steps, log lines, checkpoints with evaluations.
+
+    ``scan`` chooses the recurrent scan for the whole run, evaluations included (``set_scan``):
+    "reference" or "fused" (CUDA and the gpu extra); the run line records what the model's
+    sublayers report (``scan_of``), and a resume may change it, since it is no part of the
+    checkpoint.
 
     The run ends when the token budget is reached, the optional step cap is hit or every stream
     is dry (the ``end`` line's ``reason``: ``budget``, ``steps``, ``exhausted``); the last
@@ -927,6 +969,12 @@ def run(  # noqa: C901, PLR0913, PLR0915
     recipe = recipe_of(parts, seed, cfg)
     identity = identity_of(tokenizer_path, config_path, finalization_receipt, recipe)
     layout = Layout(groups=t.batch_chunks // micro, slots=micro)
+    # every random choice goes through an explicit generator: the model's initialization here,
+    # the corpus order through the seed; nothing reads torch's global generator. The scan is
+    # chosen before anything is written, so a refused "fused" leaves no trace.
+    model = Vesper(cfg, torch.Generator().manual_seed(seed)).to(device)
+    _ = set_scan(model, scan)
+    opt = optimizer(model, cfg)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "log.jsonl"
     if resume is None and log_path.exists():
@@ -935,10 +983,6 @@ def run(  # noqa: C901, PLR0913, PLR0915
     tokenizer = Tokenizer.load(tokenizer_path)
     split = Split(finalization, t.held_out_fraction)
     held = Split(finalization, t.held_out_fraction, held_out=True)
-    # every random choice goes through an explicit generator: the model's initialization here,
-    # the corpus order through the seed; nothing reads torch's global generator
-    model = Vesper(cfg, torch.Generator().manual_seed(seed)).to(device)
-    opt = optimizer(model, cfg)
     counts: dict[str, int] = {}
     mixer = Mixer(parts, seed, tokenizer, split, tokens_emitted=counts)
     progress = Progress(
@@ -994,6 +1038,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
             "micro_chunks": micro,
             "recompute": recompute,
             "loss_slices": slices,
+            "scan": scan_of(model),
             "device": str(device),
             "resumed_from": str(resume) if resume else None,
             "environment": environment(),
@@ -1155,6 +1200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             micro=cast("int", args.micro_chunks),
             recompute=cast("bool", args.recompute),
             slices=cast("int", args.loss_slices),
+            scan=cast("str", args.scan),
             steps=cast("int | None", args.steps),
             resume=resume,
             seed=cast("int", args.seed),

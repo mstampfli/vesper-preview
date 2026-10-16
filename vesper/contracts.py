@@ -16,6 +16,10 @@ where the shape is bound, the dtype is checked, the range is checked and the wid
 Use it for: every token or target tensor entering ``vesper.embedding`` or ``vesper.learning``.
 Not for: positions (``int64`` by contract, ``check_shape`` with a dtype), float tensors, or any
 integer tensor without a vocabulary.
+
+PRIMITIVE ``require``: a value contract on device data that also holds inside a captured CUDA
+graph (a device-side assert there, ``ContractError`` everywhere else). Every data-dependent
+check on the training step's path goes through it; a bare ``.item()`` there ends a capture.
 """
 
 import torch
@@ -91,7 +95,37 @@ def check_ids(
     if tensor.dtype not in (torch.int32, torch.int64):
         msg = f"{name}: dtype must be int32 or int64, got {tensor.dtype}"
         raise ContractError(msg)
-    if tensor.numel() > 0 and bool(((tensor < 0) | (tensor >= vocab)).any().item()):
-        msg = f"{name}: every id must lie in [0, vocab={vocab})"
-        raise ContractError(msg)
+    if tensor.numel() > 0:
+        inside = ((tensor >= 0) & (tensor < vocab)).all()
+        require(inside, f"{name}: every id must lie in [0, vocab={vocab})")
     return tensor.long()
+
+
+def require(condition: torch.Tensor, message: str) -> None:
+    """Hold a value contract computed on the device: raise ``ContractError`` unless ``condition``.
+
+    PRIMITIVE value check. ``condition`` is a one-element bool tensor (``(x >= 0).all()``,
+    ``mask.any()``). Eagerly the check reads it back and raises ``ContractError(message)``. While
+    a CUDA graph is being captured on the current stream, a read-back is not allowed (it would
+    end the capture), so the check is recorded as a device-side assert instead: it runs on every
+    replay and a violation stops the process with ``message`` (a CUDA error, not an exception
+    the step can catch). The contract holds in both modes; only the way it fails differs.
+
+    Use it for: every data-dependent check on a tensor in the training step (id ranges,
+    consecutive positions, a non-empty loss mask, a dense forward). Not for: shapes and dtypes
+    (``check_shape``, which never touches the data) or checks on Python values.
+
+    Raises:
+        ContractError: eagerly, if ``condition`` is false; or if it is not a one-element bool.
+    """
+    if condition.dtype != torch.bool or condition.numel() != 1:
+        shape = tuple(condition.shape)
+        msg = f"require: the condition must be one bool, got {condition.dtype} {shape}"
+        raise ContractError(msg)
+    if condition.is_cuda and torch.cuda.is_current_stream_capturing():
+        # torch's only capturable assert is private; pinned by tests/test_contracts.py, which
+        # replays a captured check on good and on bad data
+        torch._assert_async(condition, message)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+        return
+    if not bool(condition.item()):
+        raise ContractError(message)

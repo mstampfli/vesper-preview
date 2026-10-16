@@ -16,7 +16,7 @@ and ``(K, V)`` enter every later pass, so the per-pass states stay dense).
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import override
+from typing import Literal, override
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -26,7 +26,16 @@ from vesper.attention import KVCache, WindowedAttention, kv_cache_empty
 from vesper.config import VesperConfig
 from vesper.contracts import ContractError, Dims, check_shape
 from vesper.ffn import FFN
+from vesper.kernels.delta_scan import (
+    INPUT_DTYPE,
+    STATE_DTYPE,
+    delta_scan_fused,
+    fused_scan_available,
+)
 from vesper.recurrence import delta_scan_chunked, normalize_keys, write_strength
+
+ScanImpl = Literal["reference", "fused"]
+SCAN_IMPLS: tuple[ScanImpl, ...] = ("reference", "fused")
 
 _RMS_EPS = 1e-6  # the regularizer inside the root of RMSNorm, not a tunable and not a floor
 _RMS_SCALE_FLOOR = 1e-3  # sqrt(_RMS_EPS): keeps eps / scale^2 finite for rows near zero
@@ -185,6 +194,9 @@ class RecurrentSublayer(nn.Module):
         self.heads: int = heads
         self.head_dim: int = head_dim
         self.block: int = shape.block
+        # which implementation runs the scan: the reference or the fused CUDA kernel (set_scan);
+        # module state like train/eval, never a parameter, never in a checkpoint
+        self.scan_impl: ScanImpl = "reference"
         std = 1.0 / math.sqrt(d)
         self.w_q: nn.Parameter = nn.Parameter(torch.randn(d, d, generator=generator) * std)
         self.w_k: nn.Parameter = nn.Parameter(torch.randn(d, d, generator=generator) * std)
@@ -261,7 +273,22 @@ class RecurrentSublayer(nn.Module):
         kept in that dtype across passes, and the reads return in the activation dtype for the
         output projection. The blocked form inverts a small triangular matrix, which torch does
         not do below float32 and which would lose the WY cancellation in half precision anyway.
+
+        With ``scan_impl`` "fused" the scan is ``delta_scan_fused`` instead: ``q, k, v, beta``
+        enter in bfloat16 (on the bf16 training path the projections already are), the state
+        stays float32 across passes as above, and the kernel's bfloat16 intermediates are the
+        precision it brings (vesper/kernels/delta_scan.py, measured there).
         """
+        if self.scan_impl == "fused":
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                o, new_state = delta_scan_fused(
+                    q.to(INPUT_DTYPE),
+                    k.to(INPUT_DTYPE),
+                    v.to(INPUT_DTYPE),
+                    beta.to(INPUT_DTYPE),
+                    state.to(STATE_DTYPE),
+                )
+            return F.linear(o.to(q.dtype).flatten(2), self.w_o), new_state
         compute = torch.promote_types(q.dtype, torch.float32)
         with torch.autocast(device_type=q.device.type, enabled=False):
             o, new_state = delta_scan_chunked(
@@ -297,6 +324,74 @@ class RecurrentSublayer(nn.Module):
         k, history_next = self.keys(z, history)
         y, state_next = self.scan(q, k, v, beta, state)
         return y, state_next, history_next
+
+
+def set_scan(model: nn.Module, impl: str) -> int:
+    """Choose the scan implementation of every ``RecurrentSublayer`` in ``model``.
+
+    One switch for the whole model, so no run mixes the two. "fused" needs a CUDA device and
+    fla-core, and every parameter of ``model`` on CUDA: it is refused here, before any step,
+    rather than failing at the first scan.
+
+    Returns:
+        The number of sublayers set.
+
+    Raises:
+        ValueError: if ``impl`` is not one of ``SCAN_IMPLS``, if ``model`` has no recurrent
+            sublayer, or if "fused" is asked where it cannot run.
+    """
+    if impl not in SCAN_IMPLS:
+        msg = f"scan must be one of {SCAN_IMPLS}, got {impl!r}"
+        raise ValueError(msg)
+    sublayers = [m for m in model.modules() if isinstance(m, RecurrentSublayer)]
+    if not sublayers:
+        msg = "the model has no recurrent sublayer to set"
+        raise ValueError(msg)
+    chosen: ScanImpl = "reference"
+    for device in sorted({p.device for p in model.parameters()}, key=str):
+        chosen = check_scan(impl, device)
+    for sublayer in sublayers:
+        sublayer.scan_impl = chosen
+    return len(sublayers)
+
+
+def check_scan(impl: str, device: torch.device) -> ScanImpl:
+    """The one check of a scan choice against the device it would run on; returns it typed.
+
+    ``set_scan`` checks every parameter's device with it; a driver calls it before writing
+    anything, with the device it is about to use.
+
+    Raises:
+        ValueError: if ``impl`` is not one of ``SCAN_IMPLS``, or "fused" off CUDA or without
+            fla-core.
+    """
+    if impl == "reference":
+        return "reference"
+    if impl != "fused":
+        msg = f"scan must be one of {SCAN_IMPLS}, got {impl!r}"
+        raise ValueError(msg)
+    if device.type != "cuda":
+        msg = f"the fused scan needs the model on CUDA, got {device}"
+        raise ValueError(msg)
+    if not fused_scan_available():
+        msg = "the fused scan needs a CUDA device and fla-core (the gpu extra)"
+        raise ValueError(msg)
+    return "fused"
+
+
+def scan_of(model: nn.Module) -> ScanImpl:
+    """The scan implementation every ``RecurrentSublayer`` in ``model`` uses, read from them.
+
+    Raises:
+        ValueError: if the model has no recurrent sublayer or its sublayers disagree.
+    """
+    impls: set[ScanImpl] = {
+        m.scan_impl for m in model.modules() if isinstance(m, RecurrentSublayer)
+    }
+    if len(impls) != 1:
+        msg = f"recurrent sublayers use {sorted(impls)} scan implementations, expected exactly one"
+        raise ValueError(msg)
+    return impls.pop()
 
 
 @dataclass(frozen=True)

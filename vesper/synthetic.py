@@ -42,6 +42,7 @@ only where an answer is scored.
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import Tensor
@@ -64,12 +65,18 @@ REGISTER_POSITION = 33
 READ_POSITION = SEQUENCE_TOKENS - 1
 TERMINAL_MIX = (0.25, 0.25, 0.25, 0.25)
 MIX_TOLERANCE = 1e-9  # a mix sums to 1 within this
-# the training mix of the free hop queries over k = 1..HOPS: (first step of the stage, mix)
-MIX_SCHEDULE = (
-    (0, (0.7, 0.1, 0.1, 0.1)),
-    (1000, (0.4, 0.3, 0.15, 0.15)),
-    (3000, TERMINAL_MIX),
-)
+# the training mixes of the free hop queries over k = 1..HOPS, a versioned recipe per name:
+# (first step of the stage, mix). A run records the name and its stages; a recipe never changes
+# under its name, a new one gets a new name.
+MIX_SCHEDULES: dict[str, tuple[tuple[int, tuple[float, ...]], ...]] = {
+    # the 12000-update learnability probe (1678173; docs/reviews/2026-10-15-retrieval-binding.md)
+    "v1": ((0, (0.7, 0.1, 0.1, 0.1)), (1000, (0.4, 0.3, 0.15, 0.15)), (3000, TERMINAL_MIX)),
+    # the one-column calibration (docs/reviews/2026-10-16-stage1-c1-recipe.md): the stages moved
+    # to the measured onsets of hop1 and hop2, 3500-6500 and 8000-10000 updates
+    "v2-slow": ((0, (0.7, 0.1, 0.1, 0.1)), (8000, (0.4, 0.3, 0.15, 0.15)), (16000, TERMINAL_MIX)),
+}
+MIX_NAMES: tuple[str, ...] = tuple(MIX_SCHEDULES.keys())
+DEFAULT_MIX = "v1"
 
 ROLES = (
     "definition",
@@ -109,16 +116,19 @@ def register_token(k: int) -> int:
     return READ + HOPS + BACKS + k
 
 
-def hop_mix(step: int) -> tuple[float, ...]:
-    """The training mix of the free hop queries at optimizer step ``step`` (``MIX_SCHEDULE``).
+def hop_mix(step: int, schedule: str = DEFAULT_MIX) -> tuple[float, ...]:
+    """The training mix of the free hop queries at ``step`` under a recipe of ``MIX_SCHEDULES``.
 
     Raises:
-        ValueError: if ``step`` is negative.
+        ValueError: if ``step`` is negative or ``schedule`` is not a recipe name.
     """
+    if schedule not in MIX_SCHEDULES:
+        msg = f"unknown mix schedule {schedule!r}; known: {sorted(MIX_SCHEDULES)}"
+        raise ValueError(msg)
     if step < 0:
         msg = f"step must be at least 0, got {step}"
         raise ValueError(msg)
-    return next(mix for start, mix in reversed(MIX_SCHEDULE) if step >= start)
+    return next(mix for start, mix in reversed(MIX_SCHEDULES[schedule]) if step >= start)
 
 
 @dataclass(frozen=True)
@@ -166,12 +176,15 @@ def episodes(
         msg = f"mix must be {HOPS} non-negative probabilities summing to 1, got {tuple(mix)}"
         raise ValueError(msg)
     n = SEQUENCE_TOKENS
-    tokens = torch.full((b, n), FILL, dtype=torch.int64)
-    targets = torch.zeros(b, n, dtype=torch.int64)
-    role = torch.full((b, n), ROLES.index("gap"), dtype=torch.int64)
-    task = torch.full((b, n), -1, dtype=torch.int64)
-    for s in range(b):
-        _draw(generator, weights, 1 + s % HOPS, tokens[s], targets[s], role[s], task[s])
+    rows = [_draw(generator, weights, 1 + s % HOPS) for s in range(b)]
+    token_rows: list[list[int]] = [r[0] for r in rows]
+    target_rows: list[list[int]] = [r[1] for r in rows]
+    role_rows: list[list[int]] = [r[2] for r in rows]
+    task_rows: list[list[int]] = [r[3] for r in rows]
+    tokens = torch.tensor(token_rows, dtype=torch.int64)
+    targets = torch.tensor(target_rows, dtype=torch.int64)
+    role = torch.tensor(role_rows, dtype=torch.int64)
+    task = torch.tensor(task_rows, dtype=torch.int64)
     loss_mask = task >= 0
     doc_start = torch.zeros(b, n, dtype=torch.bool)
     doc_start[:, 0] = True
@@ -189,31 +202,32 @@ def episodes(
     return Episodes(chunk=chunk, role=role, task=task)
 
 
-def _draw(
-    g: torch.Generator,
-    weights: Tensor,
-    k_reg: int,
-    tokens: Tensor,
-    targets: Tensor,
-    role: Tensor,
-    task: Tensor,
-) -> None:
-    """Fill one sequence's rows in place (the layout of the module docstring)."""
+Row = tuple[list[int], list[int], list[int], list[int]]
+_ROLE = {name: index for index, name in enumerate(ROLES)}
+_CLASS = {name: index for index, name in enumerate(CLASSES)}
+
+
+def _draw(g: torch.Generator, weights: Tensor, k_reg: int) -> Row:
+    """One sequence's rows (the layout of the module docstring): tokens, targets, role, task.
+
+    Built as Python lists and turned into tensors once per batch by ``episodes``: an element
+    write into a tensor costs a dispatch each. The draws from ``g`` are the same calls in the same
+    order as when the rows were tensors, so a seed gives the same batches (tests/test_synthetic.py
+    pins a digest of them).
+    """
+    n = SEQUENCE_TOKENS
+    tokens, targets = [FILL] * n, [0] * n
+    role, task = [_ROLE["gap"]] * n, [-1] * n
     nodes = _ints(torch.randperm(NODES, generator=g) + FIRST_NODE)
     cycle, pool = nodes[:CYCLE], nodes[CYCLE:]
-
-    def succ(i: int, k: int) -> int:
-        return cycle[(i + k) % CYCLE]
-
     for slot, i in enumerate(_ints(torch.randperm(CYCLE, generator=g))):
         at = 3 * slot
-        tokens[at], tokens[at + 1], tokens[at + 2] = cycle[i], succ(i, 1), SEP
-        role[at] = role[at + 1] = ROLES.index("definition")
-        role[at + 2] = ROLES.index("separator")
+        tokens[at : at + 3] = [cycle[i], cycle[(i + 1) % CYCLE], SEP]
+        role[at : at + 3] = [_ROLE["definition"], _ROLE["definition"], _ROLE["separator"]]
     i_reg = _below(g, CYCLE)
     tokens[REGISTER_POSITION - 1], tokens[REGISTER_POSITION] = register_token(k_reg), cycle[i_reg]
-    role[REGISTER_POSITION - 1] = ROLES.index("register_marker")
-    role[REGISTER_POSITION] = ROLES.index("register")
+    role[REGISTER_POSITION - 1] = _ROLE["register_marker"]
+    role[REGISTER_POSITION] = _ROLE["register"]
     free = HOP_QUERIES - HOPS
     drawn = _ints(torch.multinomial(weights, free, replacement=True, generator=g) + 1)
     depths: list[int] = list(range(1, HOPS + 1)) + drawn
@@ -225,29 +239,33 @@ def _draw(
         if kind == "hop":
             i = _below(g, CYCLE)
             tokens[at], tokens[at + 1] = hop_token(level), cycle[i]
-            role[at], role[at + 1] = ROLES.index("hop_marker"), ROLES.index("hop")
-            targets[at + 1] = succ(i, level)
-            task[at + 1] = CLASSES.index(f"hop{level}")
+            role[at], role[at + 1] = _ROLE["hop_marker"], _ROLE["hop"]
+            targets[at + 1] = cycle[(i + level) % CYCLE]
+            task[at + 1] = _CLASS[f"hop{level}"]
             at += 2
         else:
             content = [pool[_below(g, len(pool))] for _ in range(3)]
-            tokens[at], tokens[at + 1], tokens[at + 2] = content
+            tokens[at : at + 3] = content
             tokens[at + 3] = back_token(level)
-            role[at : at + 3] = ROLES.index("copy_content")
-            role[at + 3] = ROLES.index("back")
+            role[at : at + 3] = [_ROLE["copy_content"]] * 3
+            role[at + 3] = _ROLE["back"]
             targets[at + 3] = content[3 - level]
-            task[at + 3] = CLASSES.index(f"back{level}")
+            task[at + 3] = _CLASS[f"back{level}"]
             at += 4
-    role[at] = ROLES.index("fill")  # tokens[at] is already FILL
+    role[at] = _ROLE["fill"]  # tokens[at] is already FILL
     tokens[READ_POSITION] = READ
-    role[READ_POSITION] = ROLES.index("read")
-    targets[READ_POSITION] = succ(i_reg, k_reg)
-    task[READ_POSITION] = CLASSES.index(f"read{k_reg}")
+    role[READ_POSITION] = _ROLE["read"]
+    targets[READ_POSITION] = cycle[(i_reg + k_reg) % CYCLE]
+    task[READ_POSITION] = _CLASS[f"read{k_reg}"]
+    return tokens, targets, role, task
 
 
 def _ints(values: Tensor) -> list[int]:
-    """A 1-D integer tensor as Python ints (``tolist`` is untyped)."""
-    return [int(v.item()) for v in values.unbind()]
+    """A 1-D integer tensor as Python ints, in one call (``tolist`` is untyped, hence the cast)."""
+    if values.dim() != 1 or values.dtype.is_floating_point:
+        msg = f"_ints needs a 1-D integer tensor, got {values.dtype} {tuple(values.shape)}"
+        raise ValueError(msg)
+    return cast("list[int]", values.tolist())  # pyright: ignore[reportUnknownMemberType]
 
 
 def _below(g: torch.Generator, bound: int) -> int:

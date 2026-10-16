@@ -5,8 +5,10 @@ from the markers it sees, so a layout or target defect in the generator cannot a
 sharing the generator's own bookkeeping.
 """
 
+import hashlib
 from collections import Counter
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
@@ -16,11 +18,12 @@ from vesper.synthetic import (
     BACKS,
     CLASSES,
     CYCLE,
+    DEFAULT_MIX,
     FIRST_NODE,
     GAP,
     HOP_QUERIES,
     HOPS,
-    MIX_SCHEDULE,
+    MIX_SCHEDULES,
     READ,
     READ_POSITION,
     REGISTER_POSITION,
@@ -29,6 +32,7 @@ from vesper.synthetic import (
     SEQUENCE_TOKENS,
     TERMINAL_MIX,
     VOCAB,
+    _ints,  # pyright: ignore[reportPrivateUsage]
     back_token,
     episodes,
     generator_for,
@@ -124,16 +128,30 @@ def test_the_mix_sets_the_free_queries_and_every_depth_stays_mandatory() -> None
 
 
 def test_the_training_mix_follows_its_schedule() -> None:
-    assert hop_mix(0) == (0.7, 0.1, 0.1, 0.1)
+    # v1 is the default and unchanged: the 12000-update probe trained under it
+    assert hop_mix(0) == hop_mix(0, "v1") == (0.7, 0.1, 0.1, 0.1)
     assert hop_mix(999) == (0.7, 0.1, 0.1, 0.1)
     assert hop_mix(1000) == (0.4, 0.3, 0.15, 0.15)
     assert hop_mix(2999) == (0.4, 0.3, 0.15, 0.15)
     assert hop_mix(3000) == TERMINAL_MIX
     assert hop_mix(10**6) == TERMINAL_MIX
-    for _, mix in MIX_SCHEDULE:
-        assert sum(mix) == pytest.approx(1.0)
+    # v2-slow, the one-column calibration's recipe (maintainer B, 2026-10-16), at every stage
+    # boundary
+    assert hop_mix(7999, "v2-slow") == (0.7, 0.1, 0.1, 0.1)
+    assert hop_mix(8000, "v2-slow") == (0.4, 0.3, 0.15, 0.15)
+    assert hop_mix(15999, "v2-slow") == (0.4, 0.3, 0.15, 0.15)
+    assert hop_mix(16000, "v2-slow") == TERMINAL_MIX
+    assert hop_mix(35999, "v2-slow") == TERMINAL_MIX
+    for stages in MIX_SCHEDULES.values():
+        assert stages[0][0] == 0
+        assert [start for start, _ in stages] == sorted({start for start, _ in stages})
+        for _, mix in stages:
+            assert sum(mix) == pytest.approx(1.0)
+    assert DEFAULT_MIX == "v1"
     with pytest.raises(ValueError, match="at least 0"):
         _ = hop_mix(-1)
+    with pytest.raises(ValueError, match="unknown mix schedule"):
+        _ = hop_mix(0, "v3")
 
 
 def test_a_mix_that_is_not_a_distribution_is_refused() -> None:
@@ -238,3 +256,48 @@ def test_items_take_every_order() -> None:
 def test_a_batch_needs_a_sequence() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         _ = episodes(generator_for("test", 0), 0, "t")
+
+
+# The generator's output as of 07b39f2 (the recipe every stage-1 run so far trained on): batches
+# from three seeds, mixes and sizes, and the first validation batch. Any change to a draw, its
+# order or the layout changes this digest; a faster generator must reproduce it exactly.
+# (a sha256 of generated batches, not a secret)
+GENERATOR_DIGEST = (
+    "65c58dd3b172c1d6e2d477a8224455cc158b3bf917c70b283e326e33c99740a4"  # pragma: allowlist secret
+)
+
+
+def test_the_generator_reproduces_its_recorded_batches_exactly() -> None:
+    h = hashlib.sha256()
+    cases = [
+        ("train", 0, 32, "v2-slow", 0),
+        ("train", 0, 32, "v2-slow", 20000),
+        ("train", 3, 7, "v1", 500),
+    ]
+    for split, seed, b, mix, step in cases:
+        g = generator_for(split, seed)
+        for i in range(3):
+            ep = episodes(g, b, f"{split}-{i}", hop_mix(step + i, mix))
+            c = ep.chunk
+            tensors = (c.tokens, c.targets, c.valid, c.doc_start, c.segment, c.loss_mask, c.pos)
+            for t in (*tensors, ep.role, ep.task):
+                h.update(_record(t))
+            h.update(repr((c.doc_ids, c.spans)).encode())
+    ep = episodes(generator_for("validation", 0), 32, "validation-0", TERMINAL_MIX)
+    for t in (ep.chunk.tokens, ep.chunk.targets, ep.task):
+        h.update(_record(t))
+    assert h.hexdigest() == GENERATOR_DIGEST
+
+
+def _record(t: torch.Tensor) -> bytes:
+    """A tensor's dtype, shape and values as bytes, for the digest."""
+    values = cast("list[int]", t.flatten().long().tolist())  # pyright: ignore[reportUnknownMemberType]
+    return f"{t.dtype}{tuple(t.shape)}{values}".encode()
+
+
+def test_ints_takes_only_a_one_dimensional_integer_tensor() -> None:
+    assert _ints(torch.arange(3, 0, -1)) == [3, 2, 1]
+    with pytest.raises(ValueError, match="1-D integer"):
+        _ = _ints(torch.full((1,), 1.5))
+    with pytest.raises(ValueError, match="1-D integer"):
+        _ = _ints(torch.zeros(2, 2, dtype=torch.int64))

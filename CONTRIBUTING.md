@@ -53,6 +53,18 @@ computes the head and the loss over position slices instead of `[b, n, V]` float
 once. Both leave the objective and the gradients unchanged. The measured layouts are in
 docs/reviews/2026-10-15-training-loop.md, Measured; a number belongs to its layout.
 
+`--scan fused` (CUDA, `--extra gpu`) runs the recurrent scan in fla-core's Triton kernels instead
+of the PyTorch reference: the same equation, with bfloat16 intermediates (about 0.5 % relative,
+vesper/kernels/delta_scan.py); the run line records which scan ran. The reference stays the
+default and the truth every kernel test compares against.
+
+The stage-1 driver takes the same choice: `python -m vesper.halting_experiment ... --device cuda
+--scan fused --cuda-graph` trains any condition on the GPU with a captured step replayed, one
+capture per phase for ACT (vesper/graphs.py; equal to the eager GPU step, tested); probes and the evaluation run on a CPU copy with the
+reference scan. The result records `device`, `scan` and `cuda_graph`, and the report's gate
+protocols name their backend: the existing ones are CPU and reference, so a GPU run is not
+assessed under them until a protocol for it is agreed.
+
 An acquisition publishes one immutable generation per run under `ROOT/<kind>/gen-<stamp>/` and
 logs its pin; choosing it for the next run is a separate, explicit step, and the flat layout of
 the first runs is an explicit option, never inferred from what lies in a directory:

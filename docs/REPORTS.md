@@ -7,6 +7,87 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-16, 15:15Z: the small experiments train on the GPU, about ten times faster
+
+**What changed.** A stage-1 training step used to be thousands of tiny GPU jobs issued one by
+one from Python, so the GPU sat idle most of the time and one CPU core was faster. Now the whole
+step is recorded once as a CUDA graph and replayed with one command, for all four conditions
+(the adaptive-halting one is recorded once per training phase). The safety checks still run on
+every step, on the GPU itself; the loss works on fixed-size arrays; and the toy-data generator
+was rewritten to produce exactly the same data (pinned by a fingerprint of its output) in less
+than half the time. Recorded training equals normal GPU training in every logged number and
+every weight (tested). Not reviewed by maintainer B yet.
+
+**What it means for you.** Measured through the real experiment driver on the 5060 Ti: 26 to 34
+ms per step, against about 340 ms on one CPU core with the box idle. A 36,000-step run trains in
+about 20 minutes instead of about 3.5 hours (the final evaluation still runs on the CPU, so the
+total is longer; not yet measured at full size), and several runs can share the card. GPU runs
+round slightly differently from CPU runs (about 0.5 % inside the memory update), so the gate
+rules now name the hardware: a GPU run is never judged under a CPU recipe. The run maintainer B designed
+continues on the CPU as agreed.
+
+**What is next.** With the current run's result, a GPU version of the same recipe proposed to
+maintainer B for further stage-1 runs. Details: commits 07b39f2, ac73fe7, 11a60fb; vesper/graphs.py;
+docs/registry.md (graphs, contracts.require, halting_experiment rows).
+
+## 2026-10-16, 12:35Z: a fused GPU kernel for the memory, five times faster training steps
+
+**What changed.** The model's memory update (the delta-rule scan) can now run in a tuned GPU
+kernel from flash-linear-attention, an open-source library (MIT license), instead of our plain
+PyTorch version. It computes the same thing to about half a percent (the rounding of 16-bit
+numbers), for the outputs and for every gradient training needs, and the error does not grow
+with longer text. Our version stays the reference every test compares against. A run chooses
+it with `--scan fused`, and its log records which one ran. Not reviewed by maintainer B yet (their
+weekly budget is reserved for the stage-1 decision).
+
+**What it means for you.** Measured on the box's 5060 Ti:
+
+| | our scan | fused kernel |
+| --- | --- | --- |
+| the scan alone, forward and backward | 1x | 29 to 62x faster |
+| Vesper-S step, 2 x 4096 tokens, all 8 passes | 9.3 s | 1.8 s (5.2x) |
+| stage-1 step (tiny model), GPU | 0.45 s | 0.12 s |
+| stage-1 step, one CPU core | 0.32 s | |
+
+The earlier entry's "the GPU is slower than one CPU core" no longer holds: with the kernel the
+tiny model trains about 2.6 times faster per run on the GPU. Compiling the whole step on top
+added little (0.11 s) for stage 1 and made Vesper-S slower. On Vesper-S the card is now busy
+92 % of the step, so a faster card would speed it up nearly in proportion; the 5090 has about
+four times the 5060 Ti's memory bandwidth and compute on paper (not measured), and twice its
+memory, enough to skip the recomputation that costs about a third of the step here (without
+it the step does not fit in 16 GB). Training Vesper-S on its full 10 billion tokens at all 8
+passes would take about 25 days on this card at today's speed, an estimate from the measured
+step, fewer if the model learns to stop early.
+
+**What is next.** Stage 1 and the stage-2 pilot fit on this card; the 5090 question becomes
+real when the full Vesper-S run starts. Before that, the other half of the GPU time
+(element-wise work around the scan) can likely be fused too. Details: commit 0e2faa4,
+vesper/kernels/delta_scan.py, docs/registry.md (kernels row).
+
+## 2026-10-16, 12:00Z: extra passes help exactly where the work does not fit in one
+
+**What changed.** With the key filter the model now learns single lookups in the real task,
+but the 12,000-update probe still failed both gates: longer lookups came late or not at all, and
+the two-column model answered two-step lookups in its first pass, so extra passes added nothing.
+Two calibration runs explained it. Trained three times longer, the two-column model learned
+two-step lookups in three of four seeds, and the first gain from depth appeared only on a
+three-step lookup (46.5 % on pass 1 to 51.9 % on pass 8). With ONE column, every lookup the model
+learned needed one pass per step: two-step lookups went from 17.6 % on pass 1 to 93.7 % on pass 2,
+three-step from 20.5 % to 77.6 % on pass 3. Maintainer B reloaded the weights and recomputed every number,
+and found
+that this is a profile of these trained weights, not a proof of a bound; four-step lookups and
+most register questions are still not learned.
+
+**What it means for you.** For the first time the test contains questions that need more
+passes, so it can now ask whether the model learns to decide its own depth. That decision is
+not shown yet: these runs force every token through all passes. A faster GPU would not speed up
+this tiny model (a step on the box's GPU was slower than on one CPU core, all overhead).
+
+**What is next.** One bounded run under a frozen recipe (one column, a slower curriculum, two
+seeds, 36,000 updates, the same two gates), docs/reviews/2026-10-16-stage1-c1-recipe.md. If it
+fails, we stop and diagnose before adding time. Meanwhile the delta-rule kernel, which removes
+most of the per-step overhead and is needed for the real model anyway.
+
 ## 2026-10-15, 19:10Z: the first stage could not learn its lookups; a candidate fix
 
 **What changed.** The stage-1 task could not ask its question: after 16,000 steps in three

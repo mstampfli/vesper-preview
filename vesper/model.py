@@ -25,7 +25,7 @@ from vesper.column import (
     init_column_state,
 )
 from vesper.config import VesperConfig
-from vesper.contracts import ContractError
+from vesper.contracts import require
 from vesper.data import Chunk
 from vesper.embedding import TiedEmbedding
 from vesper.exits import (
@@ -156,21 +156,24 @@ class Vesper(nn.Module):
         if slices < 1:
             msg = f"slices must be at least 1, got {slices}"
             raise ValueError(msg)
-        mask = chunk.loss_mask.to(result.y.device)
-        if not bool(mask.any().item()):
-            msg = "objective: no position in the chunk carries a loss"
-            raise ContractError(msg)
-        selected = result.y[mask]
-        targets = chunk.targets.to(result.y.device)[mask]
-        count = int(targets.shape[0])
-        summed = torch.zeros((), dtype=torch.float32, device=result.y.device)
-        for start in range(0, count, -(-count // slices)):
-            end = min(start + -(-count // slices), count)
-            summed = summed + _slice_loss(self, selected[start:end], targets[start:end], slices)
+        device = result.y.device
+        mask = chunk.loss_mask.to(device)
+        require(mask.any(), "objective: no position in the chunk carries a loss")
+        # static shapes for a captured step, as in all_pass_objective: every position is scored,
+        # the rows and targets outside the mask are replaced before the head and the losses after
+        # it, so nothing outside the loss positions reaches the value or a gradient
+        rows, targets, keep = _loss_rows(result.y, chunk.targets.to(device), mask)
+        width = -(-rows.shape[0] // slices)
+        summed = torch.zeros((), dtype=torch.float32, device=device)
+        for start in range(0, rows.shape[0], width):
+            end = min(start + width, rows.shape[0])
+            ranged = (rows[start:end], targets[start:end], keep[start:end])
+            summed = summed + _slice_loss(self, *ranged, slices)
+        count = mask.sum()
         return wake_total(
             summed / count,
             weights=loss_weights(cfg) if weights is None else weights,
-            ponder=result.ponder[mask].mean(),
+            ponder=torch.where(mask, result.ponder, 0.0).sum() / count,
         )
 
     def all_pass_objective(
@@ -209,52 +212,54 @@ class Vesper(nn.Module):
             raise ValueError(msg)
         device = result.per_pass.device
         mask = chunk.loss_mask.to(device)
-        if not bool(mask.any().item()):
-            msg = "all_pass_objective: no position in the chunk carries a loss"
-            raise ContractError(msg)
+        require(mask.any(), "all_pass_objective: no position in the chunk carries a loss")
         t_max = result.per_pass.shape[0]
         # every real input, not only the scored ones: a context token that halted early would
         # have written copied-forward states the later supervised passes read (maintainer B's review
         # of 49c92cf, finding 2)
-        if not bool((result.n_iters[chunk.valid.to(device)] == t_max).all().item()):
-            msg = "all_pass_objective needs a dense forward: a real input halted early"
-            raise ContractError(msg)
-        targets = chunk.targets.to(device)[mask]
-        count = int(targets.shape[0])
-        width = -(-count // slices)
-        # each pass's loss positions selected once; the slices are views of that one selection
-        selected = [result.per_pass[t][mask] for t in range(t_max)]
+        dense = ((result.n_iters == t_max) | ~chunk.valid.to(device)).all()
+        require(dense, "all_pass_objective needs a dense forward: a real input halted early")
+        # Static shapes, so the step can be captured as a CUDA graph: every position is scored
+        # (a position without a loss gets target 0, a valid id) and the reductions below keep
+        # exactly the loss positions with where (vesper.exits). The values and gradients are the
+        # selected positions' alone, as when they were selected by the mask.
+        b, n = mask.shape[0], mask.shape[1]
+        passes, targets, _ = _loss_rows(result.per_pass, chunk.targets.to(device), mask)
+        width = -(-(b * n) // slices)
         losses = torch.stack(
             [
                 torch.cat(
                     [
                         _token_losses(self, rows[s : s + width], targets[s : s + width])
-                        for s in range(0, count, width)
+                        for s in range(0, b * n, width)
                     ]
                 )
-                for rows in selected
+                for rows in passes.unbind()
             ]
-        )  # [T, N], at least float32
+        ).view(t_max, b, n)  # at least float32
         if condition == "fixed":
-            learned = torch.zeros(t_max, count, dtype=torch.float32, device=device)
+            learned = torch.zeros(t_max, b, n, dtype=torch.float32, device=device)
         else:
             head = self.loop.halting_head()
-            learned = torch.stack([head.logit(rows[None], t)[0] for t, rows in enumerate(selected)])
-        log_p = exit_log_probs(hazard_logits(learned))[:, None, :]  # float64
-        everyone = torch.ones(1, count, dtype=torch.bool, device=device)
-        expected = expected_pass_loss(log_p, losses[:, None, :].to(log_p.dtype), everyone)
+            per_pass = passes.view(t_max, b, n, -1)  # the replaced rows: no gradient outside
+            learned = torch.stack([head.logit(per_pass[t], t) for t in range(t_max)])
+        log_p = exit_log_probs(hazard_logits(learned))  # [T, b, n], float64
+        expected = expected_pass_loss(log_p, losses.to(log_p.dtype), mask)
         if condition == "local":
-            kl = kl_uniform_local(log_p, everyone)
+            kl = kl_uniform_local(log_p, mask)
         elif condition == "aggregate":
-            kl = kl_uniform_aggregate(log_p, everyone)
+            kl = kl_uniform_aggregate(log_p, mask)
         else:
             kl = torch.zeros((), dtype=log_p.dtype, device=device)
         depth = torch.arange(1, t_max + 1, dtype=log_p.dtype, device=device)
+        count = mask.sum()
+        pass_ntp = torch.where(mask, losses.detach(), 0.0).sum((1, 2)) / count
+        per_token_depth = torch.where(mask, (log_p.exp() * depth[:, None, None]).sum(0), 0.0)
         parts = {
             "expected_ntp": expected.detach(),
             "kl": kl.detach(),
-            "pass_ntp": losses.detach().mean(1),
-            "expected_depth": (log_p.exp()[:, 0, :] * depth[:, None]).sum(0).mean().detach(),
+            "pass_ntp": pass_ntp,
+            "expected_depth": (per_token_depth.sum() / count).detach(),
         }
         return expected + beta * kl, parts
 
@@ -264,15 +269,30 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def _slice_loss(model: "Vesper", y: Tensor, targets: Tensor, slices: int) -> Tensor:
-    """The summed per-token loss of one range of selected positions, recomputed when sliced."""
+def _loss_rows(y: Tensor, targets: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``y [..., b, n, d]`` as rows ``[..., b*n, d]``, targets ``[b*n]`` and the mask ``[b*n]``.
 
-    def compute(y_range: Tensor, t_range: Tensor) -> Tensor:
-        return ntp_loss(_loss_logits(model, y_range), t_range[None, :]).sum()
+    The rows and targets outside ``mask`` are replaced by zero (a valid id) BEFORE any arithmetic,
+    so the head never sees them: a non-finite hidden state outside the loss positions reaches
+    neither the value nor a gradient, as when those positions were selected away. The objectives'
+    one construction of their static-shape inputs.
+    """
+    b, n, d = y.shape[-3], y.shape[-2], y.shape[-1]
+    keep = mask.reshape(b * n)
+    rows = torch.where(keep[:, None], y.reshape(*y.shape[:-3], b * n, d), 0.0)
+    return rows, torch.where(mask, targets, 0).reshape(b * n), keep
+
+
+def _slice_loss(model: "Vesper", y: Tensor, targets: Tensor, keep: Tensor, slices: int) -> Tensor:
+    """The summed per-token loss of the kept rows of one range, recomputed when sliced."""
+
+    def compute(y_range: Tensor, t_range: Tensor, k_range: Tensor) -> Tensor:
+        losses = ntp_loss(_loss_logits(model, y_range), t_range[None, :])[0]
+        return torch.where(k_range, losses, 0.0).sum()
 
     if slices == 1:
-        return compute(y, targets)
-    return checkpoint(compute, y, targets, use_reentrant=False)
+        return compute(y, targets, keep)
+    return checkpoint(compute, y, targets, keep, use_reentrant=False)
 
 
 def _token_losses(model: "Vesper", y: Tensor, targets: Tensor) -> Tensor:
@@ -321,9 +341,7 @@ def wake_objective(
         ContractError: if no position carries a loss.
     """
     mask = chunk.loss_mask
-    if not bool(mask.any().item()):
-        msg = "wake_objective: no position in the chunk carries a loss"
-        raise ContractError(msg)
+    require(mask.any(), "wake_objective: no position in the chunk carries a loss")
     return wake_loss(
         logits,
         chunk.targets.to(logits.device),

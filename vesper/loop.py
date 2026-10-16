@@ -247,7 +247,7 @@ class CdfRule:
         if not 0.0 < self.q <= 1.0:
             msg = f"q must lie in (0, 1], got {self.q}"
             raise ValueError(msg)
-        baseline = hazard_baseline(runs).to(active.device)
+        baseline = hazard_baseline(runs, active.device)  # built where hazard_logits builds it
         survival, cdf = cdf_begin(active)
 
         def step(t: int, h: Tensor, active: Tensor, *, last: bool) -> tuple[Tensor, Tensor]:

@@ -3,6 +3,7 @@ halting-experiment-plan.md): the objective composed from per-pass losses and the
 distribution, against an oracle built from the same public pieces by hand."""
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vesper.data import Chunk, Document, Stream
 from vesper.exits import (
     exit_log_probs,
     expected_pass_loss,
+    hazard_logits,
     kl_uniform_aggregate,
     kl_uniform_local,
 )
@@ -206,9 +208,11 @@ def _saved_for_backward(condition: str, slices: int) -> tuple[int, int]:
         )
     storages = {t.untyped_storage().data_ptr(): t for t in saved}
     wide = [p for p, t in storages.items() if t.dim() and t.shape[-1] == vocab]
-    hidden = [
-        p for p, t in storages.items() if t.dim() == 2 and t.shape[-1] == d and p not in parameters
-    ]
+    # hidden rows by their exact shape, all rows or one slice of them: this fixture's b * n
+    # equals d, so a [T, b * n] tensor would match a width test alone
+    rows = int(chunk.tokens.numel())
+    shapes = {(rows, d), (-(-rows // slices), d)}
+    hidden = [p for p, t in storages.items() if tuple(t.shape) in shapes and p not in parameters]
     grads = torch.autograd.grad(value, list(model.parameters()), allow_unused=True)
     assert any(g is not None and float(g.abs().sum()) > 0 for g in grads)
     return len(wide), len(hidden)
@@ -219,7 +223,103 @@ def test_no_vocabulary_logits_are_kept_for_the_backward_pass(slices: int) -> Non
     # Maintainer B's review of 49c92cf, finding 3: at slices = 1 every pass's vocabulary
     # intermediates were saved for the backward pass, and every slice selected the pass's positions
     # anew (saved selections grew 1/2/4/8x with the slices); now the head runs again in the backward
-    # pass and each pass's positions are selected once
-    assert _saved_for_backward("fixed", slices) == (0, T)
-    # the learned head keeps its own normalized input per pass, one more [N, d] each
-    assert _saved_for_backward("local", slices) == (0, 2 * T)
+    # pass and nothing is selected at all: every pass's rows are views of the loop's one
+    # per-pass output (the static-shape objective, 2026-10-16), one storage at any slice count
+    assert _saved_for_backward("fixed", slices) == (0, 1)
+    # the learned head keeps its own normalized input per pass, one more [b * n, d] each
+    assert _saved_for_backward("local", slices) == (0, 1 + T)
+    assert _saved_for_backward("aggregate", slices) == (0, 1 + T)
+
+
+def test_the_parts_average_over_the_loss_positions_only() -> None:
+    # the static-shape objective scores every position; its reported depth must still be the
+    # mean over the loss positions, here with a head whose exits differ by position
+    model, chunk = _model(), _chunk()
+    head = model.loop.halting_head()
+    with torch.no_grad():
+        _ = head.w_h.copy_(torch.randn(head.w_h.shape, generator=torch.Generator().manual_seed(9)))
+    result = _dense(model, chunk)
+    _, parts = model.all_pass_objective(chunk, result, condition="local", beta=0.3)
+    learned = torch.stack([head.logit(result.per_pass[t], t) for t in range(T)])
+    p = exit_log_probs(hazard_logits(learned)).exp()
+    depth = torch.arange(1, T + 1, dtype=p.dtype)[:, None, None]
+    per_token = (p * depth).sum(0).detach()
+    want = float(per_token[chunk.loss_mask].mean())
+    assert abs(float(per_token.mean()) - want) > 1e-6  # the fixture tells the two means apart
+    assert float(parts["expected_depth"]) == pytest.approx(want, rel=1e-12)
+
+
+def test_targets_outside_the_loss_mask_are_never_read() -> None:
+    # selection never touched them; the static-shape objective must not either (an
+    # out-of-range id there would fail the loss's id contract if it were scored)
+    model, chunk = _model(), _chunk()
+    result = _dense(model, chunk)
+    poisoned = replace(chunk, targets=torch.where(chunk.loss_mask, chunk.targets, 10_000))
+    for condition in ("fixed", "local", "aggregate"):
+        clean, _ = model.all_pass_objective(chunk, result, condition=condition, beta=0.3)
+        dirty, _ = model.all_pass_objective(poisoned, result, condition=condition, beta=0.3)
+        assert float(dirty.detach()) == float(clean.detach()), condition
+
+
+def test_only_real_inputs_must_have_run_every_pass() -> None:
+    # Maintainer B's review of 49c92cf, finding 2: every REAL input must be dense; a padding
+    # position's depth writes nothing a scored pass reads, so it is not part of the contract
+    model, chunk = _model(), _chunk()
+    last, scored = torch.arange(15, 16), torch.arange(14, 16)
+    padded = replace(
+        chunk,
+        valid=chunk.valid.clone().index_fill_(1, last, value=False),
+        loss_mask=chunk.loss_mask.clone().index_fill_(1, scored, value=False),
+    )
+    result = _dense(model, padded)
+    short = result.n_iters.clone().index_fill_(1, last, 1)
+    _ = model.all_pass_objective(
+        padded, replace(result, n_iters=short), condition="fixed", beta=0.0
+    )
+    real = result.n_iters.clone().index_fill_(1, torch.arange(3, 4), 1)
+    with pytest.raises(ContractError, match="dense forward"):
+        _ = model.all_pass_objective(
+            padded, replace(result, n_iters=real), condition="fixed", beta=0.0
+        )
+
+
+def test_a_non_finite_hidden_state_outside_the_loss_positions_reaches_nothing() -> None:
+    # selection never sent a non-loss position through the head; the static-shape objectives
+    # replace those rows before it, so a NaN there changes no value and no gradient (both the
+    # all-pass objective and ACT's)
+    model, chunk = _model(), _chunk()
+    outside = (~chunk.loss_mask).nonzero()[0]
+    b, n = int(outside[0]), int(outside[1])
+    dense = _dense(model, chunk)
+    per_pass = dense.per_pass.detach().clone().requires_grad_(True)
+    for condition in ("fixed", "local", "aggregate"):
+        poisoned = per_pass.clone()  # a new graph per condition: each is differentiated once
+        poisoned[:, b, n] = math.nan
+        clean, _ = model.all_pass_objective(
+            chunk, replace(dense, per_pass=per_pass), condition=condition, beta=0.3
+        )
+        dirty, _ = model.all_pass_objective(
+            chunk, replace(dense, per_pass=poisoned), condition=condition, beta=0.3
+        )
+        assert float(dirty.detach()) == pytest.approx(float(clean.detach()), rel=1e-12)
+        # the head's own weights too: their gradient is the logits' gradient times the row, so
+        # a NaN row poisons them even where the row's own gradient stays finite (measured: the
+        # embedding and the output norm, when the rows were not replaced)
+        grads = torch.autograd.grad(dirty, [per_pass, *_trained_parameters(model)])
+        assert all(bool(torch.isfinite(g).all()) for g in grads), condition
+        assert float(grads[0][:, b, n].abs().sum()) == 0.0
+    cfg = parse(small_raw() | {"model": small_raw()["model"] | {"t_max": T}}, "test")
+    act = model.run(chunk.tokens, chunk.pos, model.init_states(2, F64, CPU))
+    y = act.y.detach().clone().requires_grad_(True)
+    y_poisoned = y.clone()
+    y_poisoned[b, n] = math.nan
+    clean_act, _ = model.objective(chunk, replace(act, y=y), cfg)
+    dirty_act, _ = model.objective(chunk, replace(act, y=y_poisoned), cfg)
+    assert float(dirty_act.detach()) == pytest.approx(float(clean_act.detach()), rel=1e-12)
+    grads_act = torch.autograd.grad(dirty_act, [y, *_trained_parameters(model)])
+    assert all(bool(torch.isfinite(g).all()) for g in grads_act)
+
+
+def _trained_parameters(model: Vesper) -> list[torch.Tensor]:
+    """The parameters an objective's head reaches: the tied embedding and the output norm."""
+    return [model.embedding.weight, model.norm_out.weight]

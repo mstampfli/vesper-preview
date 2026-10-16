@@ -18,7 +18,11 @@ dependencies = [
 
 [project.optional-dependencies]
 cpu = ["torch==2.14.1"]  # one release on both indexes; 2.10.0 carries PYSEC-2025-194 and PYSEC-2026-139
-gpu = ["torch==2.14.1"]
+gpu = [
+  "torch==2.14.1",
+  "fla-core==0.5.2",  # flash-linear-attention's chunked delta-rule kernel (MIT), vesper/kernels only
+  "einops==0.8.1",    # fla-core's one dependency beyond torch and triton
+]
 
 [dependency-groups]
 dev = [

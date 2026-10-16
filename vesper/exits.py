@@ -36,11 +36,14 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
-from vesper.contracts import ContractError, Dims, check_shape
+from vesper.contracts import ContractError, Dims, check_shape, require
 
 
-def hazard_baseline(t_max: int) -> Tensor:
+def hazard_baseline(t_max: int, device: torch.device | None = None) -> Tensor:
     """``[t_max]`` hazard offsets (float64): ``b0_t = -log(T - t)`` for ``t = 1..T-1``, then 0.
+
+    Built on ``device`` (CPU when None), never copied there: a host-to-device copy inside a
+    captured CUDA graph would end the capture.
 
     With zero learned logits the hazard at pass ``t`` is ``1 / (T - t + 1)``, which makes every
     exit probability exactly ``1 / T``; the last entry is a zero for the forced final exit,
@@ -52,8 +55,9 @@ def hazard_baseline(t_max: int) -> Tensor:
     if t_max < 1:
         msg = f"t_max must be at least 1, got {t_max}"
         raise ValueError(msg)
-    passes = torch.arange(1, t_max, dtype=torch.float64)
-    return torch.cat([-torch.log(t_max - passes), torch.zeros(1, dtype=torch.float64)])
+    passes = torch.arange(1, t_max, dtype=torch.float64, device=device)
+    zero = torch.zeros(1, dtype=torch.float64, device=device)
+    return torch.cat([-torch.log(t_max - passes), zero])
 
 
 def hazard_logits(learned: Tensor) -> Tensor:
@@ -73,7 +77,7 @@ def hazard_logits(learned: Tensor) -> Tensor:
         msg = "hazard_logits: no pass"
         raise ContractError(msg)
     shape = (t_max,) + (1,) * (learned.dim() - 1)
-    baseline = hazard_baseline(t_max).to(learned.device).reshape(shape)
+    baseline = hazard_baseline(t_max, learned.device).reshape(shape)
     return learned.to(torch.float64) + baseline
 
 
@@ -112,8 +116,13 @@ def expected_pass_loss(log_p: Tensor, losses: Tensor, mask: Tensor) -> Tensor:
         ContractError: on mismatched shapes or dtypes, or if no position is masked in.
     """
     _check(log_p, mask, "expected_pass_loss", losses)
-    selected = log_p[:, mask]  # [T, N]: the mask first, so nothing masked out is computed with
-    return (selected.exp() * losses[:, mask]).sum(0).mean()
+    # static shapes (a captured step cannot select by a mask): every position is computed, with
+    # the masked-out inputs replaced by zero BEFORE any arithmetic and the outputs after it
+    # (where, never a multiplication by zero), so a non-finite value there reaches neither the
+    # value nor a gradient, as with the selection this replaces
+    lp, ls = torch.where(mask, log_p, 0.0), torch.where(mask, losses, 0.0)
+    per_token = torch.where(mask, (lp.exp() * ls).sum(0), 0.0)
+    return per_token.sum() / mask.sum()
 
 
 def kl_uniform_local(log_p: Tensor, mask: Tensor) -> Tensor:
@@ -124,8 +133,9 @@ def kl_uniform_local(log_p: Tensor, mask: Tensor) -> Tensor:
     """
     _check(log_p, mask, "kl_uniform_local")
     t_max = log_p.shape[0]
-    selected = log_p[:, mask]  # [T, N]
-    return (selected.exp() * (selected + math.log(t_max))).sum(0).mean()
+    lp = torch.where(mask, log_p, 0.0)  # inputs, then outputs (expected_pass_loss)
+    per_token = torch.where(mask, (lp.exp() * (lp + math.log(t_max))).sum(0), 0.0)
+    return per_token.sum() / mask.sum()
 
 
 def kl_uniform_aggregate(log_p: Tensor, mask: Tensor) -> Tensor:
@@ -136,8 +146,11 @@ def kl_uniform_aggregate(log_p: Tensor, mask: Tensor) -> Tensor:
     """
     _check(log_p, mask, "kl_uniform_aggregate")
     t_max = log_p.shape[0]
-    selected = log_p[:, mask]  # [T, N]
-    log_mean = torch.logsumexp(selected, dim=1) - math.log(selected.shape[1])
+    # masked-out positions enter the log-sum-exp as -inf: exp(-inf) adds nothing and their
+    # gradient is exactly zero; at least one position is masked in (_check)
+    masked = torch.where(mask, log_p, float("-inf")).flatten(1)  # [T, b * n]
+    count = mask.sum().to(log_p.dtype)
+    log_mean = torch.logsumexp(masked, dim=1) - torch.log(count)
     return (log_mean.exp() * (log_mean + math.log(t_max))).sum()
 
 
@@ -248,6 +261,4 @@ def _check(log_p: Tensor, mask: Tensor, what: str, losses: Tensor | None = None)
     check_shape("mask", mask, ("b", "n"), dims, dtype=torch.bool)
     if losses is not None:
         check_shape("losses", losses, ("t", "b", "n"), dims, dtype=log_p.dtype)
-    if not bool(mask.any().item()):
-        msg = f"{what}: no position in the mask"
-        raise ContractError(msg)
+    require(mask.any(), f"{what}: no position in the mask")

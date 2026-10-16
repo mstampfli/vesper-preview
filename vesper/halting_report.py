@@ -32,11 +32,49 @@ NEED_TOLERANCE = 0.01
 LEARNED_FLOOR = 0.5  # chance is 1/48 on a node answer, 1/8 among the cycle's nodes
 ACCEPTANCE_DROP = 0.01
 DEPTH_GAIN = 0.05  # Gate 2: a learned class gains this much from pass 1 to its best depth
-# the learnability probe the gates belong to (docs/reviews/2026-10-15-retrieval-binding.md, 5.2)
-PROBE_SEEDS = (0, 1)
-PROBE_STEPS = 12000
-PROBE_SPLIT = "validation"
-PROBE_EVAL = (32, 32)  # held-out batches, sequences per batch
+
+
+@dataclass(frozen=True)
+class Protocol:
+    """One frozen recipe the gates may be read under.
+
+    B's seeds, the update count, the evaluation split and population (batches, sequences per
+    batch), the training mix recipe(s), the column count and the training backend (device and
+    recurrent scan, ``_backend``: another backend is other arithmetic, so another recipe).
+    ``None`` among ``mixes`` admits records written before the mix was recorded.
+    """
+
+    name: str
+    seeds: tuple[int, ...]
+    steps: int
+    split: str
+    population: tuple[int, int]
+    mixes: tuple[str | None, ...]
+    columns: int
+    backend: tuple[str, str]
+
+
+CPU_REFERENCE = ("cpu", "reference")
+# the recipes the gates belong to; any other set of records keeps its tables and gets no verdict
+PROTOCOLS = (
+    # the learnability probe, docs/reviews/2026-10-15-retrieval-binding.md 5.2. Its records predate
+    # the mix field: every record with an eval_split (1678173 on) trained under v1's schedule.
+    Protocol("probe-v1", (0, 1), 12000, "validation", (32, 32), (None, "v1"), 2, CPU_REFERENCE),
+    # the one-column calibration, docs/reviews/2026-10-16-stage1-c1-recipe.md (maintainer B,
+    # 2026-10-16)
+    Protocol("c1-slow-v2", (0, 1), 36000, "validation", (32, 32), ("v2-slow",), 1, CPU_REFERENCE),
+)
+
+
+def _backend(record: dict[str, object]) -> tuple[str, str]:
+    """``(device, scan)`` a record trained with.
+
+    Records written before 2026-10-16 carry neither field and trained on the CPU with the
+    reference scan, the only backend the driver had.
+    """
+    return str(record.get("device", "cpu")), str(record.get("scan", "reference"))
+
+
 # "at most 1 point" includes 1 point: 0.500 - 0.490 is 0.010000000000000009 in floating point
 COMPARISON_SLACK = 1e-12
 NATS_RESOLUTION = 5e-4  # below the three printed decimals
@@ -180,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-SHARED = ("config_sha256", "steps", "eval_sequences", "eval_split", "q_reference")
+SHARED = ("config_sha256", "steps", "eval_sequences", "eval_split", "q_reference", "mix_schedule")
 
 
 def _check_identities(records: Sequence[Record]) -> None:
@@ -197,6 +235,9 @@ def _check_identities(records: Sequence[Record]) -> None:
         if any(r.get(key) != first.get(key) for r in records):
             msg = f"records disagree on {key}"
             raise ValueError(msg)
+    if len({_backend(r) for r in records}) != 1:
+        msg = "records disagree on the training backend (device, scan)"
+        raise ValueError(msg)
     seen: set[tuple[object, object]] = set()
     betas: dict[object, object] = {}
     for record in records:
@@ -489,34 +530,52 @@ def _ablation(pooled: dict[str, Summary]) -> list[str]:
     return [*lines, "", f"Largest output change at the replayed exits: {differences}.", ""]
 
 
-def _probe_breaches(records: Sequence[Record]) -> list[str]:
-    """Why ``records`` (B's) are not the learnability probe the gates belong to; empty if they are.
+def _protocol_breaches(records: Sequence[Record], protocol: Protocol, columns: int) -> list[str]:
+    """Why ``records`` (B's) are not ``protocol``; empty if they are.
 
-    The protocol (docs/reviews/2026-10-15-retrieval-binding.md, 5.2, maintainer B's re-review of
-    1cc32a6): seeds exactly ``PROBE_SEEDS``, each after ``PROBE_STEPS`` updates, evaluated on the
-    ``PROBE_SPLIT`` set of ``PROBE_EVAL`` (batches, sequences per batch). One recipe for all is
-    already enforced (``SHARED``). Anything else keeps its tables and gets no verdict (maintainer
-    B's review of 1678173: a pass for one seed, other seeds, 1000 updates, the final split or four
-    sequences was a pass the protocol never defined).
+    Seeds exactly the protocol's, each after its update count, evaluated on its split and
+    population (batches, sequences per batch), trained under one of its mix recipes, with its
+    column count. One recipe for all records is already enforced (``SHARED``). Anything else keeps
+    its tables and gets no verdict (maintainer B's review of 1678173: a pass for one seed, other
+    seeds, 1000 updates, the final split or four sequences was a pass no protocol defined).
     """
     breaches: list[str] = []
     seeds = sorted(cast("int", r["seed"]) for r in records)
-    if tuple(seeds) != PROBE_SEEDS:
-        breaches.append(f"B seeds {seeds}, the probe has {list(PROBE_SEEDS)}")
+    if tuple(seeds) != protocol.seeds:
+        breaches.append(f"B seeds {seeds}, it has {list(protocol.seeds)}")
     steps = sorted({cast("int", r["steps"]) for r in records})
-    if steps != [PROBE_STEPS]:
-        breaches.append(f"{steps} updates, the probe has {PROBE_STEPS}")
+    if steps != [protocol.steps]:
+        breaches.append(f"{steps} updates, it has {protocol.steps}")
     splits = sorted({str(r.get("eval_split")) for r in records})
-    if splits != [PROBE_SPLIT]:
-        breaches.append(f"evaluation split {splits}, the probe uses {PROBE_SPLIT}")
+    if splits != [protocol.split]:
+        breaches.append(f"evaluation split {splits}, it uses {protocol.split}")
     population = sorted({(str(r.get("eval_batches")), str(r.get("eval_size"))) for r in records})
-    expected = (str(PROBE_EVAL[0]), str(PROBE_EVAL[1]))
-    if population != [expected]:
+    batches, size = protocol.population
+    if population != [(str(batches), str(size))]:
         shown = ", ".join(f"{b} x {s}" for b, s in population)
-        breaches.append(
-            f"evaluation of {shown} sequences, the probe uses {PROBE_EVAL[0]} x {PROBE_EVAL[1]}"
-        )
+        breaches.append(f"evaluation of {shown} sequences, it uses {batches} x {size}")
+    mixes = sorted({str(r.get("mix_schedule")) for r in records})
+    if any(r.get("mix_schedule") not in protocol.mixes for r in records):
+        allowed = [m for m in protocol.mixes if m is not None]
+        breaches.append(f"mix {mixes}, it uses {allowed}")
+    if columns != protocol.columns:
+        breaches.append(f"{columns} columns, it has {protocol.columns}")
+    backends = sorted({_backend(r) for r in records})
+    if backends != [protocol.backend]:
+        shown = ", ".join(f"{d}/{s}" for d, s in backends)
+        breaches.append(f"backend {shown}, it trains on {'/'.join(protocol.backend)}")
     return breaches
+
+
+def _protocol_of(records: Sequence[Record], columns: int) -> tuple[Protocol | None, str]:
+    """The one protocol ``records`` match exactly, or None with every protocol's breaches."""
+    reasons: list[str] = []
+    for protocol in PROTOCOLS:
+        breaches = _protocol_breaches(records, protocol, columns)
+        if not breaches:
+            return protocol, ""
+        reasons.append(f"{protocol.name}: {'; '.join(breaches)}")
+    return None, " | ".join(reasons)
 
 
 def _gates(fixed: Sequence[Record], t_max: int, columns: int) -> list[str]:
@@ -526,8 +585,9 @@ def _gates(fixed: Sequence[Record], t_max: int, columns: int) -> list[str]:
     ``TraceRule``), that pass's own output. Gate 1: every hop and read class above
     ``LEARNED_FLOOR`` at its best depth, in every seed. Gate 2: one and the same class gains at
     least ``DEPTH_GAIN`` from pass 1 to its best depth in every seed. A class without labels has no
-    accuracy and fails both. The verdicts are given only for the probe itself
-    (``_probe_breaches``); any other records keep the tables and read "not assessed".
+    accuracy and fails both. The verdicts are given only for records that match one frozen
+    protocol of ``PROTOCOLS`` exactly, and name it; any other records keep the tables and read
+    "not assessed" with every protocol's breaches.
     """
     lines = [
         "## 10. Probe gates (B: every token forced to depth j, per seed)",
@@ -535,7 +595,7 @@ def _gates(fixed: Sequence[Record], t_max: int, columns: int) -> list[str]:
     ]
     if not fixed:
         return [*lines, "No B run.", ""]
-    breaches = _probe_breaches(fixed)
+    protocol, breaches = _protocol_of(fixed, columns)
     by_seed = {cast("int", r["seed"]): r for r in fixed}  # one record per seed (_check_identities)
     summaries = [
         (seed, pooled_summary([by_seed[seed]], t_max, columns)) for seed in sorted(by_seed)
@@ -568,14 +628,17 @@ def _gates(fixed: Sequence[Record], t_max: int, columns: int) -> list[str]:
     floor, gain_points = 100 * LEARNED_FLOOR, 100 * DEPTH_GAIN
     verdict1 = f"{'pass' if gate1 else 'FAIL'} (not learned: {failing})."
     verdict2 = f"{'pass' if gaining else 'FAIL'} (classes: {', '.join(gaining) or 'none'})."
-    if breaches:
-        verdict1 = verdict2 = f"not assessed (outside the probe protocol: {'; '.join(breaches)})."
+    if protocol is None:
+        verdict1 = verdict2 = f"not assessed (outside every gate protocol: {breaches})."
+        under = ""
+    else:
+        under = f" under {protocol.name}"
     rule2 = f"one learned class gaining at least {gain_points:.0f} points over pass 1"
     return [
         *lines,
         "",
-        f"Gate 1 (every hop and read class above {floor:.0f} % in every seed): {verdict1}",
-        f"Gate 2 ({rule2} in every seed): {verdict2}",
+        f"Gate 1 (every hop and read class above {floor:.0f} % in every seed){under}: {verdict1}",
+        f"Gate 2 ({rule2} in every seed){under}: {verdict2}",
         "",
     ]
 

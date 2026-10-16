@@ -255,30 +255,104 @@ def test_gates_outside_the_probe_protocol_are_not_assessed(
     deeper = [0.4, 0.4, 0.7, 0.9, 0.9, 0.9, 0.9, 0.9]
     good = [_with_static(r, {"hop3": deeper}) for r in records[:2]]
     cases: dict[str, list[dict[str, object]]] = {
-        "B seeds [0], the probe has [0, 1]": good[:1],
-        "B seeds [8, 9], the probe has [0, 1]": [r | {"seed": 8 + i} for i, r in enumerate(good)],
-        "[1000] updates, the probe has 12000": [r | {"steps": 1000} for r in good],
-        "evaluation split ['final'], the probe uses validation": [
+        "probe-v1: B seeds [0], it has [0, 1]": good[:1],
+        "probe-v1: B seeds [8, 9], it has [0, 1]": [
+            r | {"seed": 8 + i} for i, r in enumerate(good)
+        ],
+        "probe-v1: [1000] updates, it has 12000": [r | {"steps": 1000} for r in good],
+        "probe-v1: evaluation split ['final'], it uses validation": [
             r | {"eval_split": "final"} for r in good
         ],
-        "evaluation of 2 x 2 sequences, the probe uses 32 x 32": [
+        "probe-v1: evaluation of 2 x 2 sequences, it uses 32 x 32": [
             r | {"eval_batches": 2, "eval_size": 2, "eval_sequences": 4} for r in good
+        ],
+        "probe-v1: mix ['v2-slow'], it uses ['v1']": [
+            r | {"mix_schedule": "v2-slow"} for r in good
         ],
     }
     for reason, case in cases.items():
         text = _report(case)
         for line in text.splitlines():
             if line.startswith(("Gate 1", "Gate 2")):
-                assert "not assessed (outside the probe protocol" in line, reason
+                assert "not assessed (outside every gate protocol" in line, reason
                 assert reason in line, line
         # the tables stay: the numbers are reported, only the verdict is withheld
         assert "| hop3 | " in text.split("\n## 10. ")[1]
     gate1, gate2 = _gate_lines(good)
-    assert "pass" in gate1
-    assert "pass" in gate2
+    assert "under probe-v1: pass" in gate1
+    assert "under probe-v1: pass" in gate2
     # a record from before the population was recorded is outside the protocol too
     legacy = [{k: v for k, v in r.items() if k not in {"eval_batches", "eval_size"}} for r in good]
     assert "evaluation of None x None sequences" in _gate_lines(legacy)[0]
+
+
+C1_CONFIG = CONFIG.with_name("halting-stage1-c1.yaml")
+
+
+def _c1_gate_lines(records: list[dict[str, object]], config: Path) -> tuple[str, str]:
+    text = report([Run(record=r, config=load(config)) for r in records])
+    lines = text.splitlines()
+    return next(x for x in lines if x.startswith("Gate 1")), next(
+        x for x in lines if x.startswith("Gate 2")
+    )
+
+
+def test_the_one_column_recipe_has_its_own_protocol(records: list[dict[str, object]]) -> None:
+    # Maintainer B, 2026-10-16: one column, seeds 0 and 1, 36000 updates, mix v2-slow, the same
+    # gates
+    deeper = [0.2, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+    c1 = [
+        _with_static(r, {"hop2": deeper}) | {"steps": 36000, "mix_schedule": "v2-slow"}
+        for r in records[:2]
+    ]
+    gate1, gate2 = _c1_gate_lines(c1, C1_CONFIG)
+    assert "under c1-slow-v2: pass (not learned: none)" in gate1
+    assert gate2.endswith("under c1-slow-v2: pass (classes: hop2).")
+    # each part of the recipe is required: the mix, the update count, the column count
+    for reason, case, config in (
+        (
+            "c1-slow-v2: mix ['v1'], it uses ['v2-slow']",
+            [r | {"mix_schedule": "v1"} for r in c1],
+            C1_CONFIG,
+        ),
+        (
+            "c1-slow-v2: [12000] updates, it has 36000",
+            [r | {"steps": 12000} for r in c1],
+            C1_CONFIG,
+        ),
+        ("c1-slow-v2: 2 columns, it has 1", c1, CONFIG),
+    ):
+        gate1, gate2 = _c1_gate_lines(case, config)
+        for line in (gate1, gate2):
+            assert "not assessed (outside every gate protocol" in line, reason
+            assert reason in line, line
+    # an old record (no mix field) never counts as the new recipe
+    legacy = [{k: v for k, v in r.items() if k != "mix_schedule"} for r in c1]
+    assert "c1-slow-v2: mix ['None'], it uses ['v2-slow']" in _c1_gate_lines(legacy, C1_CONFIG)[0]
+    # the backend is part of the recipe: a GPU run with the fused scan is other arithmetic, and
+    # a record that names the CPU reference explicitly is the same recipe as one written before
+    # the field existed
+    gpu = [r | {"device": "cuda", "scan": "fused", "cuda_graph": True} for r in c1]
+    for line in _c1_gate_lines(gpu, C1_CONFIG):
+        assert "c1-slow-v2: backend cuda/fused, it trains on cpu/reference" in line
+    named = [r | {"device": "cpu", "scan": "reference"} for r in c1]
+    assert "under c1-slow-v2: pass" in _c1_gate_lines(named, C1_CONFIG)[0]
+
+
+def test_records_on_different_backends_are_refused(records: list[dict[str, object]]) -> None:
+    a = copy.deepcopy(records[0])  # no backend fields: the CPU reference
+    b = copy.deepcopy(records[1]) | {"device": "cuda", "scan": "fused"}
+    with pytest.raises(ValueError, match="disagree on the training backend"):
+        _ = _report([a, b])
+    c = copy.deepcopy(records[1]) | {"device": "cpu", "scan": "reference"}
+    _ = _report([a, c])  # explicit and implicit CPU reference are one backend
+
+
+def test_records_on_different_mix_recipes_are_refused(records: list[dict[str, object]]) -> None:
+    a = copy.deepcopy(records[0]) | {"mix_schedule": "v1"}
+    b = copy.deepcopy(records[1]) | {"mix_schedule": "v2-slow"}
+    with pytest.raises(ValueError, match="disagree on mix_schedule"):
+        _ = _report([a, b])
 
 
 def test_records_on_different_evaluation_splits_are_refused(

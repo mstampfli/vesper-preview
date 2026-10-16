@@ -707,6 +707,7 @@ def test_the_run_writes_a_log_checkpoints_and_resumes(  # noqa: PLR0915
     assert all(line["run_id"] == header["run_id"] for line in lines)
     assert header["layout"] == {"groups": cfg.training.batch_chunks, "slots": 1}
     assert cast("dict[str, object]", header["recipe"])["seed"] == 0
+    assert header["scan"] == "reference"  # read back from the model's sublayers
     assert lines[-1]["kind"] == "end"
     assert lines[-1]["reason"] == "steps"
     assert lines[-1]["step"] == 4
@@ -732,6 +733,23 @@ def test_the_run_writes_a_log_checkpoints_and_resumes(  # noqa: PLR0915
             device=CPU,
         )
     assert not (tmp_path / "local-run").exists()
+    # the fused scan on a CPU model is refused before anything is written
+    with pytest.raises(ValueError, match="fused scan needs"):
+        _ = run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=tmp_path / "fused-run",
+            micro=1,
+            steps=1,
+            resume=None,
+            seed=0,
+            device=CPU,
+            scan="fused",
+        )
+    assert not (tmp_path / "fused-run").exists()
     # a fresh run never appends to a log that holds one
     with pytest.raises(ValueError, match="already holds a run"):
         _ = run(

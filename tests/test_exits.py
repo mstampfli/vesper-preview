@@ -252,3 +252,59 @@ def test_an_exit_mass_that_underflows_to_zero_contributes_exactly_zero() -> None
     (grad,) = torch.autograd.grad(kl, [z])
     assert kl.item() == pytest.approx(math.log(8), abs=1e-6)
     assert bool(torch.isfinite(grad).all())
+
+
+def _selected_oracle(
+    log_p: torch.Tensor, losses: torch.Tensor, mask: torch.Tensor
+) -> list[torch.Tensor]:
+    """The three reductions over the masked positions by selection, as they were written first."""
+    t_max = log_p.shape[0]
+    lp, ls = log_p[:, mask], losses[:, mask]
+    log_mean = torch.logsumexp(lp, dim=1) - math.log(lp.shape[1])
+    return [
+        (lp.exp() * ls).sum(0).mean(),
+        (lp.exp() * (lp + math.log(t_max))).sum(0).mean(),
+        (log_mean.exp() * (log_mean + math.log(t_max))).sum(),
+    ]
+
+
+def test_the_static_shape_reductions_equal_selection_in_value_and_gradient() -> None:
+    # the reductions keep every position and exclude by where (so a captured CUDA graph has no
+    # data-dependent shape); against selection, on a ragged mask, values and gradients agree
+    g = torch.Generator().manual_seed(3)
+    z = torch.randn(5, 3, 7, generator=g, dtype=F64, requires_grad=True)
+    losses = torch.rand(5, 3, 7, generator=g, dtype=F64).requires_grad_(True)
+    mask = torch.rand(3, 7, generator=g) < 0.4
+    assert bool(mask.any())
+    assert bool((~mask).any())
+    log_p = exit_log_probs(z)
+    got = [
+        expected_pass_loss(log_p, losses, mask),
+        kl_uniform_local(log_p, mask),
+        kl_uniform_aggregate(log_p, mask),
+    ]
+    want = _selected_oracle(log_p, losses, mask)
+    # the expected loss depends on z and the losses, the two KL terms on z alone
+    inputs = [[z, losses], [z], [z]]
+    for a, b, wrt in zip(got, want, inputs, strict=True):
+        assert float(a.item()) == pytest.approx(float(b.item()), rel=1e-12, abs=1e-14)
+        ga = torch.autograd.grad(a, wrt, retain_graph=True)
+        gb = torch.autograd.grad(b, wrt, retain_graph=True)
+        for x, y in zip(ga, gb, strict=True):
+            assert float((x - y).abs().max()) < 1e-12
+
+
+def test_non_finite_log_probabilities_at_masked_positions_reach_neither_kl() -> None:
+    # the KL terms see every position now: a NaN or -inf log-probability where the mask is off
+    # must change neither value nor any gradient
+    g = torch.Generator().manual_seed(4)
+    z = torch.randn(4, 1, 3, generator=g, dtype=F64, requires_grad=True)
+    mask = _vec([1.0, 0.0, 1.0]).bool()[None, :]
+    poison = torch.zeros(4, 1, 3, dtype=F64)
+    poison[:, 0, 1] = math.nan
+    for f in (kl_uniform_local, kl_uniform_aggregate):
+        clean_lp = exit_log_probs(z)
+        clean, dirty = f(clean_lp, mask), f(clean_lp + poison, mask)
+        assert dirty.item() == pytest.approx(clean.item(), rel=1e-12)
+        (grad,) = torch.autograd.grad(dirty, [z])
+        assert bool(torch.isfinite(grad).all()), f.__name__
