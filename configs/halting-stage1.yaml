@@ -1,0 +1,62 @@
+# The halting experiment's stage-1 model (docs/reviews/2026-10-15-halting-experiment-plan.md):
+# the small test shape with T 8 passes on the synthetic task of vesper/synthetic.py, trained on
+# the CPU by vesper/halting_experiment.py. The training section's schedule keys are not read by
+# that driver (it runs a fixed step count at a constant learning rate after warmup); they are
+# set so the file validates and describes one step (batch_chunks sequences of chunk_tokens).
+model:
+  d: 32
+  heads: 2
+  head_dim: 16
+  columns: 2
+  t_max: 8
+  vocab: 64                 # synthetic.VOCAB
+  window: 8                 # = synthetic.GAP: no direct attention across it; stacked layers relay
+  kv_groups: 2
+  ffn_mult: 2
+  retrieval_k: 32
+  retrieval_gate_threshold: 0.5
+  halt_epsilon: 0.01
+  rotary_base: 10000.0
+recurrence:
+  block: 4
+  state_read_noise: 0.0
+  key_conv: 4               # causal filter width on the projected key (the project owner, 2026-10-15)
+ledger:
+  capacity_per_column: 1048576
+  pq_bits: 8
+modulator:
+  half_life_tokens: 10000
+learning:
+  mode: e2e
+  lambda_pc: 0.1
+  lambda_h: 0.01            # condition A's ponder weight, as Vesper-S
+  lambda_g: 0.01
+  alpha: 0.5
+  m_clip_low: -1.0
+  m_clip_high: 3.0
+  target_open_rate: 0.10
+optimizer:
+  peak_lr: 1.0e-3
+  warmup_steps: 100
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  grad_clip: 1.0
+  final_lr_fraction: 1.0
+training:
+  chunk_tokens: 88          # synthetic.SEQUENCE_TOKENS
+  batch_chunks: 32
+  total_tokens: 33792000    # 12000 steps of 32 x 88 (the bounded probe; docs/reviews/2026-10-15-retrieval-binding.md 5.1)
+  phase_warm_end: 0.10
+  phase_loop_end: 0.40
+  phase_ledger_end: 0.80
+  t_max_anneal_from: 8
+  qat_from: 0.5
+  held_out_fraction: 0.005
+  checkpoints_per_run: 20
+  eval_chunks: 32
+dusk:
+  cadence_tokens: 4194304
+  budget_fraction: 0.05
+  eta_slow_fraction: 0.1
+  gamma: 0.5

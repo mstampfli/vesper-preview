@@ -1,0 +1,59 @@
+# Vesper-S. Every constant the code uses lives here or in a sibling file; none in code.
+# Names follow docs/spec.md; each key is read by exactly one field in vesper/config.py.
+model:
+  d: 768
+  heads: 12
+  head_dim: 64
+  columns: 4
+  t_max: 8
+  vocab: 32768
+  window: 512
+  kv_groups: 4              # GQA: heads / kv_groups key-value heads
+  ffn_mult: 4
+  retrieval_k: 32
+  retrieval_gate_threshold: 0.5
+  halt_epsilon: 0.01
+  rotary_base: 10000.0      # rotary position base (spec 3b)
+recurrence:
+  block: 64                 # tokens per block of the parallel scan (not the 4,096-token chunk)
+  state_read_noise: 0.01    # Gaussian sigma on H reads, from training.qat_from onward
+  key_conv: 4               # causal filter width on the projected key (the project owner, 2026-10-15); 0 = none
+ledger:
+  capacity_per_column: 1048576   # 2^20
+  pq_bits: 8
+modulator:
+  half_life_tokens: 10000
+learning:
+  mode: e2e                 # e2e | local
+  lambda_pc: 0.1            # 0 in e2e mode (applied by learning.py, not here)
+  lambda_h: 0.01
+  lambda_g: 0.01
+  alpha: 0.5
+  m_clip_low: -1.0
+  m_clip_high: 3.0
+  target_open_rate: 0.10
+optimizer:
+  peak_lr: 3.0e-4
+  warmup_steps: 2000
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  grad_clip: 1.0
+  final_lr_fraction: 0.1
+training:
+  chunk_tokens: 4096
+  batch_chunks: 128
+  total_tokens: 10000000000
+  phase_warm_end: 0.10
+  phase_loop_end: 0.40
+  phase_ledger_end: 0.80
+  t_max_anneal_from: 2
+  qat_from: 0.5
+  held_out_fraction: 0.005
+  checkpoints_per_run: 20   # a checkpoint and its evaluations every 5% of the tokens (spec: Evaluation suite)
+  eval_chunks: 32           # held-out chunks per evaluation, over micro_chunks streams
+dusk:
+  cadence_tokens: 4194304   # 2^22, counted over the whole batch
+  budget_fraction: 0.05
+  eta_slow_fraction: 0.1
+  gamma: 0.5

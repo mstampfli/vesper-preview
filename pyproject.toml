@@ -1,0 +1,126 @@
+[project]
+name = "vesper"
+version = "0.0.1"
+description = "A language model that thinks in time instead of depth, learns while it runs, and sleeps to remember."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "pyyaml>=6.0.2",
+  "beartype>=0.21",
+  "numpy>=2.1",
+  "tokenizers>=0.23.3",
+  "pyarrow>=19",
+  "huggingface-hub>=2.2",
+  "requests>=2.32",      # the Standard Ebooks title listing (GitHub API), with a timeout
+  "defusedxml>=0.7.1",   # the books' XHTML, parsed with DTDs, entities and externals forbidden
+]
+
+[project.optional-dependencies]
+cpu = ["torch==2.14.1"]  # one release on both indexes; 2.10.0 carries PYSEC-2025-194 and PYSEC-2026-139
+gpu = ["torch==2.14.1"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "ruff>=0.9",
+  "mypy>=1.14",
+  "basedpyright>=1.24",
+  "bandit>=1.8",
+  "pip-audit>=2.8",
+  "detect-secrets>=1.5",
+  "cyclonedx-bom>=5.1",
+  "types-PyYAML>=6.0.12",
+  "types-requests>=2.32",
+  "types-defusedxml>=0.7.0",
+]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
+# Transitive floors the audit demands (pip-audit in gate.sh); each names its advisory.
+constraint-dependencies = [
+  "setuptools>=83.0.0",  # PYSEC-2026-3447, pulled in transitively
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu130", extra = "gpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"  # the cu128 wheels stopped before 2.14; driver 580.126 meets CUDA 13.0's 580.65 minimum
+explicit = true
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vesper"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = [".", "tests"]  # tests/conftest.py is first-party for the tests that import its helpers
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "TC001", "TC002", "TC003",  # TYPE_CHECKING imports break beartype at runtime
+  "COM812", "ISC001",         # conflict with the formatter
+  "D203", "D213",             # one docstring style: D211 + D212
+  "FIX002", "TD002", "TD003", # TODOs carry a reason, not a ticket number
+  "E741",                     # single-letter math names (k, q, v, l) are the spec's names
+  "CPY001",                   # no per-file copyright banners
+]
+
+[tool.ruff.lint.pylint]
+max-args = 7                  # q, k, v, beta, state, block: the scan's contract has six
+max-positional-args = 7
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "PLR2004", "D", "ANN", "INP001", "FBT003"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+disallow_any_expr = true
+disallow_any_explicit = true
+disallow_any_decorated = true
+disallow_any_unimported = true
+warn_unreachable = true
+files = ["vesper", "tests"]
+plugins = []
+mypy_path = "stubs"  # precise local stubs where a library's own hints degrade to Any
+
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*"]
+# torch ships inline types; do not let its few untyped corners widen to Any silently
+implicit_reexport = true
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.12"
+include = ["vesper", "tests"]
+stubPath = "stubs"
+extraPaths = ["tests"]  # the tests import shared helpers from tests/conftest.py, as pytest runs them
+reportMissingModuleSource = false
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+filterwarnings = ["error"]

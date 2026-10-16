@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Runs the fast gate before every commit. Installed by: git config core.hooksPath .githooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+# git exports its repository context to hooks (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE, ...);
+# the gate runs tests that start git in temporary directories, and those must never act on
+# this repository through inherited variables (2026-10-15: a test's commit landed here).
+# "${!GIT_@}" enumerates every variable whose name starts with GIT_, digits included.
+for name in "${!GIT_@}"; do unset "$name"; done
+exec ./gate.sh --fast

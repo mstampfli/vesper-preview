@@ -1,0 +1,66 @@
+# Vesper-S short run on real data: the model of vesper-s.yaml at the recipe's chunk size with a
+# small batch (eight 4096-token chunks) and a budget of two hundred steps (6.5 M tokens), the
+# whole phase schedule compressed into it, a checkpoint with evaluations every fifty steps. On one
+# 16 GB GPU with --recompute --loss-slices 4 a step takes about 35 s, the run about two hours
+# (docs/reviews/2026-10-15-training-loop.md, Measured). Its held-out perplexity is a first number
+# on the finalized mixed corpus under the frozen tokenizer, at a scale far below the recipe's
+# (batch 128, 10 B tokens); it says the pipeline trains on real data, not what Vesper-S can do.
+# Every key is read by the same field as vesper-s.yaml; only the training and optimizer sections
+# differ (batch, tokens, warmup, checkpoints, evaluation size).
+model:
+  d: 768
+  heads: 12
+  head_dim: 64
+  columns: 4
+  t_max: 8
+  vocab: 32768
+  window: 512
+  kv_groups: 4
+  ffn_mult: 4
+  retrieval_k: 32
+  retrieval_gate_threshold: 0.5
+  halt_epsilon: 0.01
+  rotary_base: 10000.0
+recurrence:
+  block: 64
+  state_read_noise: 0.01
+  key_conv: 4
+ledger:
+  capacity_per_column: 1048576
+  pq_bits: 8
+modulator:
+  half_life_tokens: 10000
+learning:
+  mode: e2e
+  lambda_pc: 0.1
+  lambda_h: 0.01
+  lambda_g: 0.01
+  alpha: 0.5
+  m_clip_low: -1.0
+  m_clip_high: 3.0
+  target_open_rate: 0.10
+optimizer:
+  peak_lr: 3.0e-4
+  warmup_steps: 10
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  grad_clip: 1.0
+  final_lr_fraction: 0.1
+training:
+  chunk_tokens: 4096
+  batch_chunks: 8
+  total_tokens: 6553600       # 200 steps of 8 x 4096 tokens
+  phase_warm_end: 0.10
+  phase_loop_end: 0.40
+  phase_ledger_end: 0.80
+  t_max_anneal_from: 2
+  qat_from: 0.5
+  held_out_fraction: 0.005
+  checkpoints_per_run: 4
+  eval_chunks: 16
+dusk:
+  cadence_tokens: 4194304
+  budget_fraction: 0.05
+  eta_slow_fraction: 0.1
+  gamma: 0.5

@@ -1,0 +1,64 @@
+# Vesper-S smoke run: the model of vesper-s.yaml with a training budget that runs the whole
+# phase schedule in forty steps of four 2048-token chunks on one 16 GB GPU. Every key is read by
+# the same field as vesper-s.yaml; only the training and optimizer sections differ (chunk, batch,
+# tokens, warmup, checkpoints). Measured 2026-10-15 on the 5060 Ti (docs/reviews/
+# 2026-10-15-training-loop.md, Measured): one 4096-token chunk's forward and backward costs
+# 3.8 GiB at one pass and about 1.6 GiB more per pass, so eight passes do not fit beside the
+# box's other GPU tenant; 2048-token chunks do.
+model:
+  d: 768
+  heads: 12
+  head_dim: 64
+  columns: 4
+  t_max: 8
+  vocab: 32768
+  window: 512
+  kv_groups: 4
+  ffn_mult: 4
+  retrieval_k: 32
+  retrieval_gate_threshold: 0.5
+  halt_epsilon: 0.01
+  rotary_base: 10000.0
+recurrence:
+  block: 64
+  state_read_noise: 0.01
+  key_conv: 4
+ledger:
+  capacity_per_column: 1048576
+  pq_bits: 8
+modulator:
+  half_life_tokens: 10000
+learning:
+  mode: e2e
+  lambda_pc: 0.1
+  lambda_h: 0.01
+  lambda_g: 0.01
+  alpha: 0.5
+  m_clip_low: -1.0
+  m_clip_high: 3.0
+  target_open_rate: 0.10
+optimizer:
+  peak_lr: 3.0e-4
+  warmup_steps: 4
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  grad_clip: 1.0
+  final_lr_fraction: 0.1
+training:
+  chunk_tokens: 2048
+  batch_chunks: 4
+  total_tokens: 327680        # 40 steps of 4 x 2048 tokens
+  phase_warm_end: 0.10
+  phase_loop_end: 0.40
+  phase_ledger_end: 0.80
+  t_max_anneal_from: 2
+  qat_from: 0.5
+  held_out_fraction: 0.005
+  checkpoints_per_run: 4
+  eval_chunks: 2
+dusk:
+  cadence_tokens: 4194304
+  budget_fraction: 0.05
+  eta_slow_fraction: 0.1
+  gamma: 0.5

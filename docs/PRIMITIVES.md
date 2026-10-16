@@ -1,0 +1,27 @@
+# Primitives catalog
+
+One named, tested implementation per recurring concern. The use case and the non-use case live in
+the primitive's own docstring (grep `PRIMITIVE`); this page only says where each one is and what
+raw pattern it forbids.
+
+| Primitive | Lives in | Replaces (forbidden raw form) | Tests |
+| --- | --- | --- | --- |
+| `check_shape` | vesper/contracts.py | inline `assert t.shape == ...`, `if t.ndim != ...`, unchecked dtype assumptions at a public boundary | tests/test_contracts.py |
+| `check_ids` | vesper/contracts.py | ad-hoc `.long()` casts and inline `(ids < 0) \| (ids >= V)` range checks at the embedding, the loss and the tokenizer's decode; the data stream's int32 meets the model's int64 in one place | tests/test_contracts.py |
+| `_Section.get_int / get_float / get_str / get_section / done` | vesper/config.py | raw `cfg["key"]` access, `yaml.load`, `int(value)` coercions, silently ignored keys | tests/test_config.py |
+| `normalize_keys`, `write_strength` | vesper/recurrence.py | ad-hoc `k / k.norm()` or `sigmoid` before the scan, and ad-hoc `beta * (1 + alpha * m)` at inference, which leaves [0, 1]; the scan's stability argument depends on all three | tests/test_recurrence.py, tests/test_recurrence_review.py, tests/test_write_strength.py |
+| `quant_state_int4 / dequant_state` | vesper/quant.py | inline nibble packing (`& 0xF`, `<< 4`), per-call scale computation | tests/test_quant.py |
+| `ModulatorState` + `normalize / update` | vesper/modulator.py | a second EMA of the loss anywhere else; the spec allows exactly one pair | tests/test_modulator.py |
+| `delta_update` | vesper/recurrence.py | a second copy of the delta-rule write in the loop's copy-forward path; the step is this plus the read | tests/test_column.py, tests/test_recurrence_review.py |
+| `RMSNorm` | vesper/column.py | inline `x / x.square().mean().sqrt()` before a sublayer, or a LayerNorm; one gain per sublayer input | tests/test_column.py |
+| `normalize_text_v2`, `dedup_key` | vesper/keys.py | ad-hoc whitespace handling or hashing of texts anywhere a duplicate is decided; code hashed after any normalization; a second implementation of a key version (v1 died of that) | tests/test_collect.py |
+| `file_sha256` | vesper/keys.py | `hashlib.sha256(path.read_bytes())`, which materializes the whole file | tests/test_collect.py |
+| `string_value`, `string_column` | vesper/corpus.py | inline `isinstance(v, str)` checks and loops over parquet columns at the data boundary | tests/test_corpus.py, tests/test_collect.py |
+| `finalize` + `Split` + `select_documents` | vesper/corpus.py | an `is_held_out(doc_id, ...)` call on a document id anywhere a split is taken, a first-seen set of texts, or any membership decision that depends on the order documents arrive in | tests/test_corpus.py |
+| `ParquetOutput` | vesper/collect.py | a `ParquetWriter` opened on the destination itself, a shared temporary name, a writer closed by garbage collection | tests/test_collect.py |
+| `check_slug` | vesper/books.py | a repository name interpolated into a URL, a path or an argv without a check | tests/test_books.py |
+| `contained`, `publish` | vesper/publish.py | a path from outside (an href, a manifest entry) opened or written on the strength of lexical checks alone; a hand-rolled rename onto a final name (`contained` moved here from books.py so the book checkout and the generation manifest share one check) | tests/test_books.py, tests/test_generations.py, tests/test_publish.py |
+| `spdx_header` | vesper/collect.py | ad-hoc `"GPL" in text` searches when deciding a file's license evidence, or treating an unreadable header as no header | tests/test_collect.py |
+| `staged` | vesper/publish.py | writing a receipt, a dropped-id file or a checkpoint directory at its final name (a reader can see it half written; a failed save leaves a partial that a retry refuses); a hand-rolled `.partial` + `replace` pair; a partial named by destination and pid, which two calls share (a nested failure deleted the outer call's file, a leftover was published) | tests/test_publish.py (files, directories, nested failure, leftovers, overlap), tests/test_train.py (a failed save leaves no checkpoint), tests/test_corpus.py (a reserved receipt is refused) |
+| `owned_staging` | vesper/publish.py | an operation's staging directory named by label and clock (two nested or concurrent operations with one label under one clock tick shared it, and the inner exit deleted the outer one's files); a release spread over several windows of the operation (the books listing and receipt were written outside the cleanup); a release that raises over the body's exception when the shared parent vanishes between two checks | tests/test_publish.py (nested same label, parent vanished, renamed away, neighbour untouched), tests/test_acquire.py (every failure window of a run, the refilled parent), tests/test_migrate.py (a failing link publishes nothing for that kind) |
+| `SequenceDigest` | vesper/keys.py | `hashlib.sha256()` updated with unframed items when the identity of an ordered sequence is wanted (ids a mixer handed out, texts a trainer consumed); counting as a stand-in for identity; a hash object that cannot be stored and continued (the chain's hex state is the digest and the resume point) | tests/test_keys.py, tests/test_corpus.py (the mixer's digest tells orders apart that counts cannot; a restored mixer continues it) |
