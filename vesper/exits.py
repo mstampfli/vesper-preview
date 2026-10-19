@@ -262,3 +262,49 @@ def _check(log_p: Tensor, mask: Tensor, what: str, losses: Tensor | None = None)
     if losses is not None:
         check_shape("losses", losses, ("t", "b", "n"), dims, dtype=log_p.dtype)
     require(mask.any(), f"{what}: no position in the mask")
+
+
+def floored_stop_log_probs(z: Tensor, epsilon: float | Tensor) -> tuple[Tensor, Tensor]:
+    """``(log s, log (1 - s))`` for a stop probability ``s = (1 - epsilon) * sigmoid(z)``.
+
+    PRIMITIVE: the one place a sampled stop's probabilities are formed, for the sampled exit
+    rule (``vesper.loop.SampledRule``) and every estimator built on its log-probabilities
+    (docs/reviews/2026-10-18-halting-exploration-calibration.md). The floor ``epsilon`` is a
+    MIXTURE that guarantees continuation with probability at least ``epsilon``; unlike
+    ``max(epsilon, 1 - sigmoid(z))`` it has no region where the head's derivative is zero.
+    ``z`` are hazard logits (``hazard_logits``); both outputs are float64, from the saturated
+    logit (``HAZARD_LIMIT``), and finite for every finite ``z`` and every ``epsilon`` in
+    ``[0, 1]`` except ``log s`` at ``epsilon = 1``, which is ``-inf`` (a stop that cannot be
+    sampled); its gradient with respect to ``z`` stays finite. Not for: the deterministic CDF
+    exit (``cdf_advance``) or the dense exit distribution (``exit_log_probs``).
+
+    A float ``epsilon`` is checked on the host; a tensor (float64 on ``z``'s device: a captured
+    update reads a floor that changes between replays from it) through ``require``, so it never
+    reads the device back while a graph is captured.
+
+    Raises:
+        ValueError: if a float ``epsilon`` lies outside ``[0, 1]``.
+        ContractError: if a tensor ``epsilon`` lies outside ``[0, 1]`` (a device assert under
+            capture), or on a non-floating ``z``.
+    """
+    _floating("z", z)
+    if isinstance(epsilon, float | int):
+        if not 0.0 <= epsilon <= 1.0:
+            msg = f"epsilon must lie in [0, 1], got {epsilon}"
+            raise ValueError(msg)
+        floor = torch.tensor(float(epsilon), dtype=torch.float64, device=z.device)
+    else:
+        floor = epsilon
+        if floor.dtype != torch.float64 or floor.device != z.device:
+            msg = f"epsilon: a float64 tensor on {z.device}, got {floor.dtype} on {floor.device}"
+            raise ContractError(msg)
+        inside = ((floor >= 0.0) & (floor <= 1.0)).all()
+        require(inside, "epsilon must lie in [0, 1] (a device floor)")
+    logit = _saturated(z.to(torch.float64))
+    log_stop_hazard = functional.logsigmoid(logit)
+    log_stop = torch.log1p(-floor) + log_stop_hazard  # log(1 - eps) + log sigmoid(z)
+    # 1 - s = sigmoid(-z) + eps * sigmoid(z), summed in log space
+    log_continue = torch.logaddexp(
+        functional.logsigmoid(-logit), torch.log(floor) + log_stop_hazard
+    )
+    return log_stop, log_continue

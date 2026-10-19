@@ -39,8 +39,14 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint  # pyright: ignore[reportUnknownVariableType]
 
 from vesper.column import Carry, ColumnState, Modulation, Projections, RMSNorm
-from vesper.contracts import ContractError, Dims, check_shape
-from vesper.exits import cdf_advance, cdf_begin, cdf_reaches, hazard_baseline
+from vesper.contracts import ContractError, Dims, check_shape, require
+from vesper.exits import (
+    cdf_advance,
+    cdf_begin,
+    cdf_reaches,
+    floored_stop_log_probs,
+    hazard_baseline,
+)
 
 
 @runtime_checkable
@@ -480,3 +486,82 @@ def _merge(halts: Tensor, fresh: Projections, previous: Projections) -> Projecti
         attn_k=pick(fresh.attn_k, previous.attn_k),
         attn_v=pick(fresh.attn_v, previous.attn_v),
     )
+
+
+class SampledRule:
+    """Real, sampled stops with a continuation floor: the exploration policy of training.
+
+    After every non-final pass each deciding token stops with probability
+    ``s = (1 - epsilon) * sigmoid(head.logit(h, t) + hazard_baseline(runs)[t])``
+    (``vesper.exits.floored_stop_log_probs``), decided by ``uniforms[t] < s`` from uniforms
+    the caller draws: ``float64 [runs - 1, b, n]``, one per non-final pass and token, so a
+    forward's decisions are a function of the uniforms alone and a chunked or token-by-token
+    replay given the matching slices takes the same decisions. A stopped token emits that
+    pass's own output and its write is copied forward (``Loop``); the final pass is a forced
+    exit and decides nothing. Design: docs/reviews/2026-10-18-halting-exploration-calibration.md.
+
+    After the forward, ``log_prob [b, n]`` (float64) holds each token's summed
+    log-probability of the decisions it actually made, with the head's graph: the
+    score-function estimator's term. Tokens outside ``deciding`` (padding) and decisions of
+    inactive tokens contribute exactly zero; ``decisions [b, n]`` counts the decisions made.
+    Not the deployed policy: a floor of zero still samples (``CdfRule`` is the deterministic
+    one). One rule object serves one forward (``begin`` resets its record).
+    """
+
+    def __init__(
+        self,
+        head: HaltingHead,
+        epsilon: float | Tensor,
+        uniforms: Tensor,
+        deciding: Tensor,
+    ) -> None:
+        """Keep the policy's parts; nothing is checked until ``begin`` knows the forward."""
+        self.head: HaltingHead = head
+        self.epsilon: float | Tensor = epsilon
+        self.uniforms: Tensor = uniforms
+        self.deciding: Tensor = deciding
+        self.log_prob: Tensor | None = None
+        self.decisions: Tensor | None = None
+
+    def begin(self, active: Tensor, dtype: torch.dtype, runs: int) -> ExitStep:
+        """Check the uniforms and the deciding mask against the forward; reset the record.
+
+        Raises:
+            ContractError: on a deciding mask that is not ``bool[b, n]`` like the forward's
+                tokens, or uniforms that are not float64 ``[runs - 1, b, n]`` in ``[0, 1)``.
+        """
+        dims: Dims = {}
+        check_shape("active", active, ("b", "n"), dims, dtype=torch.bool)
+        check_shape("deciding", self.deciding, ("b", "n"), dims, dtype=torch.bool)
+        check_shape("uniforms", self.uniforms, (runs - 1, "b", "n"), dims, dtype=torch.float64)
+        if self.uniforms.numel():  # a device contract: no read-back while a graph is captured
+            require(
+                ((self.uniforms >= 0.0) & (self.uniforms < 1.0)).all(),
+                "uniforms must lie in [0, 1)",
+            )
+        baseline = hazard_baseline(runs, active.device)
+        uniforms = self.uniforms.to(active.device)
+        deciding = self.deciding.to(active.device)
+        zero = torch.zeros(active.shape, dtype=torch.float64, device=active.device)
+        log_prob = zero
+        decisions = torch.zeros(active.shape, dtype=torch.int32, device=active.device)
+        self.log_prob, self.decisions = log_prob, decisions
+
+        def step(t: int, h: Tensor, active: Tensor, *, last: bool) -> tuple[Tensor, Tensor]:
+            nonlocal log_prob, decisions
+            if last:  # the forced exit: no decision, no log-probability
+                halts = active
+                return halts, halts.to(dtype)
+            z = self.head.logit(h, t).to(torch.float64) + baseline[t]
+            log_stop, log_continue = floored_stop_log_probs(z, self.epsilon)
+            deciders = active & deciding
+            stop = active & (uniforms[t] < log_stop.detach().exp())
+            # where, never a product with a mask: an undecided token's -inf (epsilon = 1)
+            # reaches neither the sum nor its gradient
+            taken = torch.where(stop, log_stop, log_continue)
+            log_prob = log_prob + torch.where(deciders, taken, zero)
+            decisions = decisions + deciders.to(torch.int32)
+            self.log_prob, self.decisions = log_prob, decisions
+            return stop, stop.to(dtype)
+
+        return step

@@ -10,7 +10,8 @@ from typing import cast
 import pytest
 
 from vesper.config import load
-from vesper.halting_experiment import SNAPSHOT, build, evaluate
+from vesper.halting_common import SNAPSHOT
+from vesper.halting_experiment import build, evaluate
 from vesper.halting_report import Run, load_results, pooled_summary, report
 from vesper.synthetic import CLASSES, episodes, generator_for
 
@@ -101,6 +102,23 @@ def test_records_that_disagree_are_refused(records: list[dict[str, object]]) -> 
     other_beta["beta"] = 0.5
     with pytest.raises(ValueError, match="different beta"):
         _ = _report([records[0], other_beta])
+    # a crossed-seed run (maintainer B 5dba6af) is not a seed: two of them would share one seed's
+    # row
+    crossed = copy.deepcopy(records[1])
+    crossed["data_seed"] = 4
+    with pytest.raises(ValueError, match="seed 1 trained on data order 4"):
+        _ = _report([records[0], crossed])
+    explicit = copy.deepcopy(records[1])
+    explicit["data_seed"] = 1  # the data order of its own seed: a plain run, read as before
+    assert _report([records[0], explicit]) == _report([records[0], records[1]])
+    # a warm start (init_weights) is not a seed of a fresh-start recipe; a fresh run's null is
+    warm = copy.deepcopy(records[1])
+    warm["init_weights"] = {"path": "elsewhere/model.pt"}
+    with pytest.raises(ValueError, match="seed 1 started from another run's weights"):
+        _ = _report([records[0], warm])
+    fresh = copy.deepcopy(records[1])
+    fresh["init_weights"] = None
+    assert _report([records[0], fresh]) == _report([records[0], records[1]])
 
 
 def _saved_run(root: Path, record: dict[str, object], original: Path) -> Path:

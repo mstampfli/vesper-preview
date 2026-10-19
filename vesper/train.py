@@ -688,7 +688,12 @@ def restore(
     opt.load_state_dict(
         cast("dict[str, object]", torch.load(path / "optimizer.pt", weights_only=True))
     )
-    saved_states = cast("dict[str, object]", torch.load(path / "states.pt", weights_only=True))
+    # states load on the CPU whatever device saved them, are checked there (one device, real
+    # floating dtypes) and moved to the run's device by _to_device: the explicit migration
+    saved_states = cast(
+        "dict[str, object]",
+        torch.load(path / "states.pt", weights_only=True, map_location="cpu"),
+    )
     groups = cast("list[dict[str, object]]", saved_states["groups"])
     mixer_record = cast("dict[str, object] | None", saved_states.get("mixer"))
     progress_record = cast("dict[str, object]", record["progress"])
@@ -918,7 +923,10 @@ def _parser() -> argparse.ArgumentParser:
         "--scan",
         choices=SCAN_IMPLS,
         default="reference",
-        help="the recurrent scan: the reference, or the fused CUDA kernel (bf16 intermediates)",
+        help=(
+            "the recurrent scan: the reference, the fused CUDA kernel (bf16 intermediates), or "
+            "the fused float32 CUDA kernel (the reference's precision)"
+        ),
     )
     return parser
 
@@ -943,9 +951,9 @@ def run(  # noqa: C901, PLR0913, PLR0915
     """The run: streams, schedule, steps, log lines, checkpoints with evaluations.
 
     ``scan`` chooses the recurrent scan for the whole run, evaluations included (``set_scan``):
-    "reference" or "fused" (CUDA and the gpu extra); the run line records what the model's
-    sublayers report (``scan_of``), and a resume may change it, since it is no part of the
-    checkpoint.
+    "reference", "fused" or "fused-fp32" (CUDA and the gpu extra); the run line records what the
+    model's sublayers report (``scan_of``), and a resume may change it, since it is no part of
+    the checkpoint.
 
     The run ends when the token budget is reached, the optional step cap is hit or every stream
     is dry (the ``end`` line's ``reason``: ``budget``, ``steps``, ``exhausted``); the last

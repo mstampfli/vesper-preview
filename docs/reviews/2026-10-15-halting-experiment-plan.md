@@ -5,6 +5,8 @@ prior, a frozen head until measured criteria, KL annealed down, compute penalty 
 maintainer A's and maintainer B's adversarial reviews (channel e742aec; docs/reviews/2026-10-15-halting-
 objective-adversarial.md) and maintainer B's amendments (channel 1f31541). Status: a PLAN for the project owner's
 decision. Nothing below is built. The normalized halting head (690bdca) stays in every condition.
+Amended 2026-10-17 by docs/reviews/2026-10-17-halting-in-phases.md (adopted, not proven): the
+halting runs start from weights whose depth is already useful and train with real stopping.
 
 ## The question
 

@@ -29,6 +29,7 @@ from vesper.train import (
     Layout,
     Progress,
     Recipe,
+    _to_device,  # pyright: ignore[reportPrivateUsage]
     checkpoint,
     decays,
     detach_states,
@@ -403,6 +404,55 @@ def test_checkpoint_round_trip_restores_everything_and_refuses_tampering(tmp_pat
     _ = (where / "model.pt").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="hash differs"):
         _ = restore(where, fresh, fresh_opt, identity(), Layout(1, 2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the CUDA history transition needs a GPU")
+def test_cuda_states_from_a_bf16_autocast_step_restore_on_the_cpu_and_move_back(
+    tmp_path: Path,
+) -> None:
+    # Maintainer B's review of f4c9279: the cold -> saved key history under CUDA bf16 autocast,
+    # through the real checkpoint and restore; states load on the CPU (one device, checked there)
+    # and _to_device moves them back exactly
+    cuda = torch.device("cuda")
+    cfg = training_config()
+    assert cfg.recurrence.key_conv > 0
+    docs = [
+        Document(
+            f"d{i}",
+            torch.randint(1, 64, (20,), generator=torch.Generator().manual_seed(i)).to(torch.int32),
+        )
+        for i in range(4)
+    ]
+    model = Vesper(cfg, torch.Generator().manual_seed(0)).to(cuda)
+    opt = optimizer(model, cfg)
+    groups = [
+        Group(
+            Stream(iter(docs), slots=2, chunk=cfg.training.chunk_tokens),
+            model.init_states(2, torch.float32, cuda),
+        )
+    ]
+    _ = step(model, opt, groups, phase_schedule(0, 0, cfg), cfg, cuda)
+    saved = groups[0].states
+    assert any(float(z.abs().max()) > 0 for s in saved for z in s.key_history)  # it transitioned
+    where = tmp_path / "step-1"
+    _ = checkpoint(
+        where, model, opt, groups, progress_at(1, 32), identity(), recipe(), reason="interval"
+    )
+    fresh = Vesper(cfg, torch.Generator().manual_seed(99))
+    restored = restore(where, fresh, optimizer(fresh, cfg), identity(), Layout(1, 2)).states[0]
+    for before, after in zip(saved, restored, strict=True):
+        tensors = (*after.h, *after.key_history, *(t for c in after.kv for t in (c.k, c.v, c.pos)))
+        assert {t.device for t in tensors} == {CPU}
+        assert {t.dtype for t in (*after.h, *after.key_history)} == {torch.float32}
+        back = _to_device([after], cuda)[0]
+        assert all(
+            torch.equal(x, y) for x, y in zip(before.key_history, back.key_history, strict=True)
+        )
+        assert all(torch.equal(x, y) for x, y in zip(before.h, back.h, strict=True))
+        assert all(
+            torch.equal(x.k, y.k) and torch.equal(x.v, y.v) and torch.equal(x.pos, y.pos)
+            for x, y in zip(before.kv, back.kv, strict=True)
+        )
 
 
 def test_a_checkpoint_of_another_schema_is_refused_before_any_weight_is_loaded(

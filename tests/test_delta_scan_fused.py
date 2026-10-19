@@ -15,7 +15,11 @@ from vesper.column import ColumnShape, RecurrentSublayer, scan_of, set_scan
 from vesper.contracts import ContractError
 from vesper.data import Document, Stream
 from vesper.kernels import delta_scan as fused_module
-from vesper.kernels.delta_scan import delta_scan_fused, fused_scan_available
+from vesper.kernels.delta_scan import (
+    delta_scan_fused,
+    delta_scan_fused_fp32,
+    fused_scan_available,
+)
 from vesper.model import Vesper
 from vesper.recurrence import delta_scan_chunked, normalize_keys, write_strength
 
@@ -173,8 +177,9 @@ def test_set_scan_refuses_unknown_names_and_models_without_a_recurrence() -> Non
         _ = set_scan(model, "triton")
     with pytest.raises(ValueError, match="no recurrent sublayer"):
         _ = set_scan(nn.Linear(2, 2), "reference")
-    with pytest.raises(ValueError, match="fused scan needs"):
-        _ = set_scan(model, "fused")  # on CPU: no device here, or no CUDA parameters
+    for impl in ("fused", "fused-fp32"):
+        with pytest.raises(ValueError, match="fused scan needs"):
+            _ = set_scan(model, impl)  # on CPU: no device here, or no CUDA parameters
     assert scan_of(model) == "reference"  # a refused switch changed nothing
 
 
@@ -224,3 +229,148 @@ def test_the_model_trains_the_same_under_either_scan() -> None:
 
 def test_the_module_names_one_head_dim_bound() -> None:
     assert fused_module.MAX_HEAD_DIM == 256
+
+
+# --- the float32 recurrent kernel ------------------------------------------------------------
+# Its licence is float32 rounding only: measured about 2e-7 (stage 1) to 4e-7 (4096 tokens)
+# relative against the float64 reference on the same inputs, the float32 reference's own error.
+# TOL_FP32 = 1e-5 keeps a margin and still refuses the bfloat16 kernel (about 5e-3) or any
+# bfloat16 cast on the way.
+
+TOL_FP32 = 1e-5
+
+
+def _inputs32(b: int, n: int, h: int, dk: int, seed: int = 0) -> Inputs:
+    q, k, v, beta, h0 = _inputs(b, n, h, dk, seed)
+    g = torch.Generator().manual_seed(seed + 100)  # float32 values the bf16 grid cannot hold
+    noise = [1e-3 * torch.randn(t.shape, generator=g).to(t.device) for t in (q, v)]
+    k32 = normalize_keys(k.float() + 1e-3 * torch.randn(k.shape, generator=g).to(k.device))
+    return (
+        q.float() + noise[0],
+        k32,
+        v.float() + noise[1],
+        beta.float(),
+        h0,
+    )
+
+
+@needs_fused
+@pytest.mark.parametrize(("b", "n", "h", "dk"), SIZES)
+def test_fp32_forward_and_state_match_the_reference_to_float32(
+    b: int, n: int, h: int, dk: int
+) -> None:
+    q, k, v, beta, h0 = _inputs32(b, n, h, dk)
+    o_ref, s_ref = _reference(q, k, v, beta, h0)
+    o, s = delta_scan_fused_fp32(q, k, v, beta, h0)
+    assert (o.dtype, s.dtype) == (torch.float32, torch.float32)
+    assert _rel(o, o_ref) < TOL_FP32
+    assert _rel(s, s_ref) < TOL_FP32
+
+
+@needs_fused
+@pytest.mark.parametrize(("b", "n", "h", "dk"), SIZES[:4])
+def test_fp32_every_gradient_matches_the_reference_to_float32(
+    b: int, n: int, h: int, dk: int
+) -> None:
+    q, k, v, beta, h0 = _inputs32(b, n, h, dk)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    d_o = torch.randn(b, n, h, dk, generator=g, device="cuda")
+    d_s = torch.randn(b, h, dk, dk, generator=g, device="cuda")
+    ref_in = [t.double().requires_grad_() for t in (q, k, v, beta, h0)]
+    o_ref, s_ref = delta_scan_chunked(ref_in[0], ref_in[1], ref_in[2], ref_in[3], ref_in[4], 64)
+    torch.autograd.backward([(o_ref * d_o.double()).sum() + (s_ref * d_s.double()).sum()])
+    fused_in = [t.clone().requires_grad_() for t in (q, k, v, beta, h0)]
+    o, s = delta_scan_fused_fp32(fused_in[0], fused_in[1], fused_in[2], fused_in[3], fused_in[4])
+    torch.autograd.backward([(o * d_o).sum() + (s * d_s).sum()])
+    for name, got, want in zip(["q", "k", "v", "beta", "state"], fused_in, ref_in, strict=True):
+        assert got.grad is not None, name
+        assert want.grad is not None, name
+        assert _rel(got.grad, want.grad) < TOL_FP32, name
+
+
+@needs_fused
+def test_fp32_gradients_flow_from_a_state_that_needs_none() -> None:
+    # a cold or detached state (the first pass of every chunk) does not require grad; fla's
+    # recurrent backward failed to compile there, so the wrapper gives the kernel a fresh leaf
+    q, k, v, beta, h0 = _inputs32(2, 63, 3, 16)
+    ref_in = [t.double().requires_grad_() for t in (q, k, v, beta)]
+    o_ref, _ = delta_scan_chunked(ref_in[0], ref_in[1], ref_in[2], ref_in[3], h0.double(), 64)
+    torch.autograd.backward([o_ref.square().sum()])
+    fused_in = [t.clone().requires_grad_() for t in (q, k, v, beta)]
+    state = h0.clone()
+    o, _ = delta_scan_fused_fp32(fused_in[0], fused_in[1], fused_in[2], fused_in[3], state)
+    torch.autograd.backward([o.square().sum()])
+    assert not state.requires_grad  # the caller's state is untouched
+    assert state.grad is None
+    for name, got, want in zip(["q", "k", "v", "beta"], fused_in, ref_in, strict=True):
+        assert got.grad is not None, name
+        assert want.grad is not None, name
+        assert _rel(got.grad, want.grad) < TOL_FP32, name
+
+
+@needs_fused
+def test_fp32_a_carried_state_continues_the_sequence_and_no_tokens_change_nothing() -> None:
+    q, k, v, beta, h0 = _inputs32(2, 130, 3, 16)
+    o_ref, s_ref = _reference(q, k, v, beta, h0)
+    o_a, s_a = delta_scan_fused_fp32(q[:, :50], k[:, :50], v[:, :50], beta[:, :50], h0)
+    o_b, s_b = delta_scan_fused_fp32(q[:, 50:], k[:, 50:], v[:, 50:], beta[:, 50:], s_a)
+    assert _rel(torch.cat([o_a, o_b], dim=1), o_ref) < TOL_FP32
+    assert _rel(s_b, s_ref) < TOL_FP32
+    o0, s0 = delta_scan_fused_fp32(q[:, :0], k[:, :0], v[:, :0], beta[:, :0], h0)
+    assert o0.shape == (2, 0, 3, 16)
+    assert s0 is h0
+
+
+@needs_fused
+def test_fp32_refuses_bfloat16_inputs_and_a_cpu_tensor() -> None:
+    q, k, v, beta, h0 = _inputs32(1, 8, 2, 16)
+    with pytest.raises(ContractError, match="dtype"):
+        _ = delta_scan_fused_fp32(q.to(BF16), k, v, beta, h0)
+    with pytest.raises(ContractError, match="dtype"):
+        _ = delta_scan_fused_fp32(q, k, v, beta.to(BF16), h0)
+    with pytest.raises(ContractError, match="is on cpu"):
+        _ = delta_scan_fused_fp32(q, k, v, beta, h0.cpu())
+    z = torch.zeros(1, 4, 1, 8)
+    with pytest.raises(ContractError, match="CUDA only"):
+        _ = delta_scan_fused_fp32(z, z, z, torch.zeros(1, 4, 1), torch.zeros(1, 1, 8, 8))
+
+
+def test_a_fused_fp32_sublayer_runs_the_fp32_kernel_and_never_the_reference() -> None:
+    # as for "fused": on a CPU sublayer the branch must reach delta_scan_fused_fp32, which
+    # refuses the device; a dispatch that fell back to the reference would return a result
+    sub = RecurrentSublayer(SHAPE, torch.Generator().manual_seed(0))
+    sub.scan_impl = "fused-fp32"
+    with pytest.raises(ContractError, match="CUDA only"):
+        _ = sub.forward(torch.randn(2, 6, 32), torch.zeros(2, 2, 16, 16), torch.zeros(2, 3, 32))
+
+
+@needs_fused
+def test_the_model_trains_the_same_under_the_fp32_kernel_to_float32() -> None:
+    # float32 throughout, no autocast: the reference scan and the fp32 kernel differ only in
+    # float32 rounding, so the loss and every parameter gradient agree to 1e-4 relative (the
+    # bfloat16 kernel misses this by an order of magnitude or more)
+    cfg = small_config()
+    cuda = torch.device("cuda")
+    docs = [
+        Document("a", torch.arange(1, 30, dtype=torch.int32)),
+        Document("b", torch.arange(20, 51, dtype=torch.int32)),
+    ]
+    chunk = Stream(iter(docs), slots=2, chunk=16).next()
+    assert chunk is not None
+    outcomes: list[tuple[Tensor, list[Tensor]]] = []
+    for impl in ("reference", "fused-fp32"):
+        model = Vesper(cfg, torch.Generator().manual_seed(0)).to(cuda)
+        assert set_scan(model, impl) == cfg.model.columns
+        assert scan_of(model) == impl
+        result = model.run(
+            chunk.tokens.to(cuda), chunk.pos.to(cuda), model.init_states(2, torch.float32, cuda)
+        )
+        objective, _ = model.objective(chunk, result, cfg)
+        torch.autograd.backward([objective])
+        grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+        outcomes.append((objective.detach(), grads))
+    (loss_ref, grads_ref), (loss_fp32, grads_fp32) = outcomes
+    assert len(grads_ref) == len(grads_fp32)
+    assert _rel(loss_fp32, loss_ref) < 1e-6
+    for got, want in zip(grads_fp32, grads_ref, strict=True):
+        assert _rel(got, want) < 1e-4

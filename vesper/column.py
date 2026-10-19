@@ -27,15 +27,22 @@ from vesper.config import VesperConfig
 from vesper.contracts import ContractError, Dims, check_shape
 from vesper.ffn import FFN
 from vesper.kernels.delta_scan import (
+    FP32_INPUT_DTYPE,
     INPUT_DTYPE,
     STATE_DTYPE,
     delta_scan_fused,
+    delta_scan_fused_fp32,
     fused_scan_available,
 )
 from vesper.recurrence import delta_scan_chunked, normalize_keys, write_strength
 
-ScanImpl = Literal["reference", "fused"]
-SCAN_IMPLS: tuple[ScanImpl, ...] = ("reference", "fused")
+ScanImpl = Literal["reference", "fused", "fused-fp32"]
+SCAN_IMPLS: tuple[ScanImpl, ...] = ("reference", "fused", "fused-fp32")
+# what each fused scan takes its q, k, v, beta in; the reference takes promote_types(dtype, float32)
+FUSED_INPUT_DTYPES: dict[ScanImpl, torch.dtype] = {
+    "fused": INPUT_DTYPE,
+    "fused-fp32": FP32_INPUT_DTYPE,
+}
 
 _RMS_EPS = 1e-6  # the regularizer inside the root of RMSNorm, not a tunable and not a floor
 _RMS_SCALE_FLOOR = 1e-3  # sqrt(_RMS_EPS): keeps eps / scale^2 finite for rows near zero
@@ -277,16 +284,15 @@ class RecurrentSublayer(nn.Module):
         With ``scan_impl`` "fused" the scan is ``delta_scan_fused`` instead: ``q, k, v, beta``
         enter in bfloat16 (on the bf16 training path the projections already are), the state
         stays float32 across passes as above, and the kernel's bfloat16 intermediates are the
-        precision it brings (vesper/kernels/delta_scan.py, measured there).
+        precision it brings (vesper/kernels/delta_scan.py, measured there). With "fused-fp32"
+        it is ``delta_scan_fused_fp32``: everything in float32, the reference's precision.
         """
-        if self.scan_impl == "fused":
+        if self.scan_impl != "reference":
+            kernel = delta_scan_fused if self.scan_impl == "fused" else delta_scan_fused_fp32
+            dtype = FUSED_INPUT_DTYPES[self.scan_impl]
             with torch.autocast(device_type=q.device.type, enabled=False):
-                o, new_state = delta_scan_fused(
-                    q.to(INPUT_DTYPE),
-                    k.to(INPUT_DTYPE),
-                    v.to(INPUT_DTYPE),
-                    beta.to(INPUT_DTYPE),
-                    state.to(STATE_DTYPE),
+                o, new_state = kernel(
+                    q.to(dtype), k.to(dtype), v.to(dtype), beta.to(dtype), state.to(STATE_DTYPE)
                 )
             return F.linear(o.to(q.dtype).flatten(2), self.w_o), new_state
         compute = torch.promote_types(q.dtype, torch.float32)
@@ -329,16 +335,16 @@ class RecurrentSublayer(nn.Module):
 def set_scan(model: nn.Module, impl: str) -> int:
     """Choose the scan implementation of every ``RecurrentSublayer`` in ``model``.
 
-    One switch for the whole model, so no run mixes the two. "fused" needs a CUDA device and
-    fla-core, and every parameter of ``model`` on CUDA: it is refused here, before any step,
-    rather than failing at the first scan.
+    One switch for the whole model, so no run mixes two. "fused" and "fused-fp32" need a CUDA
+    device and fla-core, and every parameter of ``model`` on CUDA: they are refused here, before
+    any step, rather than failing at the first scan.
 
     Returns:
         The number of sublayers set.
 
     Raises:
         ValueError: if ``impl`` is not one of ``SCAN_IMPLS``, if ``model`` has no recurrent
-            sublayer, or if "fused" is asked where it cannot run.
+            sublayer, or if a fused scan is asked where it cannot run.
     """
     if impl not in SCAN_IMPLS:
         msg = f"scan must be one of {SCAN_IMPLS}, got {impl!r}"
@@ -362,12 +368,12 @@ def check_scan(impl: str, device: torch.device) -> ScanImpl:
     anything, with the device it is about to use.
 
     Raises:
-        ValueError: if ``impl`` is not one of ``SCAN_IMPLS``, or "fused" off CUDA or without
-            fla-core.
+        ValueError: if ``impl`` is not one of ``SCAN_IMPLS``, or a fused scan off CUDA or
+            without fla-core.
     """
     if impl == "reference":
         return "reference"
-    if impl != "fused":
+    if impl not in FUSED_INPUT_DTYPES:
         msg = f"scan must be one of {SCAN_IMPLS}, got {impl!r}"
         raise ValueError(msg)
     if device.type != "cuda":
@@ -376,7 +382,7 @@ def check_scan(impl: str, device: torch.device) -> ScanImpl:
     if not fused_scan_available():
         msg = "the fused scan needs a CUDA device and fla-core (the gpu extra)"
         raise ValueError(msg)
-    return "fused"
+    return "fused" if impl == "fused" else "fused-fp32"
 
 
 def scan_of(model: nn.Module) -> ScanImpl:
@@ -460,9 +466,17 @@ def map_state(state: ColumnState, f: Callable[[Tensor], Tensor]) -> ColumnState:
 def check_column_state(state: ColumnState, shape: ColumnShape, t_max: int) -> None:
     """Refuse a state that this column geometry and pass count cannot run (a restored one).
 
+    The dtype and device policy (maintainer B's review of f4c9279): recurrent states and key
+    histories are real floating point, float32 or wider; attention windows are real floating point
+    at any width (they take the activation dtype, bf16 under autocast) with ``int64`` positions;
+    every tensor of the state lives on one device. Moving a valid state to another device is
+    ``map_state(state, lambda t: t.to(device))``, which keeps it on one device.
+
     Raises:
         ValueError: on a pass count other than ``t_max`` in any field, a window other than the
-            shape's, or a recurrent state or key history below float32.
+            shape's, a recurrent state or key history that is not real floating point of
+            float32 or wider, an attention window that is not real floating point, or a tensor
+            on another device than ``h[0]``.
         ContractError: on a tensor shape that does not match the geometry, or batch sizes that
             differ between fields.
     """
@@ -488,8 +502,27 @@ def check_column_state(state: ColumnState, shape: ColumnShape, t_max: int) -> No
             msg = f"kv[{t}] has window {cache.window}, the column has {shape.window}"
             raise ValueError(msg)
         for name, tensor in ((f"h[{t}]", h), (f"key_history[{t}]", history)):
-            if torch.promote_types(tensor.dtype, torch.float32) != tensor.dtype:
-                msg = f"{name} is {tensor.dtype}; carried states are float32 or wider"
+            # promote_types alone admits complex64 (maintainer B): a real floating dtype is required
+            # first
+            if not tensor.dtype.is_floating_point or (
+                torch.promote_types(tensor.dtype, torch.float32) != tensor.dtype
+            ):
+                msg = f"{name} is {tensor.dtype}; carried states are real float32 or wider"
+                raise ValueError(msg)
+        for name, tensor in ((f"kv[{t}].k", cache.k), (f"kv[{t}].v", cache.v)):
+            if not tensor.dtype.is_floating_point:
+                msg = f"{name} is {tensor.dtype}; attention windows are real floating point"
+                raise ValueError(msg)
+        named = (
+            (f"h[{t}]", h),
+            (f"key_history[{t}]", history),
+            (f"kv[{t}].k", cache.k),
+            (f"kv[{t}].v", cache.v),
+            (f"kv[{t}].pos", cache.pos),
+        )
+        for name, tensor in named:
+            if tensor.device != state.h[0].device:
+                msg = f"{name} is on {tensor.device}, h[0] on {state.h[0].device}; one device"
                 raise ValueError(msg)
 
 

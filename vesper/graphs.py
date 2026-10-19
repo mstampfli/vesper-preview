@@ -16,7 +16,9 @@ initialization and allocator warm-up must not happen during capture); those are 
 
 For: the stage-1 training step on CUDA (``vesper.halting_experiment --cuda-graph``), every
 condition; ACT's loop has no host sync (all passes run, halted tokens are masked), its head freeze
-and pass count are fixed per capture. Not for: evaluation, or anything on the CPU.
+and pass count are fixed per capture; the halting calibration's update (head-only and joint).
+``WarmedGraph`` is the warm-capture-replay life both drivers share. Not for: evaluation, or
+anything on the CPU.
 """
 
 from collections.abc import Callable, Generator, Sequence
@@ -80,3 +82,61 @@ class CapturedStep:
             _ = static.copy_(value)
         self._graph.replay()
         return self.outputs
+
+
+WARM_STEPS = 3  # eager steps on a side stream before a capture (lazy init, autotuning)
+
+
+class WarmedGraph:
+    """PRIMITIVE warm, capture, replay: one training update's whole life as a CUDA graph.
+
+    Each call runs ``step(values)``: the first ``warm`` calls after construction or ``reset``
+    eagerly inside ``side_stream`` (real updates, as CUDA graphs require before a capture), the
+    next one captures ``step`` over owned copies of ``values`` (``CapturedStep``) and replays it
+    at once on those values, and every later call copies its values in and replays. The outputs
+    are the step's tensors; after a replay they are the graph's, overwritten by the next call, so
+    the caller reads them first. What ``step`` may do is ``CapturedStep``'s contract; a value
+    that changes between updates (a learning rate, a floor) is a device tensor among ``values``
+    or filled in place before the call, never a Python number read inside ``step``. The step
+    function of the capturing call is the one replayed: later calls' ``step`` is not called.
+
+    For: a driver's update on CUDA (``vesper.halting_experiment.GraphedTraining``,
+    ``vesper.halting_calibration.train_update``). Not for: work whose shapes or Python
+    decisions change between calls without a ``reset``.
+    """
+
+    def __init__(self, warm: int = WARM_STEPS) -> None:
+        """Nothing is captured yet; the first ``warm`` calls run eagerly."""
+        self.warm: int = warm
+        self.captures: int = 0
+        self.replays: int = 0
+        self._eager: int = 0
+        self._captured: CapturedStep | None = None
+
+    def reset(self) -> None:
+        """Drop the capture: the next ``warm`` calls are eager again, then a new capture."""
+        self._eager, self._captured = 0, None
+
+    def __call__(
+        self, step: Callable[[Sequence[Tensor]], Sequence[Tensor]], values: Sequence[Tensor]
+    ) -> tuple[Tensor, ...]:
+        """One update: eager while warming, else a replay over ``values`` (CUDA tensors).
+
+        Raises:
+            ContractError: if a value is not on CUDA, or (on a replay) not shaped and typed like
+                the captured one.
+        """
+        for index, value in enumerate(values):
+            if not value.is_cuda:
+                msg = f"value {index} is on {value.device}, not CUDA"
+                raise ContractError(msg)
+        if self._eager < self.warm:
+            self._eager += 1
+            with side_stream():
+                return tuple(step(values))
+        if self._captured is None:
+            static = [value.clone() for value in values]  # owned buffers, never the caller's
+            self._captured = CapturedStep(lambda: step(static), static)
+            self.captures += 1
+        self.replays += 1
+        return self._captured.replay(values)

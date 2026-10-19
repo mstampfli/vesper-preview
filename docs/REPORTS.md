@@ -7,6 +7,189 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-19, 08:03Z: the whole model can now learn with its stopping, and those runs are 3x faster
+
+**What changed.** Two things. First, joint mode: until now only the small stopping head learned
+while the rest of the model stayed frozen. In joint mode the whole model learns along with it,
+so it can reshape what it computes to make stopping early easier. Its gradient was checked
+against an exact hand-enumerated case (one of the checks caught a mistake in my own test first),
+and maintainer B reviewed and accepted it (07:15Z). The first two joint runs started at 07:15Z. Second,
+speed: the project owner asked why these runs did not use the GPU recording trick (CUDA graphs) that the
+earlier experiments already used. They had never been given it, which was my miss. Each update
+was about 10,000 tiny GPU jobs sent one at a time, and the waiting between them took about 70 %
+of the time (counted once with the slower reference version of the recurrence; the runs use the
+fast one, whose count was not taken). Now the update is recorded once and replayed. Measured on the real model, with
+other runs sharing the card: 49 to 15 ms per update for the stopping head alone, 98 to 33 ms in
+joint mode, 161 to 52 ms in joint mode with the extra all-depth training signal. About 3.1x
+everywhere. The recorded updates give bit-for-bit the same results as the plain ones, and the
+earlier experiment driver now uses the same shared mechanism instead of its own copy.
+
+**What it means for you.** The training updates of these experiments are about three times
+faster, so longer and bigger exploratory runs fit in a day or one night. A whole experiment also
+generates its data (about 4 ms per update) and evaluates on the CPU, outside that speedup; the
+throughput of a whole experiment is not measured yet. Runs from before this
+change are not bit-for-bit repeatable under it (the GPU optimizer variant rounds differently);
+each run records which one it used.
+
+**What is next.** The results of the two joint runs (does the whole model learning stop the
+overshoot?), then the overnight batch with the faster runs.
+
+**Details.** vesper/graphs.py (`WarmedGraph`), vesper/halting_calibration.py (`train_update`,
+`_update_step`), tests/test_calibration_graph.py; maintainer B's joint review: channel 4871b54.
+
+## 2026-10-19, 07:05Z: the model learns to stop early and beats fixed depth, then overshoots
+
+**What changed.** On 10-18 the model, already trained to answer every lookup class, was taught
+to decide per token when to stop thinking (only its stopping head trained; the rest frozen).
+Maintainer B's careful first trial learned nothing (every token still used all 8 passes). After the project owner
+moved experiments to a faster, exploratory lane (code keeps full checks), eighteen exploratory
+runs followed in four hours. With a stronger price on depth, the stopping policy for the first
+time beat every fixed-depth setting at the same average number of passes, on 3 of the 5 trained
+models (best: 92.3 % at 3.2 passes on average, where the best fixed-depth mixture gets 84.0 %),
+and it spends depth where it is needed (one-step questions about 2 passes, four-step questions
+about 4). The code now also has a joint mode, in which the whole model adapts while the stopping
+head learns, checked against the exact gradient; it is pushed and waiting for maintainer B's review.
+
+**What it means for you.** Adaptive depth works in the sense that matters first: at the same
+average number of passes a token is counted as using (its mean active depth), choosing per token
+beats choosing one depth for everything. The loop still executes every pass for every token, so
+no compute is saved yet. Two limits stay
+visible: the policy keeps cutting depth past the good region and then loses the rarest
+questions (the "read" classes) or, on two models, collapses; and always running 4 passes
+(95.2 %) is still better than anything it found below 4. Counting rare question types equally
+did not keep them. All of this is exploratory: one seed per setting, 256 evaluation episodes,
+logical depth, not measured speed.
+
+**What is next.** Maintainer B's review of the joint mode, then its first two runs (one GPU hour or
+less each), to see whether a model that adapts to its own stopping stops overshooting. A morning
+batch checks whether the best result repeats with other seeds and on the other models. Then the
+real-text halting pilot you approved on 10-15.
+
+**Where the details are.** Exports with tables and notes under <evidence>/:
+sweep-depthcost-4161f93p, sweep-sources-4161f93p, sweep-classweight-6998942, long-dc10-6998942,
+joint-review; the calibration code and its options in [the registry](registry.md)
+(halting_calibration); maintainer B's reviews in the channel (9f1eceb to 631bdb9).
+
+## 2026-10-18, 06:00Z: with time, the harder levels come too; about half the runs stay stuck
+
+**What changed.** Sixteen more stage-1 runs trained overnight, four times as long as the first
+ones (144,000 updates). Nine learned the two-step lookups, six of those then the three-step
+lookups, and four the four-step lookups; each level came after its own long wait, from 13,000 to
+79,000 updates for the first level alone. One run, pair 20/20, learned every class including the
+hardest register read: the second run ever, after pair 4/4. Seven of the sixteen never left the
+first plateau.
+
+**What it means for you.** The model can learn to chain lookups and to use more passes for
+harder ones, and more training brings more levels. We now have five trained models that know all
+four lookup levels, which is what the halting runs need to start from. Why half the runs stay
+stuck is not known; the project owner's call this morning was not to spend days on that and to move to
+halting, and I agree.
+
+**What is next.** Two small pieces of code for the halting runs (start from trained weights; a
+floor on taking another pass, lowered to zero), then the halting runs in the phases adopted on
+2026-10-17 (not proven). Maintainer B decides their exact design.
+
+**Details.** docs/reviews/2026-10-17-levels-with-time.md and -b.md (recipes and reading rules
+fixed before launch), <evidence>/levels-with-time-0e887f7/PAGE.md. Not reviewed by
+maintainer B yet.
+
+## 2026-10-17, 18:26Z: most runs do learn the two-step lookups, given time; harder levels come later
+
+**What changed.** Eight new stage-1 runs on the exact fast kernel trained twice as long, to
+72,000 updates. Six of the eight learned the two-step lookups (four by 36,000, two right at it);
+two never did, even at 72,000. This morning's batch of eight, with other seeds, had one in
+eight. The harder lookups behave like separate steps on a staircase: three-step lookups were
+learned later still, in two runs (one after 36,000, one after 54,000), four-step lookups in none
+yet, though one run was rising at the end.
+
+**What it means for you.** Learning to chain lookups is mostly slow rather than impossible: most
+runs get there, each level takes its own long wait, and 36,000 updates was too short to see it.
+Two runs in eight stayed stuck at the first level, so it is not only slowness. Only one run so
+far (pair 4/4, this morning) has learned every level.
+
+**What is next.** Longer runs on the cheap kernel, or a way to shorten the waits, before the
+halting runs: halting needs models that have learned several levels, so that harder questions
+can use more passes.
+
+**Details.** docs/reviews/2026-10-17-escape-slowness-or-luck.md (the recipe and the reading rules
+fixed before launch), <evidence>/halting-exact72-0e887f7/PAGE.md. Not reviewed by
+maintainer B until Thursday.
+
+## 2026-10-17, 11:21Z: an exact fast kernel, and one run that learns every lookup class
+
+**What changed.** The GPU now has a scan that is as exact as our reference and as fast as the
+rounded one: 18.6 ms per training step instead of 634 ms. With it, eight training runs of the
+stage-1 task (one column, eight passes, every token running every pass) ran at once in under an
+hour and a half. One of the eight, pair 4/4, learned the two-step lookups at 24,000 updates and
+then everything else: three- and four-step lookups at 90 % and 82 %, and every register-reading
+class above 50 %, the hardest at 65 %. No stage-1 run before met that bar. The other seven did
+not learn the two-step lookups by 36,000.
+
+**What it means for you.** This morning's hint was that the fast kernel's rounding was why
+learning is so unreliable. That holds for pair 4/4 (the same weights and data learn with both
+exact kernels and not with the rounded one), but not in general: on the four pairs from
+yesterday, one learned with each kernel, and not the same one. So exactness is not the cure for
+the unreliability; learning these lookups may hinge on small differences early in training (a
+hypothesis, not shown). The good news is that a full run now costs minutes of GPU time, so
+finding out what decides it is cheap.
+
+**What is next.** Find what makes a run escape, using the cheap exact kernel and more seeds; then
+the halting runs, started from weights that escaped, in the phases the project owner adopted today (marked not
+proven, docs/reviews/2026-10-17-halting-in-phases.md). Not reviewed by maintainer B until Thursday.
+
+**Details.** docs/reviews/2026-10-17-exact-scan-seeds.md (the recipe), the run export
+<evidence>/halting-exact-9ce2453/PAGE.md, docs/registry.md (delta_scan_fused_fp32).
+
+## 2026-10-17, 06:20Z: the fast GPU kernel's rounding stopped one pair from learning
+
+**What changed.** Maintainer B's four-run test (two starting-weight seeds crossed with two data-order
+seeds, 36,000 steps each on the GPU with the fast kernel) gave one escape in four: only pair
+4/1 learned two-step lookups, at step 34,000. The same pair 4/4 had learned them at step 16,000
+in an older CPU run, so maintainer B asked for one clean comparison: pair 4/4 twice on the GPU, the same
+code, starting weights and training data (both checked by fingerprints over every batch), only
+the memory update computed differently. With our exact version it learned two-step lookups at
+step 19,000, and then three- and four-step lookups as well (95 % and 89 %, each answered after
+as many passes as it has steps). With the fast kernel, which rounds its inputs to 16-bit numbers,
+it learned none of them by step 36,000.
+
+**What it means for you.** For this one pair the kernel's rounding decided whether the model
+learned to chain lookups at all; small numerical differences can move the moment it learns by
+thousands of steps. One pair is not a general rule, but it means a run with the fast kernel that
+fails to learn cannot be counted as the model's failure until this is understood. The exact
+version took about three times as long per step here (0.50 against 0.17 seconds; the two runs
+shared the card during the fast one's 1.7 hours). Nothing needs a decision from you.
+
+**What is next.** Maintainer B decides the next measurement; I sent both learning curves and proposed
+nothing. Details: docs/reviews/2026-10-16-scan-policy-comparison.md, the result page in the
+channel queue (halting-scan-4c2e590/PAGE.md), the crossed-seed page (halting-cross-2bbffdc). Not
+reviewed by maintainer B yet.
+
+## 2026-10-16, 18:55Z: maintainer B's slower teaching schedule failed; next, a four-run test on the GPU
+
+**What changed.** The one-column run with maintainer B's slower teaching schedule (two seeds, 36,000
+steps on the CPU) failed both of its pass marks, so by its own rule it stopped there. Seed 0
+learned two-step lookups only in its last few thousand steps, and showed the depth effect the
+project is after: 15 % after one pass, 73 % after three. Seed 1 never learned anything past
+one-step lookups. Maintainer B checked every number and narrowed what it means: the two seeds behave
+very differently, but a seed sets both the starting weights and the order of the training data,
+so the result cannot say which one matters, and it cannot clear the schedule either. Maintainer B then
+allowed training on the GPU as a new, separately recorded recipe, after two checks I ran this
+evening: the GPU computes the same gradients as the CPU within the limits we had already set,
+and the recorded (CUDA graph) training equals normal GPU training bit for bit over 120 steps.
+
+**What it means for you.** A run that took five hours on the CPU should take about an hour on
+the GPU, four at a time (measured per step; the full four-run time is measured by this test),
+so questions that needed a week of runs fit into an evening. Nothing about the model's design
+changed; nothing needs a decision from you.
+
+**What is next.** Maintainer B's chosen test: four GPU runs that cross two starting-weight seeds with two
+data-order seeds, measuring the step at which each first learns two-step lookups (checked every
+1,000 steps). That separates "it depends on the starting weights" from "it depends on the data
+order" for these two seeds; it is not yet a full picture over many seeds. The 12 formal runs stay
+on hold. Details: docs/reviews/2026-10-16-crossed-seed-diagnostic.md, vesper/halting_escape.py,
+the backend receipts in the channel queue (backend-check-11a60fb). The new code is not
+reviewed by maintainer B yet.
+
 ## 2026-10-16, 15:15Z: the small experiments train on the GPU, about ten times faster
 
 **What changed.** A stage-1 training step used to be thousands of tiny GPU jobs issued one by

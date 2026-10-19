@@ -226,9 +226,11 @@ def _check_identities(records: Sequence[Record]) -> None:
 
     Raises:
         ValueError: on a disagreement in ``SHARED``, a repeated condition and seed (a duplicate
-            would count as another seed), or a condition whose records differ in an objective
-            setting (``beta``: pooling different betas is not one condition; maintainer B's review
-            of c7d25c5).
+            would count as another seed), a record whose data order is not its seed's (a
+            crossed-seed run, ``halting_escape``), a record that started from another run's
+            weights (``init_weights``: a warm start is not a seed of a fresh-start recipe), or
+            a condition whose records differ in an objective setting (``beta``: pooling
+            different betas is not one condition; maintainer B's review of c7d25c5).
     """
     first = records[0]
     for key in SHARED:
@@ -241,6 +243,18 @@ def _check_identities(records: Sequence[Record]) -> None:
     seen: set[tuple[object, object]] = set()
     betas: dict[object, object] = {}
     for record in records:
+        if record.get("data_seed", record["seed"]) != record["seed"]:
+            msg = (
+                f"seed {record['seed']} trained on data order {record['data_seed']}: a "
+                "crossed-seed run is read by vesper.halting_escape, not pooled here as a seed"
+            )
+            raise ValueError(msg)
+        if record.get("init_weights") is not None:
+            msg = (
+                f"seed {record['seed']} started from another run's weights: a warm start is "
+                "not pooled here as a seed of a fresh-start recipe"
+            )
+            raise ValueError(msg)
         identity = (record["condition"], record["seed"])
         if identity in seen:
             msg = f"duplicate record for condition {identity[0]} seed {identity[1]}"

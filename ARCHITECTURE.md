@@ -37,9 +37,12 @@ protocol is docs/registry.md.
       halting_experiment.py  the stage-1 driver (python -m vesper.halting_experiment): one
                      condition and seed trained on the CPU or on CUDA (fused scan, optionally
                      one captured step replayed), evaluated on the CPU under every state policy
-      graphs.py      one training step captured as a CUDA graph and replayed (CapturedStep)
+      graphs.py      one training step captured as a CUDA graph and replayed (CapturedStep),
+                     warmed eagerly first (WarmedGraph; both halting drivers)
       halting_report.py  the stage-1 report (python -m vesper.halting_report): result records
                      pooled per condition into one Markdown page with the plan's verdicts
+      halting_escape.py  the crossed-seed diagnostic's endpoint (python -m
+                     vesper.halting_escape): when each run's hop2 leaves the plateau, per pair
       tokenizer.py   byte-level BPE training under a named pre-tokenization rule (words-v1 the
                      frozen choice, spaces-v1 kept selectable), encode/decode, save/load
       data.py        Document, Chunk, Stream (slots of whole documents into chunks), is_held_out
@@ -99,9 +102,11 @@ bounded-cost resume (`Mixer.restore`); docs/reviews/2026-10-15-training-loop.md,
     column, exits;  model.py -> loop, exits, embedding, learning, config (the one compute
     module that reads the config, to build itself)
     synthetic.py -> data;  halting_experiment.py -> column (scan), config, data, exits, graphs,
-    learning, loop, model, provenance, synthetic, train (optimizer, schedule, head freeze);
+    kernels (the fused scan's input dtype, recorded), learning, loop, model, provenance,
+    synthetic, train (optimizer, schedule, head freeze);
     halting_report.py ->
-    config, halting_experiment (summarize), synthetic
+    config, halting_experiment (summarize), synthetic;  halting_escape.py -> halting_experiment
+    (STATIC_CHECKS), provenance, synthetic
     tokenizer.py -> (nothing in vesper);  data.py -> contracts
     corpus.py -> data, keys, tokenizer;  books.py -> (nothing in vesper)
     collect.py -> books, corpus, keys;  acquire.py -> books, collect, generations, provenance

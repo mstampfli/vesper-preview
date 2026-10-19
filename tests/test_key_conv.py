@@ -295,6 +295,51 @@ def test_a_restored_state_is_checked_against_the_geometry() -> None:
         check_column_state(other_batch, SHAPE, 3)
 
 
+def test_a_restored_state_refuses_complex_integer_and_mixed_device_tensors() -> None:
+    # Maintainer B's review of f4c9279: promote_types admitted complex64, integer windows and a
+    # tensor on another device; each passed _states_from_record, and a complex history then ran with
+    # its imaginary part discarded
+    from vesper.train import (  # noqa: PLC0415
+        _state_record,  # pyright: ignore[reportPrivateUsage]
+        _states_from_record,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    model = _model()
+    good = model.init_states(1, F64, CPU)
+    first, last = good[0], model.t_max - 1
+    meta = torch.device("meta")
+    cases = {
+        r"key_history\[0\] is torch.complex128": replace(
+            first, key_history=tuple(z.to(torch.complex128) + 1j for z in first.key_history)
+        ),
+        r"h\[0\] is torch.complex64": replace(
+            first, h=tuple(h.to(torch.complex64) for h in first.h)
+        ),
+        r"kv\[0\].k is torch.int64": replace(
+            first, kv=tuple(replace(c, k=c.k.long()) for c in first.kv)
+        ),
+        r"kv\[0\].v is torch.int32": replace(
+            first, kv=tuple(replace(c, v=c.v.int()) for c in first.kv)
+        ),
+        r"kv\[0\].k is torch.complex64": replace(
+            first, kv=tuple(replace(c, k=c.k.to(torch.complex64)) for c in first.kv)
+        ),
+        r"key_history\[0\] is on meta": replace(
+            first, key_history=(first.key_history[0].to(meta), *first.key_history[1:])
+        ),
+        rf"kv\[{last}\].pos is on meta": replace(
+            first, kv=(*first.kv[:-1], replace(first.kv[-1], pos=first.kv[-1].pos.to(meta)))
+        ),
+    }
+    for message, bad in cases.items():
+        with pytest.raises(ValueError, match=message):
+            _ = _states_from_record(_state_record([bad, *good[1:]]), model)
+    # valid states stay accepted: float64 throughout, and the autocast layout (bf16 windows
+    # beside float32 recurrent states and histories), as init_column_state builds it
+    _ = _states_from_record(_state_record(good), model)
+    check_column_state(init_column_state(SHAPE, 2, 3, torch.bfloat16, CPU), SHAPE, 3)
+
+
 def test_the_config_bounds_the_filter_width() -> None:
     import yaml  # noqa: PLC0415
 

@@ -8,6 +8,7 @@ not the policy's own breaks one of them.
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -31,6 +32,7 @@ from vesper.halting_experiment import (
     train_step,
 )
 from vesper.loop import TraceRule
+from vesper.model import Vesper
 from vesper.synthetic import (
     BACKS,
     CLASSES,
@@ -346,6 +348,108 @@ def test_a_run_trains_and_records_the_named_mix(
     ]
 
 
+def test_the_data_order_has_its_own_seed_and_both_are_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Maintainer B 5dba6af: a seed chose both the initialization and the data order; a crossed run
+    # keeps --seed's initialization and draws --data-seed's batches, and records both
+    built: list[int] = []
+    drawn: list[tuple[str, int]] = []
+    real_build, real_generator = build, generator_for
+
+    def spy_build(
+        cfg: VesperConfig,
+        condition: str,
+        seed: int,
+        weights: Mapping[str, torch.Tensor] | None = None,
+    ) -> Vesper:
+        assert weights is None  # a fresh run: the seed draws the initialization
+        built.append(seed)
+        return real_build(cfg, condition, seed)
+
+    def spy_generator(split: str, seed: int) -> torch.Generator:
+        drawn.append((split, seed))
+        return real_generator(split, seed)
+
+    monkeypatch.setattr("vesper.halting_experiment.build", spy_build)
+    monkeypatch.setattr("vesper.halting_experiment.generator_for", spy_generator)
+
+    def small(seed: int, name: str, data_seed: int | None = None) -> dict[str, object]:
+        out = tmp_path / name
+        return run(
+            CONFIG, "fixed", seed, out, steps=1, eval_batches=1, eval_size=2, data_seed=data_seed
+        )
+
+    crossed = small(1, "c", data_seed=4)
+    assert built == [1]
+    assert ("train", 4) in drawn
+    assert ("train", 1) not in drawn
+    assert (crossed["seed"], crossed["data_seed"]) == (1, 4)
+    built.clear()
+    drawn.clear()
+    plain = small(4, "p")
+    assert built == [4]
+    assert ("train", 4) in drawn
+    assert (plain["seed"], plain["data_seed"]) == (4, 4)  # by default the data order is the seed's
+
+    def labels(out: Path) -> object:
+        first = (out / "train.jsonl").read_text(encoding="utf-8").splitlines()[0]
+        return cast("dict[str, object]", json.loads(first))["labels"]
+
+    assert labels(tmp_path / "c") == labels(tmp_path / "p")  # the same batches
+    other = small(1, "o")
+    assert other["data_seed"] == 1
+    assert labels(tmp_path / "o") != labels(tmp_path / "c")
+
+
+def _independent_chain(previous: str, tensors: list[torch.Tensor]) -> str:
+    h = hashlib.sha256(previous.encode())
+    for t in tensors:
+        h.update(f"{t.dtype}{tuple(t.shape)}".encode())
+        h.update(t.contiguous().numpy().tobytes())  # type: ignore[misc]  # ndarray: generic over Any
+    return h.hexdigest()
+
+
+def test_a_run_digests_its_initial_state_and_every_consumed_batch(tmp_path: Path) -> None:
+    # Maintainer B 7ad7211: hash what is consumed, not class counts; identical starts provable by
+    # digest
+    def go(seed: int, data_seed: int, name: str) -> dict[str, object]:
+        out = tmp_path / name
+        return run(
+            CONFIG,
+            "fixed",
+            seed,
+            out,
+            steps=2,
+            eval_batches=1,
+            eval_size=2,
+            data_seed=data_seed,
+            log_every=1,
+        )
+
+    a, again, other_init, other_data = go(1, 4, "a"), go(1, 4, "b"), go(4, 4, "c"), go(1, 1, "d")
+    keys = ("initial_state_digest", "consumed_digest")
+    assert [a[k] for k in keys] == [again[k] for k in keys]
+    assert other_init["initial_state_digest"] != a["initial_state_digest"]
+    assert other_init["consumed_digest"] == a["consumed_digest"]  # the same data order
+    assert other_data["initial_state_digest"] == a["initial_state_digest"]
+    assert other_data["consumed_digest"] != a["consumed_digest"]
+    # the chain, recomputed from an independent draw, step by step as logged
+    cfg = load(CONFIG)
+    g = generator_for("train", 4)
+    chain = ""
+    lines = (tmp_path / "a" / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    for step, line in enumerate(lines):
+        c = episodes(g, cfg.training.batch_chunks, f"train-4-{step}", hop_mix(step)).chunk
+        chain = _independent_chain(
+            chain, [c.tokens, c.targets, c.valid, c.doc_start, c.segment, c.loss_mask, c.pos]
+        )
+        assert cast("dict[str, object]", json.loads(line))["consumed_digest"] == chain, step
+    assert a["consumed_digest"] == chain
+    state = cast("dict[str, torch.Tensor]", build(cfg, "fixed", 1).state_dict())
+    assert a["initial_state_digest"] == _independent_chain("", list(state.values()))
+
+
 def test_weight_snapshots_are_the_weights_after_their_update(tmp_path: Path) -> None:
     # Maintainer B's review of 1678173: the promised snapshots every 1000 updates did not exist
     longer = tmp_path / "three"
@@ -378,3 +482,128 @@ def test_the_held_out_set_is_shared_and_disjoint_from_training() -> None:
     assert not torch.equal(a[0].chunk.tokens, final[0].chunk.tokens)
     with pytest.raises(ValueError, match="split must be one of"):
         _ = held_out(1, 3, "eval")
+
+
+def _variant(directory: Path, old: str, new: str) -> Path:
+    """The stage-1 config with one line's ``old`` replaced by ``new``, as a file of its own."""
+    text = CONFIG.read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    path = directory / f"variant-{len(list(directory.glob('variant-*')))}.yaml"
+    _ = path.write_text(text.replace(old, new), encoding="utf-8")
+    return path
+
+
+def _two_updates(config: Path, out: Path) -> Path:
+    """A finished run of B, two updates, a snapshot after the second: a warm start's source."""
+    _ = run(config, "fixed", 3, out, steps=2, eval_batches=1, eval_size=2, weights_every=2)
+    return out
+
+
+@pytest.fixture(scope="module")
+def source(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return _two_updates(CONFIG, tmp_path_factory.mktemp("source") / "run")
+
+
+def _warm(out: Path, weights: Path, condition: str = "local") -> dict[str, object]:
+    return run(
+        CONFIG, condition, 0, out, steps=1, eval_batches=1, eval_size=2, init_weights=weights
+    )
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_a_run_starts_from_another_runs_weights_with_its_own_head(
+    tmp_path: Path, source: Path, condition: str
+) -> None:
+    # the warm start of docs/reviews/2026-10-17-halting-in-phases.md
+    weights = source / "model.pt"
+    raw = weights.read_bytes()
+    state = cast("dict[str, torch.Tensor]", torch.load(weights, weights_only=True))
+    result = _warm(tmp_path / "warm", weights, condition)
+    assert result["init_weights"] == {
+        "path": str(weights),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "state_digest": _independent_chain("", list(state.values())),
+        "source_config_sha256": hashlib.sha256((source / "config.yaml").read_bytes()).hexdigest(),
+        "head": "condition",
+    }
+    # the first step starts from the file's weights, the head as the condition's own: C and D
+    # from zero_residual (B's head in the file is its untrained random direction), A and B as
+    # loaded (A's set_halting acts at the first step, B never reads its head)
+    expected = dict(state)
+    if condition in {"local", "aggregate"}:
+        for name in (k for k in expected if k.startswith("loop.halting")):
+            fill = 1.0 if name.endswith("norm.weight") else 0.0
+            expected[name] = torch.full_like(expected[name], fill)
+        assert any(
+            not torch.equal(state[k], expected[k]) for k in state
+        )  # the file's head is not already the condition's
+    assert result["initial_state_digest"] == _independent_chain("", list(expected.values()))
+    fresh = cast("dict[str, torch.Tensor]", build(_cfg(), condition, 0).state_dict())
+    assert result["initial_state_digest"] != _independent_chain("", list(fresh.values()))
+    # a fresh run records that it is one
+    plain = cast("dict[str, object]", json.loads((source / "result.json").read_text("utf-8")))
+    assert plain["init_weights"] is None
+
+
+def test_a_weight_snapshot_is_a_start_too(tmp_path: Path, source: Path) -> None:
+    snapshot = source / "weights" / "after-00002.pt"
+    result = _warm(tmp_path / "warm", snapshot)
+    record = cast("dict[str, object]", result["init_weights"])
+    assert record["sha256"] == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    # past 99999 updates the name has six digits (the 144000-update runs)
+    six = source / "weights" / "after-144000.pt"
+    _ = six.write_bytes(snapshot.read_bytes())
+    try:
+        record = cast("dict[str, object]", _warm(tmp_path / "six", six)["init_weights"])
+    finally:
+        six.unlink()
+    assert record["path"] == str(six)
+
+
+def test_a_start_of_unknown_origin_another_model_or_another_shape_is_refused(
+    tmp_path: Path, source: Path
+) -> None:
+    good = cast("dict[str, torch.Tensor]", torch.load(source / "model.pt", weights_only=True))
+    u = good["loop.u"]
+
+    def fake(label: str, payload: object) -> Path:
+        """A run directory with the stage-1 snapshot and ``payload`` saved as its model.pt."""
+        directory = tmp_path / label
+        directory.mkdir()
+        _ = (directory / "config.yaml").write_bytes(CONFIG.read_bytes())
+        torch.save(payload, directory / "model.pt")
+        return directory / "model.pt"
+
+    def refused(weights: Path, match: str) -> None:
+        out = tmp_path / "refused"
+        with pytest.raises(ValueError, match=match):
+            _ = _warm(out, weights)
+        assert not out.exists()  # refused before anything is written
+
+    # weights of no run: no snapshot of the recipe they were trained under
+    loose = tmp_path / "loose.pt"
+    _ = loose.write_bytes((source / "model.pt").read_bytes())
+    refused(loose, "not a run's model.pt")
+    refused(fake("named", good).parent / "weights" / "after-2.pt", "not a run's model.pt")
+    # a source run of another model, whether or not its shapes differ
+    epsilon = _variant(tmp_path, "halt_epsilon: 0.01", "halt_epsilon: 0.02")
+    refused(_two_updates(epsilon, tmp_path / "eps") / "model.pt", "run's model config differs")
+    conv = _variant(tmp_path, "key_conv: 4 ", "key_conv: 3 ")
+    refused(_two_updates(conv, tmp_path / "conv") / "model.pt", "run's recurrence config differs")
+    # weights that do not fit the model, name by name, before load_state_dict could cast them
+    missing = {k: v for k, v in good.items() if k != "loop.u"}
+    refused(fake("missing", missing), r"missing \['loop.u'\], unexpected \[\]")
+    refused(fake("extra", good | {"loop.v": u}), r"missing \[\], unexpected \['loop.v'\]")
+    refused(fake("shape", good | {"loop.u": u[:-1]}), r"loop.u is torch.float32\(7, ")
+    refused(fake("dtype", good | {"loop.u": u.double()}), r"loop.u is torch.float64\(8, ")
+    for bad in (float("nan"), float("inf")):
+        one = u.clone()  # a single non-finite element among finite ones
+        one[3, 0] = bad
+        refused(fake(f"value-{bad}", good | {"loop.u": one}), "loop.u has a non-finite value")
+    refused(fake("list", list(good.values())), "not a mapping of names to tensors")
+    number: dict[str, object] = {**good, "loop.u": 1.0}
+    refused(fake("number", number), "not a mapping of names to tensors")
+    # the training sections may differ: another schedule from the same weights is the point
+    rate = _variant(tmp_path, "peak_lr: 1.0e-3", "peak_lr: 5.0e-4")
+    other = _two_updates(rate, tmp_path / "rate") / "model.pt"
+    assert _warm(tmp_path / "accepted", other)["init_weights"] is not None

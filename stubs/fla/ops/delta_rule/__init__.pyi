@@ -14,3 +14,14 @@ def chunk_delta_rule(
     *,
     chunk_size: int = ...,
 ) -> tuple[Tensor, Tensor | None]: ...
+def fused_recurrent_delta_rule(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    beta: Tensor | None = None,
+    scale: float | None = None,
+    initial_state: Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: Tensor | None = None,
+) -> tuple[Tensor, Tensor | None]: ...
