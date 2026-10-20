@@ -80,6 +80,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, TextIO, cast
@@ -90,7 +91,7 @@ from torch.nn import functional
 
 from vesper.column import check_scan, scan_of, set_scan
 from vesper.contracts import ContractError, Dims, check_shape, require
-from vesper.graphs import WarmedGraph
+from vesper.graphs import WarmedGraph, deterministic_algorithms
 from vesper.halting_common import (
     CPU,
     SNAPSHOT,
@@ -930,7 +931,9 @@ def _precision(*, cuda: bool) -> dict[str, object]:
     """TF32 off and the highest float32 matmul precision (the design's arithmetic), as set.
 
     On ``cuda`` the update is captured (``WarmedGraph``) with the capturable optimizer, whose
-    device-side step arithmetic is not bitwise the CPU optimizer's; recorded here.
+    device-side step arithmetic is not bitwise the CPU optimizer's, and trains under torch's
+    deterministic algorithms (``vesper.graphs.deterministic_algorithms``, whose effective
+    settings the result records as ``determinism``); recorded here.
     """
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -1069,6 +1072,8 @@ def _train(
         torch.cuda.reset_peak_memory_stats(plan.target)
     started = time.monotonic()
     with (
+        # CUDA runs repeat (10-19); the settings in effect are recorded from inside the scope
+        deterministic_algorithms() if cuda else nullcontext(None) as determinism,
         (out / "train.jsonl").open("w", encoding="utf-8") as log,
         (out / "eval.jsonl").open("w", encoding="utf-8") as evals,
     ):
@@ -1135,6 +1140,7 @@ def _train(
         "wall_seconds": time.monotonic() - started,
         "peak_memory_bytes": torch.cuda.max_memory_allocated(plan.target) if cuda else None,
         "evaluations": evaluations,
+        "determinism": determinism,
     }
 
 

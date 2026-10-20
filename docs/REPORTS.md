@@ -7,7 +7,34 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
-## 2026-10-19, 08:03Z: the whole model can now learn with its stopping, and those runs are 3x faster
+## 2026-10-19, 17:45Z: repeatability checks pass; longer training recovers quality at lower depth
+
+**What changed.** Two things. First, GPU training runs with the same data and random draws
+diverged. Enabling PyTorch's strict deterministic mode made the tested repeats match bit for
+bit, including every weight and optimizer value across 120 updates on this runtime and card.
+The operation responsible for the earlier divergence is still unknown; the failure also
+occurred with eager execution and the reference scan. The measured cost was a few percent per
+captured training update under load. Maintainer B reviewed and accepted the change.
+
+Second, with the cheaper stopping price (2.5), three of four runs met every recorded criterion
+at 60000 updates: 97.3-98.2 % right at about 2.2 active passes per token, against 95.2 % for the
+original model at all 8 passes. Their read4 accuracy was 66-93 %, against the original's 62 %.
+All four had already passed at 5000 updates using 4.1-4.4 passes, then lost accuracy as depth
+fell; three later recovered at the lower depth. The fourth still failed read4 retention.
+
+**What it means for you.** Longer training recovered quality while using fewer active passes
+in these runs. Learning was not monotone. The new setting passed the bounded repeatability
+checks; entire 60000- or 120000-update trajectories have not yet been repeated. The four long
+runs used the earlier setting, so each is one realization. Their seeds were deliberately
+selected, and "three of four" is not a population success rate.
+
+**What is next.** Four more 60000-update runs on the earlier setting, then two other trained
+models and 120000-update runs on the accepted deterministic setting. Results in the morning.
+
+**Details.** vesper/graphs.py (`deterministic_algorithms`), tests/test_determinism.py; run pages
+dc25long-2a16c44 and dc25long-prefix-2a16c44; maintainer B's reviews in the channel (9bb3aa8, 774165e).
+
+## 2026-10-19, 08:03Z: the whole model can now learn with its stopping, and its training updates are 3x faster
 
 **What changed.** Two things. First, joint mode: until now only the small stopping head learned
 while the rest of the model stayed frozen. In joint mode the whole model learns along with it,

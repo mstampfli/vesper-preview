@@ -18,9 +18,11 @@ For: the stage-1 training step on CUDA (``vesper.halting_experiment --cuda-graph
 condition; ACT's loop has no host sync (all passes run, halted tokens are masked), its head freeze
 and pass count are fixed per capture; the halting calibration's update (head-only and joint).
 ``WarmedGraph`` is the warm-capture-replay life both drivers share. Not for: evaluation, or
-anything on the CPU.
+anything on the CPU. ``deterministic_algorithms`` makes a CUDA training loop repeat itself,
+captured or eager (measured 2026-10-19: without it two runs with equal inputs diverged).
 """
 
+import os
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 
@@ -85,6 +87,60 @@ class CapturedStep:
 
 
 WARM_STEPS = 3  # eager steps on a side stream before a capture (lazy init, autotuning)
+# the cuBLAS workspace settings its documentation names as reproducible; a preset outside them
+# is refused, an unset variable is the measured default (below)
+CUBLAS_WORKSPACES = (":4096:8", ":16:8")
+
+
+@contextmanager
+def deterministic_algorithms() -> Generator[dict[str, object]]:
+    """PRIMITIVE repeatable GPU training: torch's strict deterministic algorithms for the block.
+
+    Measured 2026-10-19 on the calibration (torch 2.14.1+cu130, RTX 5060 Ti): two CUDA runs with
+    bitwise-equal inputs diverged within the first updates, eager and captured, with the fused
+    or the reference scan. With ``CUBLAS_WORKSPACE_CONFIG`` unset (cuBLAS's default 32 MiB
+    workspace here), the repository's test repeats two captured 120-update trajectories in
+    fresh processes, including warmup and an evaluation copy. Exported 30-update probes on the
+    real source compare eager and captured execution with ``:4096:8``; their recorded metrics
+    and final weight digests agree. The measured cost was a few percent per captured update
+    under load. torch
+    substitutes deterministic implementations without raising, so this does not name the op that
+    differed and does not certify third-party kernels in general: the guarantee is the measured
+    workload, software and card.
+
+    Inside: deterministic algorithms on with ``warn_only`` off (an op without a deterministic
+    implementation raises). On exit, exceptions included, BOTH previous settings (enabled and
+    warn_only) are restored, so nesting and callers see nothing change. Yields the effective
+    settings for the run's record: both flags, the cuBLAS variable as found, and the cuBLAS
+    workspace size in effect (which an explicit ``torch.backends.cuda.cublas_workspace_size``
+    call sets over the variable).
+
+    For: a training loop on CUDA whose runs must repeat. Not for: CPU work (unchanged) or code
+    that must stay fast at any cost.
+
+    Raises:
+        RuntimeError: if ``CUBLAS_WORKSPACE_CONFIG`` is set to a value outside
+            ``CUBLAS_WORKSPACES`` (a preset is never silently kept or overridden).
+    """
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if workspace is not None and workspace not in CUBLAS_WORKSPACES:
+        allowed = ", ".join(CUBLAS_WORKSPACES)
+        msg = f"CUBLAS_WORKSPACE_CONFIG must be unset or one of {allowed}, got {workspace!r}"
+        raise RuntimeError(msg)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=False)  # noqa: FBT003  # torch's flag
+    try:
+        yield {
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "cublas_workspace_config": workspace,
+            "cublas_workspace_size": (
+                torch.backends.cuda.cublas_workspace_size() if torch.cuda.is_available() else None
+            ),
+        }
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 class WarmedGraph:
