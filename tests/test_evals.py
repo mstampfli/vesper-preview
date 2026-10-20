@@ -6,12 +6,13 @@ from typing import override
 import pytest
 import torch
 
-from conftest import small_config
+from conftest import small_config, small_raw
 from vesper.column import ColumnState, Modulation
+from vesper.config import VesperConfig, parse
 from vesper.data import Chunk, Document, Stream
-from vesper.evals import evaluate, iteration_histogram, perplexity
+from vesper.evals import evaluate, iteration_histogram, perplexity, static_profile
 from vesper.learning import ntp_loss
-from vesper.loop import LoopResult
+from vesper.loop import DenseRule, LoopResult
 from vesper.model import Vesper
 
 CPU = torch.device("cpu")
@@ -179,6 +180,52 @@ def test_perplexity_leaves_the_model_and_the_callers_states_alone() -> None:
     _ = perplexity(model, chunks, cfg, passes=2)
     assert all(torch.equal(a, b) for a, b in zip(before, model.parameters(), strict=True))
     assert all(p.grad is None for p in model.parameters())
+
+
+def three_pass_config() -> VesperConfig:
+    raw = small_raw()
+    raw["model"]["t_max"] = 3
+    return parse(raw, "test")
+
+
+def test_the_static_profile_is_every_fixed_depth_from_one_dense_traversal() -> None:
+    # the real-data pilot's phase-1 check (docs/reviews/2026-10-20-real-data-halting-pilot.md):
+    # the held-out loss if every token stopped at depth j, for every j at once. With copy-forward
+    # a token's pass-j output reads only the states of passes 1..j, so one dense traversal gives
+    # each depth; the check here runs every depth on its own, states carried across chunks.
+    cfg = three_pass_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    docs = [Document("a", torch.arange(1, 40, dtype=torch.int32) % 60 + 1)]
+    stream = Stream(iter(docs), slots=1, chunk=8)
+    chunks: list[Chunk] = []
+    while (chunk := stream.next()) is not None:
+        chunks.append(chunk)
+    assert len(chunks) > 2
+    profile = static_profile(model, chunks, cfg)
+    count = sum(int(c.loss_mask.sum().item()) for c in chunks)
+    assert profile.tokens_with_loss == count
+    assert len(profile.loss_sums) == cfg.model.t_max
+    with torch.no_grad():
+        for depth in range(1, cfg.model.t_max + 1):
+            states = model.init_states(1, torch.float32, CPU)
+            total = 0.0
+            for chunk in chunks:
+                result = model.run(
+                    chunk.tokens, chunk.pos, states, passes=depth, exit_rule=DenseRule()
+                )
+                states = list(result.states)
+                losses = ntp_loss(model.head(result.y), chunk.targets)[chunk.loss_mask]
+                total += float(losses.sum().item())
+            assert profile.loss_sums[depth - 1] == pytest.approx(total, rel=1e-5), depth
+    assert len(set(profile.mean_losses)) == cfg.model.t_max  # three different depths, not one
+    assert all(p.grad is None for p in model.parameters())
+
+
+def test_an_empty_static_profile_has_no_measurement() -> None:
+    profile = static_profile(
+        Vesper(three_pass_config(), torch.Generator().manual_seed(0)), [], three_pass_config()
+    )
+    assert (profile.tokens_with_loss, profile.mean_losses) == (0, [math.inf] * 3)
 
 
 @pytest.mark.skipif(

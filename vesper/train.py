@@ -52,11 +52,11 @@ from vesper.corpus import (
     load_finalization,
 )
 from vesper.data import Chunk, Document, SlotState, Stream, StreamState
-from vesper.evals import evaluate, iteration_histogram
+from vesper.evals import evaluate, iteration_histogram, static_profile
 from vesper.generations import parse_pin, pinned
 from vesper.keys import file_sha256
 from vesper.learning import LossWeights, check_mode
-from vesper.loop import HaltingHead
+from vesper.loop import DenseRule, HaltingHead
 from vesper.model import Vesper
 from vesper.provenance import environment, write_json
 from vesper.publish import staged
@@ -67,6 +67,11 @@ LABEL = (
     "e2e wake training; no retrieval, no ledger, no dusk: the recipe through phase 1, the"
     " no-retrieval ablation beyond"
 )
+# the training objective: "act" the recipe's (wake_objective, the ACT mixture); "fixed" every
+# pass supervised with equal weight on a dense forward (all_pass_objective, stage 1's condition
+# B), the depth-first phase of the real-data halting pilot
+# (docs/reviews/2026-10-20-real-data-halting-pilot.md). Part of a run's recipe: a resume keeps it.
+OBJECTIVES = ("act", "fixed")
 DECAYED = frozenset(
     {
         "embedding.weight",
@@ -102,8 +107,9 @@ FILES = ("model.pt", "optimizer.pt", "states.pt", "train.json")
 # progress.tokens_consumed (maintainer B's review of 629559f: a shape changed under an unchanged
 # number); 5 the recipe's generation pins; 6 the halting head's norm gain in model.pt and its Adam
 # state; 7 the recurrent key filter (rec.conv_k in model.pt) and its per-pass key history in
-# states.pt
-CHECKPOINT_SCHEMA = 7
+# states.pt; 8 the training objective in the recipe (maintainer B 0617971: part of the run's
+# identity)
+CHECKPOINT_SCHEMA = 8
 log = logging.getLogger("vesper.train")
 
 
@@ -151,6 +157,9 @@ class StepResult:
     grad_norm: float
     seconds: float
     peak_memory_bytes: int
+    # the "fixed" objective's next-token loss of each pass, token-weighted over the batch (None
+    # under "act"): what depth-first training watches, whether later passes improve
+    pass_ntp: list[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -158,7 +167,8 @@ class Recipe:
     """What decides the order and membership of the data a run consumes, beyond its three files.
 
     The seed, the ordered components with their shares, the held-out fraction, the finalize and
-    split rules and the checkpoint schema. Its sha256 is part of the ``Identity`` and the plain
+    split rules, the checkpoint schema and the training objective (``OBJECTIVES``: a resume under
+    another objective is another run). Its sha256 is part of the ``Identity`` and the plain
     record goes into the run header and ``train.json``: a run under another recipe is a labeled
     fork, never a continuation (maintainer B's review of b797837: another seed from the same
     checkpoint passed a count check over equal-length documents and diverged).
@@ -171,6 +181,7 @@ class Recipe:
     finalize_rule: str
     split_rule: str
     schema: int
+    objective: str
 
 
 @dataclass(frozen=True)
@@ -379,8 +390,13 @@ def step(  # noqa: PLR0913
     *,
     recompute: bool = False,
     slices: int = 1,
+    objective: str = "act",
 ) -> StepResult | None:
     """One optimizer step over the next chunk of every group that still has one.
+
+    ``objective`` (``OBJECTIVES``): "act" trains ``wake_objective``; "fixed" runs every token
+    through every pass of the phase (``DenseRule``) and trains ``all_pass_objective`` with equal
+    pass weights, so the halting head gets no gradient and the ponder part is zero.
 
     Every group's chunk is drawn and its loss positions counted first; each group's objective
     (``wake_objective`` with the phase's weights) is scaled by its share of the batch's loss
@@ -396,9 +412,11 @@ def step(  # noqa: PLR0913
             touched (maintainer B's review of 1725ca6: a direct step under local mode drew a
             document, replaced the group's states and zeroed the halting head before the objective
             refused).
-        ValueError: when no drawn position carries a loss.
+        ValueError: for an unknown objective, before anything is drawn; when no drawn position
+            carries a loss.
     """
     check_mode(cfg.learning.mode)  # the public boundary refuses first; the streams and states stay
+    _check_objective(objective)
     started = time.monotonic()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -416,6 +434,7 @@ def step(  # noqa: PLR0913
     loss_sum = 0.0
     ntp_sum = 0.0
     ponder_sum = 0.0
+    pass_sum: list[float] | None = None
     seen = 0
     consumed: dict[str, int] = {}
     histogram: list[Tensor] = []
@@ -423,7 +442,7 @@ def step(  # noqa: PLR0913
         # one call per group, so its logits, outputs and graph are released before the next
         # group's forward (maintainer B's review of 444b966: the step held the previous group's
         # logits, y and per_pass at the next forward)
-        loss, ntp, ponder, iters = _train_group(
+        loss, ntp, ponder, iters, pass_ntp = _train_group(
             model,
             group,
             chunk,
@@ -434,10 +453,17 @@ def step(  # noqa: PLR0913
             weights=weights,
             recompute=recompute,
             slices=slices,
+            objective=objective,
         )
         loss_sum += loss
         ntp_sum += ntp
         ponder_sum += ponder
+        if pass_ntp is not None:
+            pass_sum = (
+                pass_ntp
+                if pass_sum is None
+                else [a + b for a, b in zip(pass_sum, pass_ntp, strict=True)]
+            )
         if iters is not None:
             histogram.append(iters)
         seen += int(chunk.valid.sum().item())
@@ -461,6 +487,7 @@ def step(  # noqa: PLR0913
         grad_norm=grad_norm,
         seconds=time.monotonic() - started,
         peak_memory_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0,
+        pass_ntp=pass_sum,
     )
 
 
@@ -476,31 +503,57 @@ def _train_group(  # noqa: PLR0913
     weights: LossWeights,
     recompute: bool,
     slices: int,
-) -> tuple[float, float, float, Tensor | None]:
+    objective: str,
+) -> tuple[float, float, float, Tensor | None, list[float] | None]:
     """One group's forward, objective scaled by ``share``, backward and state hand-off.
 
-    Returns the share-weighted loss, next-token and ponder parts and the iteration counts of the
+    Returns the share-weighted loss, next-token and ponder parts, the iteration counts of the
     loss positions (None for a chunk without a loss position, whose forward still advances the
-    states). Every tensor of the forward dies with this call's frame.
+    states) and, under "fixed", each pass's share-weighted next-token loss (else None). Every
+    tensor of the forward dies with this call's frame.
     """
     tokens = chunk.tokens.to(device)
     pos = chunk.pos.to(device)
+    fixed = objective == "fixed"
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
-        result = model.run(tokens, pos, group.states, passes=phase.t_max, recompute=recompute)
+        result = model.run(
+            tokens,
+            pos,
+            group.states,
+            passes=phase.t_max,
+            recompute=recompute,
+            exit_rule=DenseRule() if fixed else None,
+        )
         group.states = detach_states(result.states)
         if share == 0.0:
-            return 0.0, 0.0, 0.0, None
+            return 0.0, 0.0, 0.0, None, None
         # the head over the loss positions in slices (float32 logits per slice), never [b, n, V]
-        objective, parts = model.objective(chunk, result, cfg, weights, slices=slices)
-    torch.autograd.backward([objective * share])
+        pass_ntp = None
+        if fixed:
+            value, all_pass = model.all_pass_objective(
+                chunk, result, condition="fixed", beta=0.0, slices=slices
+            )
+            ntp, ponder = all_pass["expected_ntp"], torch.zeros(())
+            pass_ntp = [float(v) * share for v in all_pass["pass_ntp"].unbind()]
+        else:
+            value, parts = model.objective(chunk, result, cfg, weights, slices=slices)
+            ntp, ponder = parts["ntp"], parts["ponder"]
+    torch.autograd.backward([value * share])
     return (
-        float(objective.item()) * share,
-        float(parts["ntp"].item()) * share,
-        float(parts["ponder"].item()) * share,
+        float(value.item()) * share,
+        float(ntp.item()) * share,
+        float(ponder.item()) * share,
         result.n_iters[chunk.loss_mask.to(device)].detach().cpu(),
+        pass_ntp,
     )
+
+
+def _check_objective(objective: str) -> None:
+    if objective not in OBJECTIVES:
+        msg = f"objective must be one of {OBJECTIVES}, got {objective!r}"
+        raise ValueError(msg)
 
 
 def _state_record(states: Sequence[ColumnState]) -> list[dict[str, object]]:
@@ -675,7 +728,11 @@ def restore(
             raise ValueError(msg)
     saved = cast("dict[str, object]", record["identity"])
     if saved != _plain(identity):
-        msg = f"{path}: checkpoint of a run with another tokenizer, config, finalization or recipe"
+        differ = sorted(k for k, v in _plain(identity).items() if saved.get(k) != v)
+        msg = (
+            f"{path}: checkpoint of a run with another tokenizer, config, finalization or recipe"
+            f" (differs: {', '.join(differ)}; the recipe includes the objective)"
+        )
         raise ValueError(msg)
     if cast("dict[str, object]", record["layout"]) != _plain(layout):
         msg = (
@@ -834,10 +891,13 @@ def resumed_components(data: Path, resume: Path) -> list[Component]:
     return out
 
 
-def recipe_of(parts: Sequence[Component], seed: int, cfg: VesperConfig) -> Recipe:
-    """The run's data recipe.
+def recipe_of(
+    parts: Sequence[Component], seed: int, cfg: VesperConfig, objective: str = "act"
+) -> Recipe:
+    """The run's recipe.
 
-    The seed, the ordered components with their shares and generation pins, the split, the rules.
+    The seed, the ordered components with their shares and generation pins, the split, the rules,
+    the training objective.
     """
     return Recipe(
         seed=seed,
@@ -847,6 +907,7 @@ def recipe_of(parts: Sequence[Component], seed: int, cfg: VesperConfig) -> Recip
         finalize_rule=FINALIZE_RULE,
         split_rule=SPLIT_RULE,
         schema=CHECKPOINT_SCHEMA,
+        objective=objective,
     )
 
 
@@ -928,6 +989,15 @@ def _parser() -> argparse.ArgumentParser:
             "the fused float32 CUDA kernel (the reference's precision)"
         ),
     )
+    _ = parser.add_argument(
+        "--objective",
+        choices=OBJECTIVES,
+        default="act",
+        help=(
+            "act: the recipe's ACT objective; fixed: every pass supervised with equal weight on a "
+            "dense forward (depth first); a resume keeps the run's objective"
+        ),
+    )
     return parser
 
 
@@ -947,8 +1017,14 @@ def run(  # noqa: C901, PLR0913, PLR0915
     recompute: bool = False,
     slices: int = 1,
     scan: str = "reference",
+    objective: str = "act",
 ) -> Path:
     """The run: streams, schedule, steps, log lines, checkpoints with evaluations.
+
+    ``objective`` (``OBJECTIVES``, ``step``) is part of the run's recipe and so of its identity:
+    the run line records it and ``restore`` refuses a checkpoint of another objective. Every
+    checkpoint also records the held-out static profile (``static_profile``: the loss at each
+    fixed depth).
 
     ``scan`` chooses the recurrent scan for the whole run, evaluations included (``set_scan``):
     "reference", "fused" or "fused-fp32" (CUDA and the gpu extra); the run line records what the
@@ -962,19 +1038,21 @@ def run(  # noqa: C901, PLR0913, PLR0915
     to a log that holds one (a resume does, with ``resumed_from``). Returns the log's path.
 
     Raises:
-        ValueError: when ``batch_chunks`` is not a multiple of ``micro``, the finalization does
-            not cover the components, ``out`` already holds a run and this is not a resume, the
-            checkpoint has another identity or layout, or its replay does not reproduce the
-            checkpoint's documents (their digest and the realized shares).
+        ValueError: when ``batch_chunks`` is not a multiple of ``micro``, the objective is
+            unknown or differs from the resumed run's, the finalization does not cover the
+            components, ``out`` already holds a run and this is not a resume, the checkpoint has
+            another identity or layout, or its replay does not reproduce the checkpoint's
+            documents (their digest and the realized shares).
     """
     t = cfg.training
     check_mode(cfg.learning.mode)  # an unsupported mode is refused before anything is read
+    _check_objective(objective)
     if micro < 1 or t.batch_chunks % micro != 0:
         msg = f"micro_chunks must divide batch_chunks ({t.batch_chunks}), got {micro}"
         raise ValueError(msg)
     finalization = load_finalization(finalization_receipt)
     check_inputs(finalization, parts)
-    recipe = recipe_of(parts, seed, cfg)
+    recipe = recipe_of(parts, seed, cfg, objective)
     identity = identity_of(tokenizer_path, config_path, finalization_receipt, recipe)
     layout = Layout(groups=t.batch_chunks // micro, slots=micro)
     # every random choice goes through an explicit generator: the model's initialization here,
@@ -1047,6 +1125,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
             "recompute": recompute,
             "loss_slices": slices,
             "scan": scan_of(model),
+            "objective": objective,
             "device": str(device),
             "resumed_from": str(resume) if resume else None,
             "environment": environment(),
@@ -1081,6 +1160,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
         checkpointed_at = step_index
         chunks = held_out_chunks(parts, seed, tokenizer, held, micro, cfg)
         evaluation = evaluate(model, chunks, cfg, passes=phase.t_max)
+        profile = static_profile(model, chunks, cfg)
         emit(
             {
                 "kind": "checkpoint",
@@ -1099,6 +1179,8 @@ def run(  # noqa: C901, PLR0913, PLR0915
                 "training_tokens_with_loss": training_positions,
                 "training_measurement": "last-step-pre-update",
                 "held_out_t_max": phase.t_max,
+                "held_out_static_loss": profile.mean_losses,
+                "held_out_static_tokens_with_loss": profile.tokens_with_loss,
                 "training_t_max": training_passes,
             }
         )
@@ -1112,7 +1194,17 @@ def run(  # noqa: C901, PLR0913, PLR0915
 
     while (reason := stopped()) is None:
         phase = phase_schedule(tokens_seen, step_index, cfg)
-        result = step(model, opt, groups, phase, cfg, device, recompute=recompute, slices=slices)
+        result = step(
+            model,
+            opt,
+            groups,
+            phase,
+            cfg,
+            device,
+            recompute=recompute,
+            slices=slices,
+            objective=objective,
+        )
         if result is None:
             reason = "exhausted"
             break
@@ -1209,6 +1301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recompute=cast("bool", args.recompute),
             slices=cast("int", args.loss_slices),
             scan=cast("str", args.scan),
+            objective=cast("str", args.objective),
             steps=cast("int | None", args.steps),
             resume=resume,
             seed=cast("int", args.seed),

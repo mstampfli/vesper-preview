@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 import yaml
+from torch.nn import functional
 
 from conftest import small_config, small_raw
 from vesper.config import VesperConfig, parse
@@ -18,7 +19,7 @@ from vesper.corpus import Component, finalize
 from vesper.data import Chunk, Document, Stream, is_held_out
 from vesper.keys import file_sha256
 from vesper.learning import LossWeights
-from vesper.loop import HaltingHead
+from vesper.loop import DenseRule, HaltingHead
 from vesper.model import Vesper, wake_objective
 from vesper.sample import components
 from vesper.tokenizer import train_from_texts
@@ -235,6 +236,7 @@ def test_a_step_is_the_token_weighted_mean_of_the_unsplit_batch() -> None:
     assert result is not None
     assert result.tokens_with_loss == 4
     assert result.tokens == 4  # the valid inputs: one pair and three pairs
+    assert result.pass_ntp is None  # only the fixed objective reports each pass
     grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
     # the unsplit batch: the same two chunks side by side as two slots, one objective over all
     # four loss positions (a stream over both documents would pack them into one slot instead)
@@ -276,6 +278,151 @@ def test_a_step_is_the_token_weighted_mean_of_the_unsplit_batch() -> None:
         for state in group.states:
             assert all(not h.requires_grad and h.grad_fn is None for h in state.h)
             assert all(not c.k.requires_grad for c in state.kv)
+
+
+def test_the_fixed_objective_supervises_every_pass_equally_on_a_dense_forward() -> None:
+    # the real-data pilot's phase 1 (docs/reviews/2026-10-20-real-data-halting-pilot.md): stage
+    # 1's condition B on text; the reference is written out here, not taken from the model
+    raw = small_raw()
+    raw["model"]["t_max"] = 3
+    raw["training"]["t_max_anneal_from"] = 3  # depth first: every pass from the start
+    cfg = parse(raw, "test")
+    docs = docs_with_loss_counts(cfg.training.chunk_tokens)
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    reference = copy.deepcopy(model)
+    phase = phase_schedule(0, 0, cfg)
+    assert phase.t_max == 3
+    chunk_tokens = cfg.training.chunk_tokens
+    groups = [
+        Group(
+            Stream(iter(docs), slots=1, chunk=chunk_tokens),
+            model.init_states(1, torch.float32, CPU),
+        )
+    ]
+    result = step(model, optimizer(model, cfg), groups, phase, cfg, CPU, objective="fixed")
+    assert result is not None
+    assert result.histogram == [0.0, 0.0, 1.0]  # every scored token ran every pass
+    assert result.ponder == 0.0
+    chunk = Stream(iter(docs), slots=1, chunk=chunk_tokens).next()
+    assert chunk is not None
+    out = reference.run(
+        chunk.tokens,
+        chunk.pos,
+        reference.init_states(1, torch.float32, CPU),
+        passes=3,
+        exit_rule=DenseRule(),
+    )
+    assert torch.equal(out.n_iters[chunk.valid], torch.full_like(out.n_iters[chunk.valid], 3))
+    mask = chunk.loss_mask
+    per_pass = torch.stack(
+        [
+            functional.cross_entropy(
+                reference.head(out.per_pass[t])[mask].float(), chunk.targets[mask].long()
+            )
+            for t in range(3)
+        ]
+    )
+    each = [float(v) for v in per_pass.detach().unbind()]
+    assert len(set(each)) == 3  # the passes differ, so the weights are visible
+    expected = per_pass.mean()
+    assert result.ntp == pytest.approx(float(expected.detach()), rel=1e-5)
+    assert result.loss == pytest.approx(float(expected.detach()), rel=1e-5)
+    assert result.pass_ntp == pytest.approx(each, rel=1e-5)
+    torch.autograd.backward([expected])
+    _ = torch.nn.utils.clip_grad_norm_(
+        [p for p in reference.parameters() if p.requires_grad], cfg.optimizer.grad_clip
+    )
+    for (name, p), (_, q) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        if q.grad is None or not bool(q.grad.any()):
+            assert p.grad is None or not bool(p.grad.any()), name
+            continue
+        assert p.grad is not None, name
+        assert torch.allclose(p.grad, q.grad, atol=1e-6, rtol=1e-5), name
+    head = model.loop.halting_head()
+    assert all(p.grad is None or not bool(p.grad.any()) for p in head.parameters())
+
+
+def test_the_fixed_objective_ignores_a_head_that_would_stop_every_token() -> None:
+    # depth first must not depend on the halting head's state: a free head biased to stop at
+    # pass 1 halts every token under ACT, and the fixed step still runs and trains every pass
+    raw = small_raw()
+    raw["model"]["t_max"] = 3
+    raw["training"]["t_max_anneal_from"] = 3
+    cfg = parse(raw, "test")
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    phase = phase_schedule(int(cfg.training.total_tokens * 0.2), 8, cfg)  # loop: head free
+    assert (phase.halting_frozen, phase.t_max) == (False, 3)
+    set_halting(model, phase)
+    with torch.no_grad():
+        _ = model.loop.halting_head().b_h.fill_(30.0)  # p(halt) = 1 at the first pass
+    docs = docs_with_loss_counts(cfg.training.chunk_tokens)
+    chunk = Stream(iter(docs), slots=1, chunk=cfg.training.chunk_tokens).next()
+    assert chunk is not None
+    with torch.no_grad():
+        act = model.run(chunk.tokens, chunk.pos, model.init_states(1, torch.float32, CPU), passes=3)
+    assert bool((act.n_iters[chunk.valid] == 1).all())  # ACT would stop every token at pass 1
+    groups = [
+        Group(
+            Stream(iter(docs), slots=1, chunk=cfg.training.chunk_tokens),
+            model.init_states(1, torch.float32, CPU),
+        )
+    ]
+    result = step(model, optimizer(model, cfg), groups, phase, cfg, CPU, objective="fixed")
+    assert result is not None
+    assert result.histogram == [0.0, 0.0, 1.0]
+    assert result.pass_ntp is not None
+    assert len(result.pass_ntp) == 3
+
+
+def test_a_checkpoint_from_before_the_objective_is_refused_by_its_schema(tmp_path: Path) -> None:
+    # schema 7 stored a recipe without the objective; such a checkpoint is another run's, refused
+    # by its schema number before the identity (not later as a mismatched recipe)
+    cfg = training_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    opt = optimizer(model, cfg)
+    docs = [Document("d", torch.arange(1, 40, dtype=torch.int32))]
+    groups = [
+        Group(
+            Stream(iter(docs), slots=1, chunk=cfg.training.chunk_tokens),
+            model.init_states(1, torch.float32, CPU),
+        )
+    ]
+    where = tmp_path / "step-1"
+    _ = checkpoint(where, model, opt, groups, progress_at(1, 16), identity(), recipe(), reason="x")
+    record = cast("dict[str, object]", json.loads((where / "train.json").read_text()))
+    old = cast("dict[str, object]", record["recipe"])
+    del old["objective"]
+    old["schema"] = 7
+    _ = (where / "train.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    manifest = cast("dict[str, str]", json.loads((where / "manifest.json").read_text()))
+    manifest["train.json"] = file_sha256(where / "train.json")
+    _ = (where / "manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="schema 7, this code reads 8"):
+        _ = restore(where, model, opt, identity(), Layout(1, 1))
+
+
+def test_an_unknown_objective_is_refused_before_anything_is_drawn() -> None:
+    cfg = training_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    stream = Stream(
+        iter(docs_with_loss_counts(cfg.training.chunk_tokens)),
+        slots=1,
+        chunk=cfg.training.chunk_tokens,
+    )
+    groups = [Group(stream, model.init_states(1, torch.float32, CPU))]
+    with pytest.raises(ValueError, match="objective"):
+        _ = step(
+            model,
+            optimizer(model, cfg),
+            groups,
+            phase_schedule(0, 0, cfg),
+            cfg,
+            CPU,
+            objective="pondernet",
+        )
+    assert stream.next() is not None  # nothing was drawn
 
 
 def test_a_step_trains_the_live_groups_when_a_stream_is_dry_and_none_moves_nothing() -> None:
@@ -329,7 +476,7 @@ def identity() -> Identity:
 
 
 def recipe() -> Recipe:
-    return Recipe(0, (("a", 1.0),), (None,), 0.0, "finalize", "split", CHECKPOINT_SCHEMA)
+    return Recipe(0, (("a", 1.0),), (None,), 0.0, "finalize", "split", CHECKPOINT_SCHEMA, "act")
 
 
 def progress_at(step: int, tokens_seen: int) -> Progress:
@@ -375,6 +522,7 @@ def test_checkpoint_round_trip_restores_everything_and_refuses_tampering(tmp_pat
         "finalize_rule": "finalize",
         "split_rule": "split",
         "schema": CHECKPOINT_SCHEMA,
+        "objective": "act",
     }
     with pytest.raises(ValueError, match="already exists"):
         _ = checkpoint(where, model, opt, groups, progress, identity(), recipe(), reason="interval")
@@ -888,6 +1036,56 @@ def test_the_run_writes_a_log_checkpoints_and_resumes(  # noqa: PLR0915
             seed=0,
             device=CPU,
         )
+
+
+def test_a_fixed_run_records_its_objective_and_the_static_profile_and_keeps_it(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+    out = tmp_path / "run"
+
+    def go(steps: int, resume: Path | None, objective: str) -> Path:
+        return run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=out,
+            micro=1,
+            steps=steps,
+            resume=resume,
+            seed=0,
+            device=CPU,
+            objective=objective,
+        )
+
+    lines = read_log(go(2, None, "fixed"))
+    assert lines[0]["objective"] == "fixed"
+    assert cast("dict[str, object]", lines[0]["recipe"])["objective"] == "fixed"  # in the identity
+    steps = [line for line in lines if line["kind"] == "step"]
+    assert all(line["ponder"] == 0.0 for line in steps)
+    for line in steps:  # the steps trained the fixed objective: each pass's loss, their mean
+        losses = cast("list[float]", line["pass_ntp"])
+        assert len(losses) == line["t_max"]
+        assert sum(losses) / len(losses) == pytest.approx(cast("float", line["ntp"]), rel=1e-6)
+    checkpoints = [line for line in lines if line["kind"] == "checkpoint"]
+    assert checkpoints
+    for line in checkpoints:
+        losses = cast("list[float]", line["held_out_static_loss"])
+        assert len(losses) == cfg.model.t_max
+        assert all(math.isfinite(v) for v in losses)
+        assert line["held_out_static_tokens_with_loss"] == line["held_out_tokens_with_loss"]
+    last = Path(cast("str", checkpoints[-1]["path"]))
+    before = (out / "log.jsonl").read_text()
+    # the objective is in the recipe, the recipe's hash in the checkpoint's identity
+    with pytest.raises(ValueError, match=r"differs: recipe_sha256; the recipe includes the obj"):
+        _ = go(1, last, "act")
+    assert (out / "log.jsonl").read_text() == before  # refused before anything was written
+    resumed = read_log(go(1, last, "fixed"))
+    assert [line["objective"] for line in resumed if line["kind"] == "run"] == ["fixed", "fixed"]
 
 
 def test_a_direct_step_refuses_an_unsupported_mode_before_touching_anything() -> None:

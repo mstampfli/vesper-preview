@@ -15,6 +15,7 @@ from torch import Tensor
 from vesper.config import VesperConfig
 from vesper.data import Chunk
 from vesper.learning import ntp_loss
+from vesper.loop import DenseRule
 from vesper.model import Vesper
 
 
@@ -78,6 +79,58 @@ def evaluate(model: Vesper, chunks: Sequence[Chunk], cfg: VesperConfig, passes: 
             # Do not retain one chunk's logits/pass outputs during the next forward.
             del logits, result
     return Evaluation(total, count, _pass_totals(depths))
+
+
+@dataclass(frozen=True)
+class StaticProfile:
+    """The held-out next-token loss at every fixed depth ``1..T`` on the same positions."""
+
+    loss_sums: tuple[float, ...]
+    tokens_with_loss: int
+
+    @property
+    def mean_losses(self) -> list[float]:
+        """Mean loss per depth; ``inf`` everywhere when no position carries a loss."""
+        n = self.tokens_with_loss
+        return [s / n if n else math.inf for s in self.loss_sums]
+
+
+def static_profile(model: Vesper, chunks: Sequence[Chunk], cfg: VesperConfig) -> StaticProfile:
+    """The loss if every token stopped at depth ``j``, for every ``j``, from one dense traversal.
+
+    With copy-forward a token's pass-``j`` output reads only the states of passes ``1..j``, which
+    earlier tokens wrote at those same passes, so pass ``j`` of a dense run (``DenseRule``, every
+    token every pass) is exactly a run in which every token stops at ``j``. ``chunks`` are
+    consecutive chunks of one held-out stream with cold states carried, as in ``evaluate``; no
+    gradient, float32; one depth's logits exist at a time. For the halting pilot's phase-1 check
+    (docs/reviews/2026-10-20-real-data-halting-pilot.md): does the loss fall with depth?
+    """
+    device = next(model.parameters()).device
+    t_max = cfg.model.t_max
+    totals = [0.0] * t_max
+    count = 0
+    states = None
+    with torch.no_grad(), torch.autocast(device.type, enabled=False):
+        for chunk in chunks:
+            if states is None:
+                states = model.init_states(chunk.tokens.shape[0], torch.float32, device)
+            result = model.run(
+                chunk.tokens.to(device),
+                chunk.pos.to(device),
+                states,
+                passes=t_max,
+                exit_rule=DenseRule(),
+            )
+            states = list(result.states)
+            mask = chunk.loss_mask.to(device)
+            if bool(mask.any().item()):
+                targets = chunk.targets.to(device)
+                for depth in range(t_max):
+                    per_token = ntp_loss(model.head(result.per_pass[depth]).float(), targets)
+                    totals[depth] += float(per_token[mask].sum().item())
+                count += int(mask.sum().item())
+            del result
+    return StaticProfile(tuple(totals), count)
 
 
 def perplexity(model: Vesper, chunks: Sequence[Chunk], cfg: VesperConfig, passes: int) -> float:

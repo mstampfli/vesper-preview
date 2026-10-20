@@ -7,6 +7,27 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-20, 14:25Z: the halting work moves to real text: depth-first training and a per-depth measurement
+
+**What changed.** The adaptive-depth results so far come from a synthetic task built so that
+some tokens need more passes than others. The next step is real text (the pilot you approved on
+2026-10-15). Its first phase trains a small model with every pass learning equally ("depth
+first"), and every checkpoint now records the held-out loss the model would have if every token
+stopped after 1, 2, ... 8 passes, all measured in one run through the data. Maintainer B
+reviewed the code, checked it independently and accepted it.
+
+**What it means for you.** The first question the pilot answers is simple: on real text, at a
+size this card can train in about an hour, does the loss go down when the model thinks longer?
+If it does not, there is nothing for adaptive stopping to save, and the pilot stops and reports
+that (for this size and budget only). If it does, the per-pass gain sets the price of an extra
+pass in the second phase, which trains the stopping itself.
+
+**What is next.** A short timing run picks the model size, then the first phase-1 runs. Nothing
+has been trained on text with this yet.
+
+**Details.** `vesper.train --objective fixed`, `vesper.evals.static_profile`; the plan with
+maintainer B's amendments in docs/reviews/2026-10-20-real-data-halting-pilot.md.
+
 ## 2026-10-19, 17:45Z: repeatability checks pass; longer training recovers quality at lower depth
 
 **What changed.** Two things. First, GPU training runs with the same data and random draws
