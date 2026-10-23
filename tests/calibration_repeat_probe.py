@@ -23,14 +23,12 @@ from vesper.column import set_scan
 from vesper.graphs import WarmedGraph, deterministic_algorithms
 from vesper.halting_calibration import (
     EPISODES,
-    ROLLOUTS,
     _floor_at,  # pyright: ignore[reportPrivateUsage]
-    _optimizer,  # pyright: ignore[reportPrivateUsage]
-    _release_backbone,  # pyright: ignore[reportPrivateUsage]
     _source_model,  # pyright: ignore[reportPrivateUsage]
     train_update,
 )
 from vesper.halting_common import chained_digest, evaluating
+from vesper.joint_update import ROLLOUTS, optimizer, release_backbone
 from vesper.synthetic import TERMINAL_MIX, episodes, generator_for
 
 UPDATES = 120
@@ -46,11 +44,11 @@ def _digest(tensors: list[Tensor]) -> str:
 def main() -> None:
     source, sha, out = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
     _, model, head = _source_model(source, sha)
-    backbone = _release_backbone(model)
+    backbone = release_backbone(model)
     model = model.to(torch.device("cuda"))
     _ = set_scan(model, "fused-fp32")
     params = head + backbone
-    opt = _optimizer(head, backbone, capturable=True)
+    opt = optimizer(head, backbone, capturable=True)
     graph = WarmedGraph()
     data, action = generator_for("repeat-train", 0), generator_for("repeat-action", 0)
     t_max = model.loop.t_max

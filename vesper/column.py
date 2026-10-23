@@ -14,7 +14,7 @@ and ``(K, V)`` enter every later pass, so the per-pass states stay dense).
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, override
 
@@ -34,6 +34,8 @@ from vesper.kernels.delta_scan import (
     delta_scan_fused_fp32,
     fused_scan_available,
 )
+from vesper.kernels.keys import fused_keys
+from vesper.kernels.norm import fused_rms_norm
 from vesper.recurrence import delta_scan_chunked, normalize_keys, write_strength
 
 ScanImpl = Literal["reference", "fused", "fused-fp32"]
@@ -46,6 +48,7 @@ FUSED_INPUT_DTYPES: dict[ScanImpl, torch.dtype] = {
 
 _RMS_EPS = 1e-6  # the regularizer inside the root of RMSNorm, not a tunable and not a floor
 _RMS_SCALE_FLOOR = 1e-3  # sqrt(_RMS_EPS): keeps eps / scale^2 finite for rows near zero
+_FUSED_NORM_DTYPES = (torch.float32, torch.bfloat16, torch.float16)  # float64 keeps the reference
 
 
 @dataclass(frozen=True)
@@ -166,6 +169,9 @@ class RMSNorm(nn.Module):
         if x.shape[-1] != d:
             msg = f"RMSNorm: last axis must be {d}, got {x.shape[-1]} (shape {tuple(x.shape)})"
             raise ContractError(msg)
+        if x.is_cuda and x.dtype in _FUSED_NORM_DTYPES:
+            # the same arithmetic as one kernel per direction (kernels.norm); below, the reference
+            return fused_rms_norm(x, self.weight, _RMS_SCALE_FLOOR, _RMS_EPS)
         compute = torch.promote_types(x.dtype, torch.float32)
         wide = x.to(compute)
         scale = wide.detach().abs().amax(dim=-1, keepdim=True).clamp_min(_RMS_SCALE_FLOOR)
@@ -262,6 +268,12 @@ class RecurrentSublayer(nn.Module):
             return normalize_keys(z.view(b, n, self.heads, self.head_dim)), history
         width = self.key_conv
         compute = torch.promote_types(z.dtype, torch.float32)
+        if z.is_cuda and z.dtype in _FUSED_NORM_DTYPES and self.head_dim & (self.head_dim - 1) == 0:
+            # the same filter and normalization as one kernel per direction (kernels.keys);
+            # the next history is the newest K - 1 inputs, an owned float32 copy as below
+            k = fused_keys(z, history, self.conv_k, self.heads)
+            tail = z[:, max(0, n - (width - 1)) :].to(compute)
+            return k, torch.cat([history.to(compute)[:, n:], tail], dim=1)
         full = torch.cat([history.to(compute), z.to(compute)], dim=1)  # [b, K - 1 + n, d]
         taps = self.conv_k.to(compute)
         u = taps[0] * full[:, width - 1 : width - 1 + n]
@@ -365,7 +377,9 @@ def check_scan(impl: str, device: torch.device) -> ScanImpl:
     """The one check of a scan choice against the device it would run on; returns it typed.
 
     ``set_scan`` checks every parameter's device with it; a driver calls it before writing
-    anything, with the device it is about to use.
+    anything, with the device it is about to use. Whether the choice can run CAPTURED is a
+    driver's question (``check_capturable_scan``): the reference scan on CUDA stays valid here,
+    as the eager oracle the fused kernels' equivalence tests compare against.
 
     Raises:
         ValueError: if ``impl`` is not one of ``SCAN_IMPLS``, or a fused scan off CUDA or
@@ -383,6 +397,27 @@ def check_scan(impl: str, device: torch.device) -> ScanImpl:
         msg = "the fused scan needs a CUDA device and fla-core (the gpu extra)"
         raise ValueError(msg)
     return "fused" if impl == "fused" else "fused-fp32"
+
+
+def check_capturable_scan(impl: str, device: torch.device) -> ScanImpl:
+    """``check_scan``, and the choice must run as a captured CUDA graph on CUDA.
+
+    For every driver that launches work (training, evaluation): CUDA graphs are a hard
+    requirement for anything on the GPU (the project owner 2026-10-21), and the reference scan's
+    block inverse (``torch.inverse``) cannot be captured, so on CUDA the choice is a fused scan.
+    Not for: equivalence tests, whose eager CUDA reference is the oracle (``check_scan``).
+
+    Raises:
+        ValueError: as ``check_scan``, or the reference scan on CUDA.
+    """
+    chosen = check_scan(impl, device)
+    if chosen == "reference" and device.type == "cuda":
+        msg = (
+            "the reference scan cannot run as a captured CUDA graph (torch.inverse); on CUDA"
+            " use fused or fused-fp32"
+        )
+        raise ValueError(msg)
+    return chosen
 
 
 def scan_of(model: nn.Module) -> ScanImpl:
@@ -461,6 +496,74 @@ def map_state(state: ColumnState, f: Callable[[Tensor], Tensor]) -> ColumnState:
         kv=tuple(KVCache(k=f(c.k), v=f(c.v), pos=f(c.pos), window=c.window) for c in state.kv),
         key_history=tuple(f(z) for z in state.key_history),
     )
+
+
+def reset_recurrent(state: ColumnState, keep: Tensor) -> ColumnState:
+    """PRIMITIVE ``state`` with the recurrent memory of the rows where ``keep`` is 0 made cold.
+
+    ``keep`` is ``[b]`` (1 carries, 0 restarts): those rows' recurrent states ``h`` and key
+    histories become exactly zero, what ``init_column_state`` gives (``torch.where``, so a value
+    that is not finite cannot survive as ``0 * x``); the attention windows are left as they are
+    (a cold row's window is the short context it would build within its first chunk anyway, and
+    a window cannot be emptied for one row of a shared cache). Static shapes, capturable.
+
+    A recurrent restart is not a full cold start: the attention windows keep their context.
+
+    For: the trainer's staggered restarts (``train.reset_keep``). Not for: a full cold start of a
+    whole batch (``init_column_state``).
+
+    Raises:
+        ContractError: when ``keep`` is not ``[b]`` for the state's ``b`` rows (maintainer B
+        9e3066c: a
+            ``[1]`` keep broadcast over three rows and cleared them all).
+    """
+    rows = next(iter(state.h + state.key_history)).shape[0]
+    check_shape("keep", keep, ("b",), {"b": int(rows)})
+    hold = keep.gt(0)
+
+    def where(t: Tensor) -> Tensor:
+        return torch.where(hold.view(-1, *([1] * (t.dim() - 1))), t, torch.zeros_like(t))
+
+    return ColumnState(
+        h=tuple(where(h) for h in state.h),
+        kv=state.kv,
+        key_history=tuple(where(z) for z in state.key_history),
+    )
+
+
+def state_tensors(states: Sequence[ColumnState]) -> list[Tensor]:
+    """PRIMITIVE every tensor of ``states`` as a flat list, in ``map_state``'s fixed order.
+
+    For: a captured CUDA graph's values and outputs, which are flat tensor lists (the trainer's
+    step, the evaluations' chunks). ``with_state_tensors`` is its inverse.
+    """
+    out: list[Tensor] = []
+
+    def collect(t: Tensor) -> Tensor:
+        out.append(t)
+        return t
+
+    for state in states:
+        _ = map_state(state, collect)
+    return out
+
+
+def with_state_tensors(
+    templates: Sequence[ColumnState], tensors: Sequence[Tensor]
+) -> list[ColumnState]:
+    """PRIMITIVE ``templates``' structure (and windows) filled with ``tensors`` in order.
+
+    The inverse of ``state_tensors``: only the templates' structure is read, never their values.
+
+    Raises:
+        ValueError: if the count differs from the templates' own.
+    """
+    expected = len(state_tensors(templates))
+    if expected != len(tensors):
+        msg = f"{len(tensors)} state tensors for a structure of {expected}"
+        raise ValueError(msg)
+    feed = iter(tensors)
+    return [map_state(state, lambda _: next(feed)) for state in templates]
 
 
 def check_column_state(state: ColumnState, shape: ColumnShape, t_max: int) -> None:

@@ -13,6 +13,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from vesper.contracts import Dims, check_shape
+from vesper.kernels.act import relu_square
 
 
 class FFN(nn.Module):
@@ -43,7 +44,15 @@ class FFN(nn.Module):
         """The hidden activations ``relu(W_1 x)^2``: ``[b, n, d] -> [b, n, ffn_mult d]``."""
         dims: Dims = {}
         check_shape("x", x, ("b", "n", "d"), dims)
-        return F.relu(F.linear(x, self.w1)).square()
+        z = F.linear(x, self.w1)
+        if z.is_cuda and z.dtype in (torch.float32, torch.bfloat16, torch.float16):
+            return relu_square(z)  # one kernel each way, the same bits (kernels.act)
+        h = F.relu(z)
+        # h * h, not h.square(): autocast runs pow in float32 (a [b, n, 4d] float32 tensor and a
+        # cast back for W_2, measured 2026-10-21 as ~17 GiB per step on the 5090), while a
+        # product stays in the activation dtype; a product of two bfloat16 values is exact in
+        # float32, so one rounding to bfloat16 gives the same bits, forward and backward
+        return h * h
 
     @override
     def forward(self, x: Tensor) -> Tensor:

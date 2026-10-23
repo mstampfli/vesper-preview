@@ -22,6 +22,9 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from vesper.contracts import ContractError, Dims, check_shape, require
+from vesper.kernels.window_attn import window_attention
+
+_WINDOW_KERNEL_DTYPES = (torch.bfloat16, torch.float16)  # float32 keeps the blocked path
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +248,17 @@ class WindowedAttention(nn.Module):
         n, w = dims["n"], self.window
         if n == 0:
             return q.new_zeros(dims["b"], 0, self.w_o.shape[0]), cache
+        if q.is_cuda and q.dtype in _WINDOW_KERNEL_DTYPES:
+            # the same window over consecutive positions as one tiled kernel (kernels.window_attn);
+            # the cache may be wider than q (an empty float32 cache promotes what is pushed onto
+            # it), and the blocked path's attention runs in q's dtype under autocast too
+            kpos = torch.cat([cache.pos, pos], dim=1)
+            consecutive = (kpos[:, 1:] - kpos[:, :-1] == 1).all()
+            require(consecutive, "attend: cache and chunk positions must be consecutive")
+            keys = torch.cat([cache.k.to(q.dtype), k.to(q.dtype)], dim=1)
+            vals = torch.cat([cache.v.to(q.dtype), v.to(q.dtype)], dim=1)
+            y = self.output(window_attention(q, keys, vals, w))
+            return y, kv_cache_push(cache, k, v, pos)
         outs: list[Tensor] = []
         for s in range(0, n, w):
             e = min(s + w, n)

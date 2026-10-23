@@ -221,14 +221,15 @@ def _saved_for_backward(condition: str, slices: int) -> tuple[int, int]:
 @pytest.mark.parametrize("slices", [1, 2, 4])
 def test_no_vocabulary_logits_are_kept_for_the_backward_pass(slices: int) -> None:
     # Maintainer B's review of 49c92cf, finding 3: at slices = 1 every pass's vocabulary
-    # intermediates were saved for the backward pass, and every slice selected the pass's positions
-    # anew (saved selections grew 1/2/4/8x with the slices); now the head runs again in the backward
-    # pass and nothing is selected at all: every pass's rows are views of the loop's one
-    # per-pass output (the static-shape objective, 2026-10-16), one storage at any slice count
-    assert _saved_for_backward("fixed", slices) == (0, 1)
+    # intermediates were saved for the backward pass. They still are not: kernels.nll.linear_nll
+    # keeps only the log-sum-exp per row. What it keeps instead of recomputing (2026-10-21, the 5090
+    # profile: the recomputed head was ~21 ms of a step) is each call's normalized rows, one
+    # [b * n / slices, d] per pass and slice: T * slices hidden storages, 1/V of the logits'
+    # width each (until 2026-10-21 the head and its norm ran again and one storage was kept)
+    assert _saved_for_backward("fixed", slices) == (0, T * slices)
     # the learned head keeps its own normalized input per pass, one more [b * n, d] each
-    assert _saved_for_backward("local", slices) == (0, 1 + T)
-    assert _saved_for_backward("aggregate", slices) == (0, 1 + T)
+    assert _saved_for_backward("local", slices) == (0, T * slices + T)
+    assert _saved_for_backward("aggregate", slices) == (0, T * slices + T)
 
 
 def test_the_parts_average_over_the_loss_positions_only() -> None:
@@ -323,3 +324,17 @@ def test_a_non_finite_hidden_state_outside_the_loss_positions_reaches_nothing() 
 def _trained_parameters(model: Vesper) -> list[torch.Tensor]:
     """The parameters an objective's head reaches: the tied embedding and the output norm."""
     return [model.embedding.weight, model.norm_out.weight]
+
+
+def test_position_losses_refuse_targets_of_another_leading_shape() -> None:
+    # Maintainer B's review of 571b5f9 (410cdc1): y [2, 3, d] with targets [3, 2] was accepted
+    # (flattened first) and returned [3, 2]; the declared contract is targets with y's exact leading
+    # shape
+    model = _model()
+    d = model.embedding.weight.shape[1]
+    y = torch.randn(2, 3, d, dtype=F64)
+    good = torch.zeros(2, 3, dtype=torch.int64)
+    assert model.position_losses(y, good).shape == (2, 3)
+    for bad in (torch.zeros(3, 2, dtype=torch.int64), torch.zeros(6, dtype=torch.int64)):
+        with pytest.raises(ContractError):
+            _ = model.position_losses(y, bad)

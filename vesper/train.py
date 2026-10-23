@@ -14,7 +14,9 @@ manifest, the streams' packing state, the carried states and the identity of wha
 """
 
 import argparse
+import dataclasses
 import hashlib
+import io
 import json
 import logging
 import math
@@ -25,7 +27,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
@@ -34,10 +36,14 @@ from vesper.attention import KVCache
 from vesper.column import (
     SCAN_IMPLS,
     ColumnState,
+    check_capturable_scan,
     check_column_state,
     map_state,
+    reset_recurrent,
     scan_of,
     set_scan,
+    state_tensors,
+    with_state_tensors,
 )
 from vesper.config import VesperConfig, load
 from vesper.corpus import (
@@ -52,9 +58,16 @@ from vesper.corpus import (
     load_finalization,
 )
 from vesper.data import Chunk, Document, SlotState, Stream, StreamState
-from vesper.evals import evaluate, iteration_histogram, static_profile
+from vesper.evals import EvalGraphs, evaluate, iteration_histogram, static_profile
 from vesper.generations import parse_pin, pinned
-from vesper.keys import file_sha256
+from vesper.graphs import (
+    WARM_STEPS,
+    SignatureGraph,
+    memory_peak,
+    reset_memory_peak,
+    signature,
+)
+from vesper.keys import file_sha256, verified_bytes
 from vesper.learning import LossWeights, check_mode
 from vesper.loop import DenseRule, HaltingHead
 from vesper.model import Vesper
@@ -130,10 +143,43 @@ class Phase:
 
 @dataclass
 class Group:
-    """One micro-batch: its stream of ``micro_chunks`` slots and their carried states."""
+    """One micro-batch: its stream of ``micro_chunks`` slots and their carried states.
+
+    ``draw_ahead`` draws the group's next chunk early: ``step`` calls it (through its ``ahead``
+    argument) while the device runs the current step, so the host's drawing overlaps the GPU's
+    work instead of leaving the card idle (measured 2026-10-21 on the RTX 5090 with real data:
+    drawing took 42 of a 274 ms step). ``next`` hands that chunk out before drawing anew, so the
+    chunks and their order are the stream's own; ``stream_state`` is the stream as of the last
+    chunk handed out, so a checkpoint never records a chunk that was drawn but not trained.
+    """
 
     stream: Stream
     states: list[ColumnState]
+    _ahead: list[Chunk | None] = dataclasses.field(default_factory=list, init=False)
+    _before: StreamState | None = dataclasses.field(default=None, init=False)
+
+    def next(self) -> Chunk | None:
+        """The chunk drawn ahead if there is one, else the stream's next."""
+        if self._ahead:
+            self._before = None
+            return self._ahead.pop()
+        return self.stream.next()
+
+    def draw_ahead(self) -> None:
+        """Draw the next chunk now and keep the stream's state from before it.
+
+        Raises:
+            ValueError: when a chunk is already drawn ahead (one at most).
+        """
+        if self._ahead:
+            msg = "a chunk is already drawn ahead"
+            raise ValueError(msg)
+        self._before = self.stream.state()
+        self._ahead.append(self.stream.next())
+
+    def stream_state(self) -> StreamState:
+        """The stream's state as of the last chunk handed out (what a checkpoint records)."""
+        return self.stream.state() if self._before is None else self._before
 
 
 @dataclass(frozen=True)
@@ -142,8 +188,9 @@ class StepResult:
 
     ``consumed`` counts the step's input tokens per source as the streams emitted them (the
     chunks' ``spans``), which is what the model saw; the mixer's hand-out counts are not that.
-    ``peak_memory_bytes`` is the accelerator's peak of allocated bytes during the step, with the
-    carried states of every slot and the optimizer resident (0 on the CPU, which has no counter).
+    ``peak_reserved_bytes`` is ``graphs.memory_peak`` over the step: what the allocator held
+    from the card, the captured graph's pool, the carried states of every slot and the optimizer
+    included (0 on the CPU, which has no counter).
     """
 
     loss: float
@@ -156,7 +203,7 @@ class StepResult:
     histogram: list[float]
     grad_norm: float
     seconds: float
-    peak_memory_bytes: int
+    peak_reserved_bytes: int
     # the "fixed" objective's next-token loss of each pass, token-weighted over the batch (None
     # under "act"): what depth-first training watches, whether later passes improve
     pass_ntp: list[float] | None = None
@@ -391,8 +438,21 @@ def step(  # noqa: PLR0913
     recompute: bool = False,
     slices: int = 1,
     objective: str = "act",
+    graphs: "StepGraphs | None" = None,
+    ahead: Callable[[], None] | None = None,
 ) -> StepResult | None:
     """One optimizer step over the next chunk of every group that still has one.
+
+    ``ahead``, when given, is called once the step is launched on the device and before its
+    record is read: the run draws the next step's chunks there (``Group.draw_ahead``), on the
+    host while the device works, and ``Group.next`` hands them out to the next step.
+
+    On CUDA the whole step (every group's forward, objective and backward, the clip and the
+    optimizer's step) is ONE captured CUDA graph (``graphs``; the project owner 2026-10-21: CUDA
+    graphs are a hard requirement for anything on the GPU, so a CUDA step without ``graphs`` is
+    refused); the step reads nothing back until it has run, then its record in one transfer. On the
+    CPU the same device step runs directly. The model's optimizer must be the capturable one on
+    CUDA (``optimizer(..., capturable=True)``).
 
     ``objective`` (``OBJECTIVES``): "act" trains ``wake_objective``; "fixed" runs every token
     through every pass of the phase (``DenseRule``) and trains ``all_pass_objective`` with equal
@@ -417,68 +477,77 @@ def step(  # noqa: PLR0913
     """
     check_mode(cfg.learning.mode)  # the public boundary refuses first; the streams and states stay
     _check_objective(objective)
+    cuda = device.type == "cuda"
+    if cuda and graphs is None:
+        msg = "a CUDA step runs as a captured CUDA graph: pass StepGraphs (no eager GPU step)"
+        raise ValueError(msg)
+    if cuda and scan_of(model) == "reference":
+        msg = "the reference scan cannot run as a captured CUDA graph; set a fused scan"
+        raise ValueError(msg)
     started = time.monotonic()
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-    drawn = [(group, chunk) for group in groups if (chunk := group.stream.next()) is not None]
+    reset_memory_peak(device)
+    drawn = [
+        (index, group, chunk)
+        for index, group in enumerate(groups)
+        if (chunk := group.next()) is not None
+    ]
     if not drawn:
         return None
     set_halting(model, phase)
-    counts = [int(chunk.loss_mask.sum().item()) for _, chunk in drawn]
+    # the chunks are still on the CPU: counting there costs no device synchronization
+    counts = [int(chunk.loss_mask.sum()) for _, _, chunk in drawn]
     total = sum(counts)
     if total == 0:
         msg = "no position in the batch carries a loss"
         raise ValueError(msg)
-    weights = LossWeights(lambda_h=phase.lambda_h, lambda_g=cfg.learning.lambda_g)
-    opt.zero_grad(set_to_none=True)
-    loss_sum = 0.0
-    ntp_sum = 0.0
-    ponder_sum = 0.0
-    pass_sum: list[float] | None = None
-    seen = 0
-    consumed: dict[str, int] = {}
-    histogram: list[Tensor] = []
-    for (group, chunk), count in zip(drawn, counts, strict=True):
-        # one call per group, so its logits, outputs and graph are released before the next
-        # group's forward (maintainer B's review of 444b966: the step held the previous group's
-        # logits, y and per_pass at the next forward)
-        loss, ntp, ponder, iters, pass_ntp = _train_group(
-            model,
-            group,
-            chunk,
-            count / total,
-            phase=phase,
-            cfg=cfg,
-            device=device,
-            weights=weights,
-            recompute=recompute,
-            slices=slices,
-            objective=objective,
+    set_learning_rate(opt, phase.lr)  # a capturable optimizer's rate is filled in place
+    sizes = [group.stream.slots for group in groups]  # every group's, so a dry one keeps its place
+    plan = _StepPlan(
+        has_loss=tuple(count > 0 for count in counts),
+        t_max=phase.t_max,
+        halting_frozen=phase.halting_frozen,
+        fixed=objective == "fixed",
+        recompute=recompute,
+        slices=slices,
+        templates=tuple(tuple(group.states) for _, group, _ in drawn),
+        chunks=tuple(chunk for _, _, chunk in drawn),
+        reset_every=cfg.training.state_reset_chunks,
+        first_slots=tuple(sum(sizes[:index]) for index, _, _ in drawn),
+        total_slots=sum(sizes),
+    )
+    values: list[Tensor] = []
+    for _, group, chunk in drawn:
+        values += [t.to(device) for t in _chunk_tensors(chunk)]
+        values += state_tensors(group.states)
+    shares: list[float] = [c / total for c in counts]
+    values.append(torch.tensor(shares, dtype=torch.float32, device=device))
+    if graphs is None:
+        out: Sequence[Tensor] = _device_step(model, opt, cfg, plan, phase.lambda_h, values)
+    else:
+        lambda_h = graphs.lambda_h(device)
+        _ = lambda_h.fill_(phase.lambda_h)
+        out = graphs(
+            plan.key(values),
+            lambda v: _device_step(model, opt, cfg, plan, lambda_h, v),
+            values,
         )
-        loss_sum += loss
-        ntp_sum += ntp
-        ponder_sum += ponder
-        if pass_ntp is not None:
-            pass_sum = (
-                pass_ntp
-                if pass_sum is None
-                else [a + b for a, b in zip(pass_sum, pass_ntp, strict=True)]
-            )
-        if iters is not None:
-            histogram.append(iters)
-        seen += int(chunk.valid.sum().item())
-        for slot_spans in chunk.spans:
-            for source, inputs in slot_spans:
-                consumed[source] = consumed.get(source, 0) + inputs
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    grad_norm = float(nn.utils.clip_grad_norm_(parameters, cfg.optimizer.grad_clip).item())
-    set_learning_rate(opt, phase.lr)
-    # the optimizer's step is untyped in torch; its result (a closure's loss) is not used here
-    _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
+    if ahead is not None:
+        ahead()  # on the host while the device runs the launched step
+    read = _read_step(out, plan)
+    histogram = [
+        n_iters[chunk.loss_mask].to(torch.int32)
+        for n_iters, chunk in zip(read.n_iters, plan.chunks, strict=True)
+        if bool(chunk.loss_mask.any())
+    ]
+    for (_, group, _), states in zip(drawn, read.states, strict=True):
+        group.states = with_state_tensors(group.states, states)
+    loss, ntp, ponder, grad_norm = read.scalars
+    seen = sum(int(chunk.valid.sum()) for _, _, chunk in drawn)
+    consumed = _consumed(plan.chunks)
     return StepResult(
-        loss=loss_sum,
-        ntp=ntp_sum,
-        ponder=ponder_sum,
+        loss=loss,
+        ntp=ntp,
+        ponder=ponder,
         tokens_with_loss=total,
         tokens=seen,
         consumed=consumed,
@@ -486,68 +555,271 @@ def step(  # noqa: PLR0913
         histogram=iteration_histogram(histogram, cfg.model.t_max),
         grad_norm=grad_norm,
         seconds=time.monotonic() - started,
-        peak_memory_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0,
-        pass_ntp=pass_sum,
+        peak_reserved_bytes=memory_peak(device),
+        pass_ntp=read.pass_ntp if plan.fixed else None,
     )
 
 
-def _train_group(  # noqa: PLR0913
-    model: Vesper,
-    group: Group,
-    chunk: Chunk,
-    share: float,
-    *,
-    phase: Phase,
-    cfg: VesperConfig,
-    device: torch.device,
-    weights: LossWeights,
-    recompute: bool,
-    slices: int,
-    objective: str,
-) -> tuple[float, float, float, Tensor | None, list[float] | None]:
-    """One group's forward, objective scaled by ``share``, backward and state hand-off.
+def _consumed(chunks: Sequence[Chunk]) -> dict[str, int]:
+    """The input tokens per source the chunks fed the model (their ``spans``)."""
+    consumed: dict[str, int] = {}
+    for chunk in chunks:
+        for slot_spans in chunk.spans:
+            for source, inputs in slot_spans:
+                consumed[source] = consumed.get(source, 0) + inputs
+    return consumed
 
-    Returns the share-weighted loss, next-token and ponder parts, the iteration counts of the
-    loss positions (None for a chunk without a loss position, whose forward still advances the
-    states) and, under "fixed", each pass's share-weighted next-token loss (else None). Every
-    tensor of the forward dies with this call's frame.
+
+_CHUNK_FIELDS = 7  # tokens, targets, valid, doc_start, segment, loss_mask, pos
+
+
+def _chunk_tensors(chunk: Chunk) -> list[Tensor]:
+    """A chunk's ``_CHUNK_FIELDS`` tensors, in the order ``_chunk_with`` takes them back."""
+    c = chunk
+    return [c.tokens, c.targets, c.valid, c.doc_start, c.segment, c.loss_mask, c.pos]
+
+
+def _chunk_with(chunk: Chunk, tensors: Sequence[Tensor]) -> Chunk:
+    """``chunk`` with its tensors replaced (a step's device values), its metadata kept."""
+    tokens, targets, valid, doc_start, segment, loss_mask, pos = tensors
+    return dataclasses.replace(
+        chunk,
+        tokens=tokens,
+        targets=targets,
+        valid=valid,
+        doc_start=doc_start,
+        segment=segment,
+        loss_mask=loss_mask,
+        pos=pos,
+    )
+
+
+@dataclass(frozen=True)
+class _StepRead:
+    """A device step's outputs on the host: read in one transfer after the step ran."""
+
+    scalars: tuple[float, float, float, float]  # loss, ntp, ponder, grad norm
+    pass_ntp: list[float]
+    n_iters: list[Tensor]  # per group, [b, n] on the CPU
+    states: list[list[Tensor]]  # per group, its new state tensors, still on the device
+
+
+def _read_step(out: Sequence[Tensor], plan: "_StepPlan") -> _StepRead:
+    """``_device_step``'s outputs read back: the only point the host waits for the device."""
+    groups = len(plan.chunks)
+    iters = list(out[5 : 5 + groups])
+    record = torch.cat(
+        [torch.stack(list(out[:4])).double(), out[4].double()]
+        + [n.flatten().double() for n in iters]
+    ).cpu()
+    values = [float(v) for v in record.unbind()]
+    t_max = plan.t_max
+    n_iters: list[Tensor] = []
+    offset = 4 + t_max
+    for n in iters:
+        n_iters.append(record[offset : offset + n.numel()].view(n.shape).to(torch.int64))
+        offset += n.numel()
+    states: list[list[Tensor]] = []
+    rest = list(out[5 + groups :])
+    for template in plan.templates:
+        size = len(state_tensors(template))
+        states.append(rest[:size])
+        rest = rest[size:]
+    return _StepRead(
+        scalars=(values[0], values[1], values[2], values[3]),
+        pass_ntp=values[4 : 4 + t_max],
+        n_iters=n_iters,
+        states=states,
+    )
+
+
+class StepGraphs(SignatureGraph):
+    """The trainer's captured steps on CUDA (``graphs.SignatureGraph``) and its halting weight.
+
+    The step's signature (``_StepPlan.key``) is the phase's pass count and head freeze, the
+    objective, which groups drew a chunk and which of them carry a loss, the memory options and
+    every value's shape (the attention windows fill during the first chunk, a dry group leaves
+    the batch); phases and the tail only move forward, so an old signature never returns. The
+    halting weight ``lambda_h``, which ramps every step, is a device scalar filled before each
+    step, never a captured float.
     """
-    tokens = chunk.tokens.to(device)
-    pos = chunk.pos.to(device)
-    fixed = objective == "fixed"
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-    ):
-        result = model.run(
-            tokens,
-            pos,
-            group.states,
-            passes=phase.t_max,
-            recompute=recompute,
-            exit_rule=DenseRule() if fixed else None,
+
+    def __init__(self, warm: int = WARM_STEPS) -> None:
+        """Nothing captured yet."""
+        super().__init__(warm)
+        self._lambda_h: Tensor | None = None
+
+    def lambda_h(self, device: torch.device) -> Tensor:
+        """The device scalar the captured objective reads the halting weight from."""
+        if self._lambda_h is None:
+            self._lambda_h = torch.zeros((), dtype=torch.float32, device=device)
+        return self._lambda_h
+
+
+@dataclass(frozen=True)
+class _StepPlan:
+    """What one step's device work is, beyond its values: the signature and the structure."""
+
+    # which drawn groups carry a loss position: a group without one skips the head (a Python
+    # decision frozen into the graph). Which groups drew needs no field: the device work never
+    # reads a group's index, and a dry group changes the values' count
+    has_loss: tuple[bool, ...]
+    t_max: int
+    halting_frozen: bool
+    fixed: bool
+    recompute: bool
+    slices: int
+    templates: tuple[tuple[ColumnState, ...], ...]  # each group's state structure
+    chunks: tuple[Chunk, ...]  # each group's chunk, for its metadata (the tensors are values)
+    reset_every: int = 0  # training.state_reset_chunks (reset_keep); 0 = never
+    first_slots: tuple[int, ...] = ()  # each drawn group's first slot in the whole batch
+    total_slots: int = 0  # the batch's slots over every group, drawn or not
+
+    def key(self, values: Sequence[Tensor]) -> tuple[object, ...]:
+        """The capture signature: the plan's switches and every value's shape and dtype."""
+        return signature(
+            values,
+            self.has_loss,
+            self.t_max,
+            self.halting_frozen,
+            self.fixed,
+            self.recompute,
+            self.slices,
+            self.reset_every,
+            self.first_slots,
+            self.total_slots,
         )
-        group.states = detach_states(result.states)
-        if share == 0.0:
-            return 0.0, 0.0, 0.0, None, None
-        # the head over the loss positions in slices (float32 logits per slice), never [b, n, V]
-        pass_ntp = None
-        if fixed:
-            value, all_pass = model.all_pass_objective(
-                chunk, result, condition="fixed", beta=0.0, slices=slices
+
+
+RESET_LEVELS = 6  # memory lifetimes per group of slots: K, 4K, 16K, 64K, 256K chunks, never
+RESET_RATIO = 4
+
+
+def reset_keep(
+    pos: Tensor, chunk_tokens: int, shortest: int, first_slot: int, total_slots: int
+) -> Tensor:
+    """PRIMITIVE ``float32 [b]``: 0 where a slot's recurrent memory restarts cold, else 1.
+
+    MIXED LIFETIMES: the ``b`` rows of ``pos`` are the batch's slots ``first_slot ..
+    first_slot + b - 1`` of ``total_slots``; slot ``s`` has level ``s % RESET_LEVELS`` and period
+    ``shortest * RESET_RATIO ** level`` chunks; the last level never restarts. So at every step
+    the batch holds memories of every age, from cold to never cleared (a single period would
+    trade the never-reset run's failure for its mirror image: no memory older than the period
+    is ever trained). Slots are numbered across the whole batch, not within a micro-group, so
+    how the batch is split into groups does not change any slot's lifetime (maintainer B 9e3066c:
+    per group, six groups of two slots never had the never-cleared level). A slot's chunk index is
+    ``pos[:, 0] // chunk_tokens`` (positions count every emitted position, padding included: the
+    slot's own chunk count, resume-safe, no host state); it restarts when ``(index + offset) %
+    period == 0`` and never at its first chunk (already cold). Slots that share a level are
+    staggered by ``offset = copy * period // copies`` (``copy = s // RESET_LEVELS``, ``copies``
+    the batch's slots per level, rounded up). Computed on the device, inside the captured step.
+
+    For: training a model that must work from a cold start AND from long-carried memory (the 16x
+    d512 run of 2026-10-21, never reset, reached held-out perplexity 36.4 from its own carried
+    states and 351 from cold ones). Not for: ``shortest`` < 1.
+
+    Raises:
+        ValueError: when the rows do not lie inside ``0 .. total_slots - 1``.
+    """
+    b = int(pos.shape[0])
+    if first_slot < 0 or first_slot + b > total_slots:
+        msg = f"slots {first_slot}..{first_slot + b - 1} are not inside 0..{total_slots - 1}"
+        raise ValueError(msg)
+    slot = first_slot + torch.arange(b, device=pos.device)
+    level = torch.remainder(slot, RESET_LEVELS)
+    period = shortest * torch.pow(torch.full_like(slot, RESET_RATIO), level)
+    copies = -(-total_slots // RESET_LEVELS)
+    offset = torch.div(slot, RESET_LEVELS, rounding_mode="floor") * period // copies
+    chunk_index = torch.div(pos[:, 0], chunk_tokens, rounding_mode="floor")
+    due = torch.remainder(chunk_index + offset, period).eq(0)
+    restart = due & chunk_index.gt(0) & level.lt(RESET_LEVELS - 1)
+    return restart.logical_not().to(torch.float32)
+
+
+def _device_step(
+    model: Vesper,
+    opt: torch.optim.AdamW,
+    cfg: VesperConfig,
+    plan: _StepPlan,
+    lambda_h: float | Tensor,
+    values: Sequence[Tensor],
+) -> list[Tensor]:
+    """The whole optimizer step on the device with no read-back: capturable as one CUDA graph.
+
+    ``values``: per group that drew, its chunk's ``_CHUNK_FIELDS`` then its state tensors
+    (``state_tensors``), and last the groups' shares of the batch's loss tokens (float32).
+    Each group's forward (autocast bf16 on CUDA), its objective scaled by its share and its
+    backward run in turn, so a group's logits and graph are released before the next forward
+    (maintainer B's review of 444b966); a group without a loss position only advances its states.
+    Then one clip over the trainable parameters and the optimizer's step. Returns the share-weighted
+    loss, next-token and ponder parts, the gradient norm (scalars), the per-pass next-token loss
+    ``[T]`` (zeros under "act"), every group's pass counts ``[b, n]`` and its new detached
+    state tensors.
+    """
+    device = values[0].device
+    shares = values[-1]
+    weights = LossWeights(lambda_h=lambda_h, lambda_g=cfg.learning.lambda_g)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt.zero_grad(set_to_none=True)
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    loss, ntp, ponder = zero, zero, zero
+    pass_ntp = torch.zeros(plan.t_max, dtype=torch.float32, device=device)
+    iters: list[Tensor] = []
+    states_out: list[Tensor] = []
+    cursor = 0
+    for g, (template, chunk) in enumerate(zip(plan.templates, plan.chunks, strict=True)):
+        local = _chunk_with(chunk, values[cursor : cursor + _CHUNK_FIELDS])
+        cursor += _CHUNK_FIELDS
+        size = len(state_tensors(template))
+        states = with_state_tensors(template, values[cursor : cursor + size])
+        cursor += size
+        if plan.reset_every > 0:
+            carry = reset_keep(
+                local.pos,
+                cfg.training.chunk_tokens,
+                plan.reset_every,
+                plan.first_slots[g],
+                plan.total_slots,
             )
-            ntp, ponder = all_pass["expected_ntp"], torch.zeros(())
-            pass_ntp = [float(v) * share for v in all_pass["pass_ntp"].unbind()]
-        else:
-            value, parts = model.objective(chunk, result, cfg, weights, slices=slices)
-            ntp, ponder = parts["ntp"], parts["ponder"]
-    torch.autograd.backward([value * share])
-    return (
-        float(value.item()) * share,
-        float(ntp.item()) * share,
-        float(ponder.item()) * share,
-        result.n_iters[chunk.loss_mask.to(device)].detach().cpu(),
-        pass_ntp,
-    )
+            states = [reset_recurrent(state, carry) for state in states]
+        share = shares[g]
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            result = model.run(
+                local.tokens,
+                local.pos,
+                states,
+                passes=plan.t_max,
+                recompute=plan.recompute,
+                exit_rule=DenseRule() if plan.fixed else None,
+            )
+            states_out += state_tensors(detach_states(result.states))
+            iters.append(result.n_iters.detach())
+            if not plan.has_loss[g]:
+                continue
+            # the head over the loss positions in slices; without recomputation its logits are
+            # kept for the backward pass too (one switch trades memory for speed everywhere)
+            keep = not plan.recompute
+            if plan.fixed:
+                value, all_pass = model.all_pass_objective(
+                    local, result, condition="fixed", beta=0.0, slices=plan.slices, keep_logits=keep
+                )
+                part_ntp, part_ponder = all_pass["expected_ntp"], zero
+                pass_ntp = pass_ntp + all_pass["pass_ntp"].float() * share
+            else:
+                value, parts = model.objective(
+                    local, result, cfg, weights, slices=plan.slices, keep_logits=keep
+                )
+                part_ntp, part_ponder = parts["ntp"], parts["ponder"]
+        torch.autograd.backward([value * share])
+        loss = loss + value.detach().float() * share
+        ntp = ntp + part_ntp.detach().float() * share
+        ponder = ponder + part_ponder.detach().float() * share
+    grad_norm = nn.utils.clip_grad_norm_(params, cfg.optimizer.grad_clip).float()
+    # the optimizer's step is untyped in torch; its result (a closure's loss) is not used here
+    _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
+    return [loss, ntp, ponder, grad_norm, pass_ntp, *iters, *states_out]
 
 
 def _check_objective(objective: str) -> None:
@@ -663,7 +935,7 @@ def checkpoint(  # noqa: PLR0913
     if path.exists():
         msg = f"{path}: a checkpoint already exists there"
         raise ValueError(msg)
-    streams = [g.stream.state() for g in groups]
+    streams = [g.stream_state() for g in groups]
     layout = Layout(groups=len(groups), slots=len(streams[0].slots) if streams else 0)
     with staged(path) as partial:
         partial.mkdir(parents=True)
@@ -719,13 +991,14 @@ def restore(
             ``layout`` (regrouping logical slots is not supported; the run refuses before it
             trains, so the layout it logs is the one it executes).
     """
-    record = _checked_record(path)  # one snapshot of train.json, its schema checked first
-    manifest = cast("dict[str, str]", json.loads((path / "manifest.json").read_text()))
-    for name in FILES:
-        file = path / name
-        if not file.is_file() or file_sha256(file) != manifest.get(name):
-            msg = f"{file}: missing or its hash differs from the manifest"
-            raise ValueError(msg)
+    # one snapshot of train.json and the manifest, its schema checked first; every other file
+    # checked against that manifest and loaded from the bytes that were checked
+    record, manifest = checked_record(path)
+    blobs = {
+        name: verified_bytes(path / name, manifest.get(name), f"{name}, against the manifest")
+        for name in FILES
+        if name != "train.json"
+    }
     saved = cast("dict[str, object]", record["identity"])
     if saved != _plain(identity):
         differ = sorted(k for k, v in _plain(identity).items() if saved.get(k) != v)
@@ -740,16 +1013,16 @@ def restore(
             f" {_plain(layout)}; regrouping is not supported"
         )
         raise ValueError(msg)
-    loaded = cast("dict[str, Tensor]", torch.load(path / "model.pt", weights_only=True))
+    loaded = cast("dict[str, Tensor]", torch.load(io.BytesIO(blobs["model.pt"]), weights_only=True))
     _ = cast("object", model.load_state_dict(loaded))
     opt.load_state_dict(
-        cast("dict[str, object]", torch.load(path / "optimizer.pt", weights_only=True))
+        cast("dict[str, object]", torch.load(io.BytesIO(blobs["optimizer.pt"]), weights_only=True))
     )
     # states load on the CPU whatever device saved them, are checked there (one device, real
     # floating dtypes) and moved to the run's device by _to_device: the explicit migration
     saved_states = cast(
         "dict[str, object]",
-        torch.load(path / "states.pt", weights_only=True, map_location="cpu"),
+        torch.load(io.BytesIO(blobs["states.pt"]), weights_only=True, map_location="cpu"),
     )
     groups = cast("list[dict[str, object]]", saved_states["groups"])
     mixer_record = cast("dict[str, object] | None", saved_states.get("mixer"))
@@ -783,13 +1056,25 @@ def _mixer_from_record(record: dict[str, object]) -> MixerState:
     )
 
 
-def _checked_record(path: Path) -> dict[str, object]:
-    """The checkpoint's ``train.json`` as one validated snapshot.
+class CheckedRecord(NamedTuple):
+    """A checkpoint's ``train.json`` and the ONE ``manifest.json`` snapshot it was checked against.
+
+    Every other file of the checkpoint is checked against this same ``manifest`` (read once),
+    with ``keys.verified_bytes``, and loaded from the bytes that were checked.
+    """
+
+    record: dict[str, object]
+    manifest: dict[str, object]
+
+
+def checked_record(path: Path) -> CheckedRecord:
+    """The checkpoint's ``train.json`` as one validated snapshot, and the manifest it matched.
 
     Hashed and parsed from the same bytes, its schema checked before any field is read (maintainer
     B's review of f55bfb3: a hash-then-reread let a replacement land between the two, and a schema-3
-    record reached a KeyError first). Returns the record with ``recipe`` known to be a mapping of
-    the current schema.
+    record reached a KeyError first). The record's ``recipe`` is known to be a mapping of the
+    current schema. Shared by ``restore``, ``resumed_components`` and the text pilot's
+    ``halting_text.load_text_source`` (maintainer B's review of 72c9d31).
 
     Raises:
         ValueError: when the manifest or the record is missing, the hash differs, the record is
@@ -803,10 +1088,7 @@ def _checked_record(path: Path) -> dict[str, object]:
     manifest = _mapping(
         cast("object", json.loads(manifest_path.read_bytes())), f"{manifest_path}: malformed"
     )
-    data = file.read_bytes()
-    if hashlib.sha256(data).hexdigest() != manifest.get("train.json"):
-        msg = f"{file}: missing or its hash differs from the manifest"
-        raise ValueError(msg)
+    data = verified_bytes(file, manifest.get("train.json"), "train.json, against the manifest")
     try:
         parsed = cast("object", json.loads(data))
     except ValueError as exc:
@@ -821,7 +1103,7 @@ def _checked_record(path: Path) -> dict[str, object]:
             " no conversion exists, the run is a fork from this checkpoint's own code"
         )
         raise ValueError(msg)
-    return record
+    return CheckedRecord(record, manifest)
 
 
 def _mapping(value: object, what: str) -> dict[str, object]:
@@ -848,8 +1130,8 @@ def resumed_components(data: Path, resume: Path) -> list[Component]:
             (a legacy-layout run resumes under ``--legacy-layout --web --mix``), a pin is
             malformed, or a pinned generation is missing, changed or re-hashed.
     """
-    record = _checked_record(resume)
-    recipe = cast("dict[str, object]", record["recipe"])  # a mapping: _checked_record said so
+    record = checked_record(resume).record
+    recipe = cast("dict[str, object]", record["recipe"])  # a mapping: checked_record said so
     components = recipe.get("components")
     pins = recipe.get("generations")
     if not isinstance(components, list) or not isinstance(pins, list):
@@ -983,10 +1265,11 @@ def _parser() -> argparse.ArgumentParser:
     _ = parser.add_argument(
         "--scan",
         choices=SCAN_IMPLS,
-        default="reference",
+        default=None,
         help=(
-            "the recurrent scan: the reference, the fused CUDA kernel (bf16 intermediates), or "
-            "the fused float32 CUDA kernel (the reference's precision)"
+            "the recurrent scan: the reference (CPU only), the fused CUDA kernel (bf16"
+            " intermediates), or the fused float32 CUDA kernel (the reference's precision);"
+            " default fused-fp32 on CUDA, the reference on the CPU"
         ),
     )
     _ = parser.add_argument(
@@ -1059,8 +1342,13 @@ def run(  # noqa: C901, PLR0913, PLR0915
     # the corpus order through the seed; nothing reads torch's global generator. The scan is
     # chosen before anything is written, so a refused "fused" leaves no trace.
     model = Vesper(cfg, torch.Generator().manual_seed(seed)).to(device)
+    _ = check_capturable_scan(scan, device)  # CUDA work is captured: no reference scan there
     _ = set_scan(model, scan)
-    opt = optimizer(model, cfg)
+    # on CUDA every step is one captured graph (the project owner 2026-10-21: a hard requirement),
+    # so the optimizer is the capturable variant whose rate is a device tensor
+    cuda = device.type == "cuda"
+    opt = optimizer(model, cfg, capturable=cuda)
+    graphs = StepGraphs() if cuda else None
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "log.jsonl"
     if resume is None and log_path.exists():
@@ -1143,24 +1431,40 @@ def run(  # noqa: C901, PLR0913, PLR0915
     training_positions = 0
     training_passes = 0
     phase = phase_schedule(tokens_seen, step_index, cfg)
+    # the mixer as of the chunks handed out to a step: taken right before the groups draw ahead,
+    # so a checkpoint and the log agree with the groups' stream_state (all three describe the
+    # documents pulled for trained chunks only; a resume rebuilds the drawn-ahead chunks)
+    handed: tuple[MixerState, dict[str, int], str] | None = None
+
+    def handed_out() -> tuple[MixerState, dict[str, int], str]:
+        return handed if handed is not None else (mixer.state(), dict(counts), mixer.digest())
+
+    def ahead() -> None:
+        nonlocal handed
+        handed = (mixer.state(), dict(counts), mixer.digest())
+        for group in groups:
+            group.draw_ahead()
 
     def save(reason: str) -> None:
         nonlocal checkpointed_at
+        mixer_state, emitted, digest = handed_out()
         current = Progress(
             step=step_index,
             tokens_seen=tokens_seen,
-            tokens_emitted=dict(counts),
+            tokens_emitted=dict(emitted),
             tokens_consumed=dict(consumed),
-            documents_sha256=mixer.digest(),
+            documents_sha256=digest,
         )
         where = out / f"step-{step_index}"
         _ = checkpoint(
-            where, model, opt, groups, current, identity, recipe, reason=reason, mixer=mixer.state()
+            where, model, opt, groups, current, identity, recipe, reason=reason, mixer=mixer_state
         )
         checkpointed_at = step_index
         chunks = held_out_chunks(parts, seed, tokenizer, held, micro, cfg)
-        evaluation = evaluate(model, chunks, cfg, passes=phase.t_max)
-        profile = static_profile(model, chunks, cfg)
+        # captured on CUDA; built per checkpoint so their memory is not held while training
+        eval_graphs = EvalGraphs() if cuda else None
+        evaluation = evaluate(model, chunks, cfg, passes=phase.t_max, graphs=eval_graphs)
+        profile = static_profile(model, chunks, cfg, graphs=eval_graphs)
         emit(
             {
                 "kind": "checkpoint",
@@ -1204,6 +1508,8 @@ def run(  # noqa: C901, PLR0913, PLR0915
             recompute=recompute,
             slices=slices,
             objective=objective,
+            graphs=graphs,
+            ahead=ahead,
         )
         if result is None:
             reason = "exhausted"
@@ -1237,7 +1543,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
         )
         for source, inputs in result.consumed.items():
             consumed[source] = consumed.get(source, 0) + inputs
-        line["shares"] = dict(counts)  # tokens the mixer handed to the streams
+        line["shares"] = dict(handed_out()[1])  # tokens the mixer handed out for trained chunks
         line["consumed"] = dict(consumed)  # inputs the model saw, per source, over the run
         emit(line)
         if tokens_seen >= next_checkpoint:
@@ -1245,7 +1551,18 @@ def run(  # noqa: C901, PLR0913, PLR0915
             save("interval")
     if step_index != checkpointed_at:
         save(reason)
-    emit({"kind": "end", "step": step_index, "tokens_seen": tokens_seen, "reason": reason})
+    emit(
+        {
+            "kind": "end",
+            "step": step_index,
+            "tokens_seen": tokens_seen,
+            "reason": reason,
+            # the proof that a CUDA run trained captured: its graphs' captures and replays
+            "step_graph": None
+            if graphs is None
+            else {"captures": graphs.captures, "replays": graphs.replays},
+        }
+    )
     return log_path
 
 
@@ -1268,10 +1585,21 @@ def _append(path: Path, line: dict[str, object]) -> None:
         _ = handle.write(json.dumps(line) + "\n")
 
 
+def _scan_for(chosen: str | None, device: torch.device) -> str:
+    """The scan asked for, else the device's default.
+
+    fused-fp32 on CUDA (capturable, the reference's precision), the reference on the CPU.
+    """
+    if chosen is not None:
+        return chosen
+    return "fused-fp32" if device.type == "cuda" else "reference"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """The command line: 0 when the run reached its last step or its data, 1 on an error."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     args = _parser().parse_args(argv)
+    device = torch.device(cast("str", args.device))
     config_path = cast("Path", args.config)
     cfg = load(config_path)
     resume = cast("Path | None", args.resume)
@@ -1300,12 +1628,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             micro=cast("int", args.micro_chunks),
             recompute=cast("bool", args.recompute),
             slices=cast("int", args.loss_slices),
-            scan=cast("str", args.scan),
+            scan=_scan_for(cast("str | None", args.scan), device),
             objective=cast("str", args.objective),
             steps=cast("int | None", args.steps),
             resume=resume,
             seed=cast("int", args.seed),
-            device=torch.device(cast("str", args.device)),
+            device=device,
         )
     except (RuntimeError, ValueError, TypeError):
         log.exception("stopped")

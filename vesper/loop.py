@@ -218,11 +218,10 @@ class TraceRule:
         if self.depths.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64}:
             msg = f"trace depths must be a signed integer tensor, got {self.depths.dtype}"
             raise ContractError(msg)
-        if self.depths.numel() and not bool(
-            ((self.depths >= 1) & (self.depths <= runs)).all().item()
-        ):
-            msg = f"trace depths must lie in [1, {runs}]"
-            raise ContractError(msg)
+        if self.depths.numel():
+            # require: eager ContractError, a device assert inside a captured evaluation
+            in_range = ((self.depths >= 1) & (self.depths <= runs)).all()
+            require(in_range, f"trace depths must lie in [1, {runs}]")
         depths = self.depths.to(active.device)
 
         def step(t: int, h: Tensor, active: Tensor, *, last: bool) -> tuple[Tensor, Tensor]:
@@ -394,6 +393,10 @@ class Loop(nn.Module):
         active = torch.ones(b, n, dtype=torch.bool, device=device)
         rule = ActRule(self.halting, self.halt_epsilon) if exit_rule is None else exit_rule
         decide = rule.begin(active, x0.dtype, runs)
+        # DenseRule: no token halts before the last pass, so every copy-forward selection below
+        # would pick the fresh value; skipping them is exact (measured 2026-10-21 on the 5090:
+        # their where/fill/add kernels were ~1500 of a ~5000-kernel captured training step)
+        dense = isinstance(rule, DenseRule)
         y = torch.zeros_like(x0)
         depth = torch.zeros(b, n, dtype=x0.dtype, device=device)
         n_iters = torch.zeros(b, n, dtype=torch.int32, device=device)
@@ -413,23 +416,25 @@ class Loop(nn.Module):
                     current[c],
                     t,
                     modulation,
-                    None if previous is None else Carry(active, previous),
+                    None if previous is None or dense else Carry(active, previous),
                     recompute=recompute,
                 )
                 fresh.append(written)
                 # inactive positions hold whatever the dense pass produced there, meaningful or
                 # not: they are zeroed before the next column, the head, the output or a
                 # gradient can read them, so a non-finite value there stops at its column
-                h = torch.where(active[..., None], h, torch.zeros_like(h))
+                if not dense:
+                    h = torch.where(active[..., None], h, torch.zeros_like(h))
             halts, allocation = decide(t, h, active, last=t == runs - 1)
             y = y + allocation[..., None] * h
             depth = depth + allocation * (t + 1)
             n_iters = n_iters + active.to(torch.int32)
             per_pass.append(h)
-            for c, written in enumerate(fresh):
-                previous = carried[c]
-                carried[c] = written if previous is None else _merge(halts, written, previous)
-            x = torch.where(active[..., None], h, x)
+            if not dense:  # no token halted, so nothing is ever carried
+                for c, written in enumerate(fresh):
+                    previous = carried[c]
+                    carried[c] = written if previous is None else _merge(halts, written, previous)
+            x = h if dense else torch.where(active[..., None], h, x)
             active = active & ~halts
         return LoopResult(
             y=y,

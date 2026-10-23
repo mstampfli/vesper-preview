@@ -38,6 +38,7 @@ the ``Stream`` takes. This module is off the hot path: pure Python over pyarrow,
 """
 
 import hashlib
+import io
 import json
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -49,7 +50,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from vesper.data import Document, is_held_out
-from vesper.keys import SequenceDigest, dedup_key, file_sha256
+from vesper.keys import SequenceDigest, dedup_key, file_sha256, verified_bytes
 from vesper.publish import staged
 from vesper.tokenizer import Tokenizer
 
@@ -471,24 +472,31 @@ def _publish_dropped(ids: list[str], parquet_path: Path) -> str:
         return file_sha256(partial)  # the rename happens on the way out, after the hash
 
 
-def load_finalization(receipt: Path) -> Finalization:
+def load_finalization(receipt: Path, *, sha256: str | None = None) -> Finalization:
     """Read a finalization back from its receipt; the dropped file's hash is verified.
 
+    Each file is read once and parsed from the bytes that were hashed (``keys.verified_bytes``),
+    never re-read after its check. ``sha256``, when given, is the receipt's own expected hash
+    (a run's recorded identity): the receipt that is parsed is then the one that was checked.
+
     Raises:
-        ValueError: when the receipt is empty (reserved by a run that is still working or was
-            abandoned; the dropped file beside it is not reader-ready), or the dropped file is
-            missing or its hash differs from the receipt.
+        ValueError: when the receipt's hash is not ``sha256``, the receipt is empty (reserved by
+            a run that is still working or was abandoned; the dropped file beside it is not
+            reader-ready), or the dropped file is missing or its hash differs from the receipt.
     """
-    text = receipt.read_text(encoding="utf-8")
+    data = (
+        receipt.read_bytes()
+        if sha256 is None
+        else verified_bytes(receipt, sha256, "the finalization receipt")
+    )
+    text = data.decode("utf-8")
     if not text.strip():
         msg = f"{receipt}: reserved, not published (a finalization in progress or abandoned)"
         raise ValueError(msg)
     record = cast("dict[str, object]", json.loads(text))
     dropped_path = receipt.parent / cast("str", record["dropped_file"])
-    if not dropped_path.is_file() or file_sha256(dropped_path) != record["dropped_sha256"]:
-        msg = f"{receipt}: dropped file {dropped_path} missing or changed since the receipt"
-        raise ValueError(msg)
-    column = pq.read_table(str(dropped_path), columns=["doc_id"]).column("doc_id").to_pylist()
+    dropped = verified_bytes(dropped_path, record["dropped_sha256"], f"{receipt}: its dropped file")
+    column = pq.read_table(io.BytesIO(dropped), columns=["doc_id"]).column("doc_id").to_pylist()
     ids = string_column(column, "doc_id", dropped_path, 0)
     inputs = cast("list[dict[str, object]]", record["inputs"])
     return Finalization(dropped=frozenset(ids), inputs=_inputs(inputs), receipt=receipt)

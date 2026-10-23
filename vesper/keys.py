@@ -1,4 +1,4 @@
-"""The corpus's identity primitives: the dedup normalization and key, and a bounded file hash.
+"""The corpus's identity primitives: the dedup normalization and key, and the file hashes.
 
 Every place that decides whether two documents are the same, or attests to a file's content,
 calls one of these. The dedup key is versioned so a change of rule rebuilds the keys instead of
@@ -66,6 +66,39 @@ def file_sha256(path: Path) -> str:
         while chunk := handle.read(_CHUNK):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def hashed_bytes(path: Path) -> tuple[bytes, str]:
+    """PRIMITIVE: a small file's bytes, read ONCE, and the SHA-256 of exactly those bytes.
+
+    For a file that is hashed AND used (a checkpoint's weights, a config, a pin, a receipt): the
+    caller parses the returned bytes and reports the returned hash, so the two describe one
+    snapshot. Hashing the path and then reading it again lets a replacement land between the
+    two reads (maintainer B's reviews of f55bfb3 and 72c9d31). Not for large data read as a stream
+    (the whole file is held in memory; ``file_sha256`` for those).
+    """
+    data = path.read_bytes()
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def verified_bytes(path: Path, sha256: object, what: str) -> bytes:
+    """PRIMITIVE: ``hashed_bytes``'s bytes when their hash is ``sha256``; a ``ValueError`` if not.
+
+    ``sha256`` is the expected hex digest as stored (a manifest entry, an identity field);
+    anything that is not that digest, a missing entry included, refuses. ``what`` names the file
+    in the message. Parse the returned bytes, never the path again.
+
+    Raises:
+        ValueError: when the file is missing or its bytes hash to another digest.
+    """
+    if not path.is_file():
+        msg = f"{what} ({path}): missing"
+        raise ValueError(msg)
+    data, digest = hashed_bytes(path)
+    if digest != sha256:
+        msg = f"{what} ({path}): changed, its hash differs from the recorded one"
+        raise ValueError(msg)
+    return data
 
 
 @final

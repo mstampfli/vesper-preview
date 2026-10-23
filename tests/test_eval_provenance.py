@@ -30,8 +30,10 @@ def test_checkpoint_separates_pre_update_training_and_post_update_evaluation(
     def two_pass_warm(tokens_seen: int, step: int, cfg: VesperConfig) -> train.Phase:
         return replace(schedule(tokens_seen, step, cfg), t_max=2, halting_frozen=True)
 
-    def optimizer_that_changes_depth(model: Vesper, cfg: VesperConfig) -> torch.optim.AdamW:
-        opt = make_optimizer(model, cfg)
+    def optimizer_that_changes_depth(
+        model: Vesper, cfg: VesperConfig, *, capturable: bool = False
+    ) -> torch.optim.AdamW:
+        opt = make_optimizer(model, cfg, capturable=capturable)
         update = cast("Callable[[], float | None]", opt.step)
 
         def update_then_halt() -> None:

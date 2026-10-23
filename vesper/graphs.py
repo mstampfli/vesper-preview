@@ -129,11 +129,21 @@ def deterministic_algorithms() -> Generator[dict[str, object]]:
         raise RuntimeError(msg)
     enabled = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill = fill_uninitialized_memory()
     torch.use_deterministic_algorithms(True, warn_only=False)  # noqa: FBT003  # torch's flag
+    # torch's deterministic mode also fills every new tensor with NaN so that a read of
+    # uninitialized memory repeats; measured 2026-10-21 on the 5090: ~2700 fill kernels of a
+    # ~6000-kernel captured step. It is off here on this evidence only: the separate-process
+    # repeat test and the captured == eager tests pass bitwise with it off, so the paths THEY run
+    # read no memory they did not write (an uninitialized read there would differ between runs).
+    # It is not a proof for other paths; an op reading unwritten memory elsewhere would not be
+    # caught by them (maintainer B's review of 571b5f9).
+    _set_fill_uninitialized_memory(value=False)
     try:
         yield {
             "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
             "warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "fill_uninitialized_memory": fill_uninitialized_memory(),
             "cublas_workspace_config": workspace,
             "cublas_workspace_size": (
                 torch.backends.cuda.cublas_workspace_size() if torch.cuda.is_available() else None
@@ -141,6 +151,20 @@ def deterministic_algorithms() -> Generator[dict[str, object]]:
         }
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        _set_fill_uninitialized_memory(value=fill)
+
+
+def fill_uninitialized_memory() -> bool:
+    """Torch's ``torch.utils.deterministic.fill_uninitialized_memory``, typed.
+
+    Torch defines it on a module subclass the type checkers cannot see.
+    """
+    value: object = torch.utils.deterministic.fill_uninitialized_memory  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]
+    return bool(value)  # pyright: ignore[reportUnknownArgumentType]
+
+
+def _set_fill_uninitialized_memory(*, value: bool) -> None:
+    torch.utils.deterministic.fill_uninitialized_memory = value  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
 
 
 class WarmedGraph:
@@ -196,3 +220,77 @@ class WarmedGraph:
             self.captures += 1
         self.replays += 1
         return self._captured.replay(values)
+
+
+class SignatureGraph:
+    """PRIMITIVE one ``WarmedGraph`` per work signature: GPU work whose shape changes rarely.
+
+    Each call names its signature ``key`` (everything the captured work depends on beyond the
+    values copied in: shapes, dtypes, a phase, which inputs exist). The same key replays the
+    current graph; a new key drops it and warms and captures a new one, so the memory of only
+    one graph is held. ``captures`` counts captures over the object's life, ``replays`` replays.
+
+    For: work that moves forward through few signatures and repeats each many times (the
+    trainer's steps across phases and the tail, the evaluations' chunks after the first one's
+    empty windows; the project owner 2026-10-21: CUDA graphs for ANYTHING on the GPU). Not for: work
+    that alternates between signatures (each switch re-warms; hold one ``SignatureGraph`` per
+    alternating kind instead). ``warm`` larger than the work never captures: the eager oracle an
+    equality test compares against, not a run mode.
+    """
+
+    def __init__(self, warm: int = WARM_STEPS) -> None:
+        """Nothing captured yet."""
+        self.warm: int = warm
+        self.captures: int = 0
+        self.replays: int = 0
+        self._key: tuple[object, ...] | None = None
+        self._graph: WarmedGraph | None = None
+
+    def __call__(
+        self,
+        key: tuple[object, ...],
+        step: Callable[[Sequence[Tensor]], Sequence[Tensor]],
+        values: Sequence[Tensor],
+    ) -> tuple[Tensor, ...]:
+        """``step(values)`` under ``key``'s graph: eager while warming, then captured, replayed.
+
+        Raises:
+            ContractError: as ``WarmedGraph``.
+        """
+        if key != self._key or self._graph is None:
+            self._key, self._graph = key, WarmedGraph(self.warm)
+        graph = self._graph
+        captures, replays = graph.captures, graph.replays
+        out = graph(step, values)
+        self.captures += graph.captures - captures
+        self.replays += graph.replays - replays
+        return out
+
+
+def reset_memory_peak(device: torch.device) -> None:
+    """Start a new ``memory_peak`` window on ``device`` (nothing on the CPU)."""
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def memory_peak(device: torch.device) -> int:
+    """PRIMITIVE the bytes a run holds on ``device``: the allocator's peak RESERVATION.
+
+    Since the last ``reset_memory_peak``, the most the caching allocator held from the card,
+    which includes every captured graph's private pool. Not the peak of allocated bytes: a
+    replay allocates nothing, so a window of replays reports only the resting tensors (the
+    5090 sweep of 2026-10-21 read 0.99 GiB for steps that held 15 GB). Reserved bytes can
+    exceed what live tensors need by the allocator's cached blocks; that is memory the process
+    holds and another job cannot have. 0 on the CPU, which has no counter.
+
+    For: every reported memory figure of a GPU run (training steps, drivers, the throughput
+    sweep). Not for: the size of one tensor or of one graph alone.
+    """
+    if device.type != "cuda":
+        return 0
+    return torch.cuda.max_memory_reserved(device)
+
+
+def signature(values: Sequence[Tensor], *switches: object) -> tuple[object, ...]:
+    """A ``SignatureGraph`` key: the ``switches`` and every value's shape, dtype and device."""
+    return (*switches, tuple((tuple(v.shape), v.dtype, v.device) for v in values))

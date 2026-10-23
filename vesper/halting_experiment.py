@@ -71,7 +71,14 @@ from typing import TextIO, cast
 import torch
 from torch import Tensor, nn
 
-from vesper.column import FUSED_INPUT_DTYPES, SCAN_IMPLS, Column, check_scan, scan_of, set_scan
+from vesper.column import (
+    FUSED_INPUT_DTYPES,
+    SCAN_IMPLS,
+    Column,
+    check_capturable_scan,
+    scan_of,
+    set_scan,
+)
 from vesper.config import VesperConfig, parse_bytes
 from vesper.data import Chunk
 from vesper.exits import exit_log_probs, hazard_cdf_exits, hazard_logits
@@ -276,7 +283,9 @@ def _check_backend(device: str, scan: str, condition: str, *, cuda_graph: bool) 
 
     Raises:
         ValueError: on an unknown condition, a device outside ``DEVICES``, a scan it cannot
-            run, or ``cuda_graph`` off CUDA.
+            run or cannot capture (the reference on CUDA), ``cuda_graph`` off CUDA, or CUDA
+            without ``cuda_graph`` (CUDA graphs for anything on the GPU, the project owner
+            2026-10-21).
     """
     if condition not in CONDITIONS:
         msg = f"condition must be one of {CONDITIONS}, got {condition!r}"
@@ -285,9 +294,13 @@ def _check_backend(device: str, scan: str, condition: str, *, cuda_graph: bool) 
         msg = f"device must be one of {DEVICES}, got {device!r}"
         raise ValueError(msg)
     target = torch.device(device)
-    _ = check_scan(scan, target)
+    _ = check_capturable_scan(scan, target)
     if cuda_graph and target.type != "cuda":
         msg = f"cuda_graph needs device cuda, got {device}"
+        raise ValueError(msg)
+    if target.type == "cuda" and not cuda_graph:
+        # CUDA graphs are a hard requirement for anything on the GPU (the project owner 2026-10-21)
+        msg = "on CUDA the step runs captured: pass cuda_graph (no eager GPU training)"
         raise ValueError(msg)
     return target
 

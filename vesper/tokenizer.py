@@ -128,6 +128,15 @@ class Tokenizer:
         """Read a tokenizer written by ``save``."""
         return cls(_HfTokenizer.from_file(str(path)))
 
+    @classmethod
+    def parse(cls, data: bytes) -> "Tokenizer":
+        """The tokenizer of the bytes of a file written by ``save``; ``load`` of the same file.
+
+        For a tokenizer whose file hash is checked first (``keys.verified_bytes``): the bytes
+        that were checked are the bytes parsed, never the path read again.
+        """
+        return cls(_HfTokenizer.from_buffer(data))
+
 
 PRE_TOKENIZERS: dict[str, str] = {
     "spaces-v1": (

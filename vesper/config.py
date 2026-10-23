@@ -113,6 +113,11 @@ class TrainingConfig:
     held_out_fraction: float
     checkpoints_per_run: int
     eval_chunks: int
+    # the SHORTEST memory lifetime in chunks: slots restart their recurrent memory (h, key
+    # history) every this, 4x, 16x, 64x, 256x many of their chunks or never, by slot (mixed
+    # lifetimes, train.reset_keep); 0 = never for every slot, the state carried forever (absent in
+    # a config = 0: the 16x d512 run of 2026-10-21 showed cold-start decay without restarts)
+    state_reset_chunks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +178,14 @@ class _Section:
             msg = f"{self._where}.{key}: expected an integer, got {value!r}"
             raise ConfigError(msg)
         return value
+
+    def get_int_or(self, key: str, default: int) -> int:
+        """Read an optional integer: ``default`` when the key is absent, else as ``get_int``.
+
+        For a recipe knob added after configs and checkpoints exist whose absence has one
+        meaning (the old behaviour); never for a value with no safe default.
+        """
+        return default if key not in self._items else self.get_int(key)
 
     def get_float(self, key: str) -> float:
         """Read a float; an integer literal is accepted, a bool is not."""
@@ -292,6 +305,7 @@ def _training(s: _Section) -> TrainingConfig:
         held_out_fraction=s.get_float("held_out_fraction"),
         checkpoints_per_run=s.get_int("checkpoints_per_run"),
         eval_chunks=s.get_int("eval_chunks"),
+        state_reset_chunks=s.get_int_or("state_reset_chunks", 0),
     )
     s.done()
     return cfg
@@ -364,6 +378,7 @@ def validate(cfg: VesperConfig) -> None:
     _require(0.0 < t.held_out_fraction < 1.0, "training: held_out_fraction in (0, 1)")
     _require(t.checkpoints_per_run >= 1, "training: checkpoints_per_run must be at least 1")
     _require(t.eval_chunks >= 1, "training: eval_chunks must be at least 1")
+    _require(t.state_reset_chunks >= 0, "training: state_reset_chunks must be 0 (never) or more")
     _require(0.0 < d.gamma <= 1.0, "dusk: gamma in (0, 1]")
     _require(0.0 <= d.budget_fraction <= 1.0, "dusk: budget_fraction in [0, 1]")
     _require(0.0 <= d.eta_slow_fraction <= 1.0, "dusk: eta_slow_fraction in [0, 1]")

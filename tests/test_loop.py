@@ -477,6 +477,34 @@ def test_the_dense_rule_runs_every_pass_with_fresh_writes() -> None:
     assert (dense.y - dense.per_pass[2]).abs().max().item() == 0.0
 
 
+def test_the_dense_fast_path_equals_the_merging_path_bitwise_with_gradients() -> None:
+    # DenseRule skips every copy-forward selection (2026-10-21: ~1500 kernels of a training
+    # step); a trace exiting every token at the last pass means the same but runs the merges, so
+    # outputs, states and every parameter's gradient must be equal to the bit
+    loop, _, _ = _real_loop(t_max=3)
+    x0 = torch.randn(2, 5, SHAPE.d, generator=torch.Generator().manual_seed(9), dtype=F64)
+    pos = torch.arange(5).expand(2, 5)
+    up = torch.randn(3, 2, 5, SHAPE.d, generator=torch.Generator().manual_seed(10), dtype=F64)
+
+    def run(rule: DenseRule | TraceRule) -> tuple[LoopResult, list[Tensor]]:
+        loop.zero_grad(set_to_none=True)
+        result = loop.forward(x0, pos, _real_states(2, 3), exit_rule=rule)
+        torch.autograd.backward([(result.per_pass * up).sum() + result.y.sum()])
+        grads = [p.grad.clone() for p in loop.parameters() if p.grad is not None]
+        return result, grads
+
+    fast, fast_grads = run(DenseRule())
+    slow, slow_grads = run(TraceRule(iters([[3] * 5] * 2)))
+    assert torch.equal(fast.y, slow.y)
+    assert torch.equal(fast.per_pass, slow.per_pass)
+    assert torch.equal(fast.n_iters, slow.n_iters)
+    for sa, sb in zip(fast.states, slow.states, strict=True):
+        assert all(torch.equal(a, b) for a, b in zip(sa.h, sb.h, strict=True))
+        assert all(torch.equal(a.k, b.k) for a, b in zip(sa.kv, sb.kv, strict=True))
+    assert len(fast_grads) == len(slow_grads) > 0
+    assert all(torch.equal(a, b) for a, b in zip(fast_grads, slow_grads, strict=True))
+
+
 def test_a_trace_replays_a_given_exit_pattern_with_copy_forward() -> None:
     # a trace is ACT with a one-hot probability at the traced pass: the same halts, the same
     # allocation (1 - 0 = 1), so the same copy-forward states and outputs

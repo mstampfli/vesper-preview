@@ -58,16 +58,17 @@ One run:
 - ``--train joint`` (exploratory, maintainer B f27b8a3, accepted 4871b54): the backbone trains too,
 from
   the same source and head start, in a second AdamW group at ``BACKBONE_LR``. Its update loss
-  (``_update_loss``) adds to the score surrogate (whose features are NOT detached, so the
-  backbone also learns from the decisions) the pathwise weighted label term of the sampled
+  (``joint_update.update_loss``) adds to the score surrogate (whose features are NOT detached,
+  so the backbone also learns from the decisions) the pathwise weighted label term of the sampled
   trajectories, and with ``--dense-weight`` rho the mean over passes of that term on fresh
   all-pass states (backbone only). A joint run saves the whole weights and the CURRENT
   backbone's full and static profiles at every save point; the source's stay the target.
 - On CUDA every update is one captured CUDA graph after three eager ones
   (``vesper.graphs.WarmedGraph``): the update runs on the device without a read-back
-  (``_update_step``), the floor and the batch are its inputs, the rates are device tensors of a
-  capturable AdamW, and the record is read from its outputs; captured updates equal eager ones
-  bitwise. The capturable optimizer's arithmetic is not bitwise the CPU one's (recorded).
+  (``joint_update.update_step``), the floor and the batch are its inputs, the rates are device
+  tensors of a capturable AdamW, and the record is read from its outputs; captured updates
+  equal eager ones bitwise. The capturable optimizer's arithmetic is not bitwise the CPU one's
+  (recorded).
 
 The loop executes every pass for every token whatever the policy (stopped tokens are masked and
 their writes copied forward), so a lower active depth here is not a lower executed cost; the
@@ -83,15 +84,14 @@ from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, TextIO, cast
+from typing import TextIO, cast
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
-from vesper.column import check_scan, scan_of, set_scan
-from vesper.contracts import ContractError, Dims, check_shape, require
-from vesper.graphs import WarmedGraph, deterministic_algorithms
+from vesper.column import check_capturable_scan, scan_of, set_scan
+from vesper.graphs import WarmedGraph, deterministic_algorithms, memory_peak, reset_memory_peak
 from vesper.halting_common import (
     CPU,
     SNAPSHOT,
@@ -107,7 +107,24 @@ from vesper.halting_common import (
     version_or_none,
 )
 from vesper.halting_experiment import class_counts, held_out
-from vesper.loop import CdfRule, DenseRule, ExitRule, LoopResult, SampledRule, TraceRule
+from vesper.joint_update import (
+    ADAM_EPS,
+    BACKBONE_LR,
+    BETAS,
+    GRAD_CLIP,
+    HEAD_BIAS,
+    PEAK_LR,
+    ROLLOUTS,
+    WARMUP,
+    Step,
+    optimizer,
+    release_backbone,
+    set_learning_rates,
+    start_head,
+    training_precision,
+    update_step,
+)
+from vesper.loop import CdfRule, DenseRule, ExitRule, TraceRule
 from vesper.model import Vesper
 from vesper.provenance import environment, write_json
 from vesper.synthetic import CLASSES, ROLES, TERMINAL_MIX, Episodes, episodes, generator_for
@@ -121,19 +138,11 @@ DEPTH_REDUCTION = 0.2  # the verdict: all-token mean active depth at least 20 % 
 LABEL_WEIGHTS = ("episode", "class")  # how a trajectory's labels form its NLL term
 LABEL_WEIGHT = "episode"  # the design's: each episode's mean label NLL
 EPISODES = 32  # unique episodes per update
-ROLLOUTS = 2  # independent trajectories per episode, each the other's baseline
 UPDATES = 2000
 SAVE_AT = (0, 500, 1000, 1500, 2000)
-HEAD_BIAS = -math.log(9.0)  # with the hazard baseline: the q = 0.5 policy exits at the last pass
 DEPTH_COST = 0.02
-PEAK_LR = 1e-4
-BACKBONE_LR = 1e-4  # a joint run's backbone (its stage-1 training ran at 1e-3); exploratory
 TRAIN_MODES = ("head", "joint")  # what trains: the head on a frozen backbone, or both
 TRAIN_MODE = "head"  # the design's
-WARMUP = 100
-BETAS = (0.9, 0.95)
-ADAM_EPS = 1e-8
-GRAD_CLIP = 1.0
 FLOORS = ("none", "taper")
 FLOOR_START = 0.5
 FLOOR_END = 1500  # the taper reaches zero at this update and stays there
@@ -165,108 +174,6 @@ def _floor_at(schedule: str, update: int) -> float:
     if schedule == "none":
         return 0.0
     return FLOOR_START * max(1.0 - update / FLOOR_END, 0.0)
-
-
-def _learning_rate(update: int, peak: float = PEAK_LR) -> float:
-    """``peak`` after a linear warmup over the first ``WARMUP`` updates, constant after."""
-    return peak * min((update + 1) / WARMUP, 1.0)
-
-
-def _optimizer(
-    head: list[nn.Parameter], backbone: list[nn.Parameter], *, capturable: bool = False
-) -> torch.optim.AdamW:
-    """AdamW with one group per trainable set, each with its ``"peak"`` rate.
-
-    The head at ``PEAK_LR``, a trainable backbone (joint runs) at ``BACKBONE_LR``; no weight
-    decay in either, so the update descends the trajectory cost itself. ``capturable`` (CUDA,
-    a captured update) keeps the step counts on the device and gives every group its own rate
-    as a device tensor, filled in place by ``_set_learning_rates`` (a float would be frozen into
-    the graph at capture), as ``vesper.train.optimizer`` does for one shared rate.
-    """
-    device = head[0].device
-
-    def rate(peak: float) -> float | Tensor:
-        return torch.tensor(peak, device=device) if capturable else peak
-
-    groups: list[dict[str, object]] = [{"params": head, "peak": PEAK_LR, "lr": rate(PEAK_LR)}]
-    if backbone:
-        groups.append({"params": backbone, "peak": BACKBONE_LR, "lr": rate(BACKBONE_LR)})
-    return torch.optim.AdamW(
-        groups, betas=BETAS, eps=ADAM_EPS, weight_decay=0.0, capturable=capturable
-    )
-
-
-def _set_learning_rates(opt: torch.optim.AdamW, update: int) -> list[float]:
-    """Every group's rate at ``update`` from its ``"peak"`` (``_learning_rate``); the rates.
-
-    A capturable optimizer's device rate is filled in place, never replaced.
-    """
-    rates: list[float] = []
-    for group in cast("list[dict[str, object]]", opt.param_groups):
-        if "peak" not in group:
-            msg = "a parameter group without its peak rate: build the optimizer with _optimizer"
-            raise ValueError(msg)
-        rate = _learning_rate(update, cast("float", group["peak"]))
-        current = group["lr"]
-        if isinstance(current, float):
-            group["lr"] = rate
-        else:  # the capturable optimizer's device tensor (``_optimizer``)
-            _ = cast("Tensor", current).fill_(rate)
-        rates.append(rate)
-    return rates
-
-
-def _group_grad_norms(opt: torch.optim.AdamW) -> Tensor:
-    """``float64 [groups]``: each group's gradient L2 norm before clipping (0 without any).
-
-    On the device, never read back (a captured update returns it).
-    """
-    groups = cast("list[dict[str, object]]", opt.param_groups)
-    device = cast("list[nn.Parameter]", groups[0]["params"])[0].device
-    norms: list[Tensor] = []
-    for group in groups:
-        grads = [p.grad for p in cast("list[nn.Parameter]", group["params"]) if p.grad is not None]
-        squares = [(g.double() * g.double()).sum() for g in grads]
-        zero = torch.zeros((), dtype=torch.float64, device=device)
-        norms.append(torch.stack(squares).sum().sqrt() if squares else zero)
-    return torch.stack(norms)
-
-
-def start_head(model: Vesper) -> list[nn.Parameter]:
-    """Freeze every backbone parameter and set the head's calibration start; its parameters.
-
-    The head: direction 0, gain 1, bias ``HEAD_BIAS``; with ``hazard_baseline`` its stop
-    hazard is ``1 / (1 + 9 (T - t))`` at every pass t < T, whatever the backbone computes.
-    """
-    _ = model.requires_grad_(requires_grad=False)
-    head = model.loop.halting_head()
-    head.zero_residual()
-    with torch.no_grad():
-        _ = head.b_h.fill_(HEAD_BIAS)
-    _ = head.requires_grad_(requires_grad=True)
-    return list(head.parameters())
-
-
-def actor_loss(costs: Tensor, log_probs: Tensor) -> Tensor:
-    """The score-function surrogate with paired baselines: ``costs, log_probs [ROLLOUTS, E]``.
-
-    ``mean_(r, e) stopgrad(C_r - C_other) * log_prob_r``: each rollout's baseline is the OTHER
-    rollout's detached cost, independent of its own actions, so the expected gradient is the
-    exact gradient of the expected cost (a baseline that includes the rollout's own cost halves
-    it: the design's oracle). ``log_probs`` are the summed log-probabilities of the decisions each
-    trajectory made, never divided by their random number.
-
-    Raises:
-        ContractError: unless both are ``[ROLLOUTS, E]`` with one ``E >= 1``.
-    """
-    dims: Dims = {}
-    check_shape("costs", costs, (ROLLOUTS, "e"), dims)
-    check_shape("log_probs", log_probs, (ROLLOUTS, "e"), dims)
-    if dims["e"] < 1:
-        msg = "actor_loss: no episode"
-        raise ContractError(msg)
-    advantage = (costs - costs.flip(0)).detach()
-    return (advantage * log_probs).mean()
 
 
 def _label_weights(task: Tensor, scheme: str) -> Tensor:
@@ -302,131 +209,6 @@ def _label_weights(task: Tensor, scheme: str) -> Tensor:
     return torch.where(mask, per_class[safe], 0.0)
 
 
-class _Costs(NamedTuple):
-    """Per trajectory, float64: ``cost``, ``objective``, ``nll``, ``depth`` ``[b]`` detached.
-
-    ``ce [b, n]`` is the per-label NLL (0 off the labels) WITH its graph to the backbone, for
-    the pathwise term of a joint update (no graph when the backbone is frozen).
-    """
-
-    cost: Tensor
-    objective: Tensor
-    nll: Tensor
-    depth: Tensor
-    ce: Tensor
-
-
-def _costs(
-    model: Vesper,
-    result: LoopResult,
-    targets: Tensor,
-    mask: Tensor,
-    weights: Tensor,
-    valid: Tensor,
-    depth_cost: float,
-) -> _Costs:
-    """The trajectories' costs, ``[b]`` each, and the per-label NLL ``[b, n]``.
-
-    ``objective`` is the label NLL weighted by ``weights`` (``_label_weights``, one row per
-    trajectory), ``nll`` the ordinary mean next-token NLL over the trajectory's labels (logged
-    whatever the weights), ``depth`` the mean active depth over its real tokens, and
-    ``cost = objective + depth_cost * depth / T``.
-    """
-    ce = _label_nll(model, result.y, targets, mask)
-    with torch.no_grad():
-        plain_ce = ce.detach()
-        nll = plain_ce.sum(1) / mask.sum(1).double()
-        objective = (plain_ce * weights).sum(1)
-        depth = torch.where(valid, result.n_iters.double(), 0.0).sum(1) / valid.sum(1).double()
-        t_max = int(result.per_pass.shape[0])
-        return _Costs(objective + depth_cost * depth / t_max, objective, nll, depth, ce)
-
-
-def _label_nll(model: Vesper, y: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
-    """``float64 [..., n]``: the next-token NLL of the outputs ``y [..., n, d]``, with its graph.
-
-    At the labels of ``mask [b, n]`` (broadcast over leading pass dimensions), 0 elsewhere. The
-    head takes ``[b, n, d]``: leading dimensions are folded into its batch and back.
-    """
-    lead = y.shape[:-1]
-    logits = model.head(y.reshape(-1, *y.shape[-2:])).float()
-    safe = torch.where(mask, targets.long(), 0).expand(lead)  # every index valid; masked below
-    ce = functional.cross_entropy(logits.flatten(0, -2), safe.reshape(-1), reduction="none").view(
-        lead
-    )
-    return torch.where(mask, ce.double(), 0.0)
-
-
-class _Dense(NamedTuple):
-    """The optional dense auxiliary of a joint update: the UNIQUE episodes once each."""
-
-    tokens: Tensor
-    pos: Tensor
-    targets: Tensor
-    mask: Tensor
-    weights: Tensor
-    weight: float
-
-
-class _Loss(NamedTuple):
-    """One update's differentiable loss and its parts (``total = score + pathwise + dense``)."""
-
-    total: Tensor
-    score: Tensor
-    pathwise: Tensor
-    dense: Tensor
-    costs: _Costs
-    rule: SampledRule
-    result: LoopResult
-
-
-def _update_loss(  # noqa: PLR0913, PLR0917
-    model: Vesper,
-    tokens: Tensor,
-    pos: Tensor,
-    targets: Tensor,
-    mask: Tensor,
-    valid: Tensor,
-    weights: Tensor,
-    uniforms: Tensor,
-    epsilon: float | Tensor,
-    depth_cost: float,
-    dense: _Dense | None = None,
-) -> _Loss:
-    """The loss whose gradient, in expectation, is the gradient of the expected trajectory cost.
-
-    The batch is the episodes ``ROLLOUTS`` times over, rollout-major, with sampled stops from
-    ``uniforms`` (``SampledRule``). For ``J = E[label term + depth_cost * depth / T]`` a
-    parameter moves both a trajectory's cost and its probability, so the loss has two parts
-    (maintainer B, channel f27b8a3): ``score``, the paired score surrogate (``actor_loss``) whose
-    costs are detached and whose log-probabilities keep their graph through the head AND the
-    backbone features it reads; and ``pathwise``, the mean over trajectories of the weighted
-    label term WITH its graph (the depth has no pathwise derivative). With the backbone frozen
-    only the head has gradients, from ``score`` alone. ``dense`` (a joint run's auxiliary,
-    ``weight`` rho) adds rho times the mean over passes of the same weighted label term on fresh
-    all-pass states of the unique episodes: a backbone-only pathwise term with no decision credit.
-
-    Raises:
-        RuntimeError: if the rule recorded no decisions.
-    """
-    rule = SampledRule(model.loop.halting_head(), epsilon, uniforms, valid)
-    states = model.init_states(int(tokens.shape[0]), torch.float32, tokens.device)
-    result = model.run(tokens, pos, states, exit_rule=rule)
-    costs = _costs(model, result, targets, mask, weights, valid, depth_cost)
-    if rule.log_prob is None or rule.decisions is None:
-        msg = "the sampled rule recorded no decisions"
-        raise RuntimeError(msg)
-    score = actor_loss(costs.cost.view(ROLLOUTS, -1), rule.log_prob.sum(1).view(ROLLOUTS, -1))
-    pathwise = (costs.ce * weights).sum(1).mean()
-    dense_term = torch.zeros((), dtype=torch.float64, device=tokens.device)
-    if dense is not None and dense.weight > 0.0:
-        fresh = model.init_states(int(dense.tokens.shape[0]), torch.float32, tokens.device)
-        passes = model.run(dense.tokens, dense.pos, fresh, exit_rule=DenseRule()).per_pass
-        per_pass = (_label_nll(model, passes, dense.targets, dense.mask) * dense.weights).sum(-1)
-        dense_term = dense.weight * per_pass.mean(0).mean()
-    return _Loss(score + pathwise + dense_term, score, pathwise, dense_term, costs, rule, result)
-
-
 def _class_nll(ce: Tensor, task: Tensor) -> list[float | None]:
     """The mean NLL of each class in ``CLASSES`` order, pooled over every label; None if absent."""
     mask = task >= 0
@@ -454,11 +236,11 @@ def train_update(  # noqa: PLR0913, PLR0917
 ) -> dict[str, object]:
     """One update of the trainable parameters from ``ep``'s sampled trajectories; its record.
 
-    ``_update_loss`` is the loss (the head's score term; with a trainable backbone also the
-    pathwise label term and, at ``dense_weight`` above 0, the dense auxiliary); ``opt`` holds
-    one parameter group per trainable set, each with its own ``"peak"`` learning rate under
-    the shared warmup (``_set_learning_rates``); ``params`` is every trainable parameter,
-    clipped together.
+    ``joint_update.update_loss`` is the loss (the head's score term; with a trainable backbone
+    also the pathwise label term and, at ``dense_weight`` above 0, the dense auxiliary); ``opt``
+    holds one parameter group per trainable set, each with its own ``"peak"`` learning rate
+    under the shared warmup (``joint_update.set_learning_rates``); ``params`` is every
+    trainable parameter, clipped together.
 
     The batch is the episodes ``ROLLOUTS`` times over, rollout-major, and ``uniforms`` are
     float64 ``[T - 1, ROLLOUTS * E, n]`` in the same order. ``depth_cost`` weighs the mean active
@@ -468,10 +250,10 @@ def train_update(  # noqa: PLR0913, PLR0917
     The record keeps the ordinary mean NLL (``nll``) beside the trained term
     (``objective_nll``) and each class's NLL pooled over the batch (``class_nll``).
 
-    The update itself (``_update_step``) runs on the device without a read-back; the record is
+    The update itself (``update_step``) runs on the device without a read-back; the record is
     read from its outputs after it. With ``graph`` (CUDA) the update is captured once and
     replayed (``vesper.graphs.WarmedGraph``): the batch, the uniforms and the floor are its
-    values, the rates are filled into a capturable ``opt`` (``_optimizer``) before it.
+    values, the rates are filled into a capturable ``opt`` (``optimizer``) before it.
 
     Raises:
         FloatingPointError: on a non-finite cost, surrogate or gradient, before the step (in a
@@ -479,7 +261,7 @@ def train_update(  # noqa: PLR0913, PLR0917
     """
     device = next(model.parameters()).device
     c = ep.chunk
-    rates = _set_learning_rates(opt, update)
+    rates = set_learning_rates(opt, update)
     unique = _label_weights(ep.task, label_weight)
     values = [
         torch.cat([t] * ROLLOUTS).to(device)
@@ -487,10 +269,10 @@ def train_update(  # noqa: PLR0913, PLR0917
     ]
     values += [uniforms.to(device), torch.tensor(epsilon, dtype=torch.float64, device=device)]
 
-    def step(inputs: Sequence[Tensor]) -> _Step:
-        return _update_step(model, opt, params, depth_cost, dense_weight, inputs)
+    def step(inputs: Sequence[Tensor]) -> Step:
+        return update_step(model, opt, params, depth_cost, dense_weight, inputs)
 
-    out = step(values) if graph is None else _Step(*graph(step, values))
+    out = step(values) if graph is None else Step(*graph(step, values))
     t_max = model.loop.t_max
     pair_nll = out.objective.view(ROLLOUTS, -1)  # the NLL term the depth cost competes with
     pair_depth = depth_cost * out.depth.view(ROLLOUTS, -1) / t_max
@@ -515,87 +297,6 @@ def train_update(  # noqa: PLR0913, PLR0917
         "pair_nll_diff_std": float((pair_nll[0] - pair_nll[1]).std()),
         "pair_depth_cost_diff_std": float((pair_depth[0] - pair_depth[1]).std()),
     }
-
-
-class _Step(NamedTuple):
-    """One update's outputs, detached, on the device: what its record is read from."""
-
-    score: Tensor
-    pathwise: Tensor
-    dense: Tensor
-    cost: Tensor
-    objective: Tensor
-    nll: Tensor
-    depth: Tensor
-    ce: Tensor
-    grad_norm: Tensor
-    group_norms: Tensor
-    decisions: Tensor
-    n_iters: Tensor
-
-
-NON_FINITE = "non-finite cost, surrogate or gradient (the update after the last one logged)"
-
-
-def _update_step(
-    model: Vesper,
-    opt: torch.optim.AdamW,
-    params: Sequence[nn.Parameter],
-    depth_cost: float,
-    dense_weight: float,
-    values: Sequence[Tensor],
-) -> _Step:
-    """The update on the device, with no read-back: capturable as one CUDA graph.
-
-    ``values`` are ``train_update``'s, all on the model's device: tokens, positions, targets,
-    loss mask, valid (each ``[ROLLOUTS * E, n]``, rollout-major), the label weights (float64,
-    the same), the uniforms and the floor (a float64 scalar). The unique episodes, for the
-    dense auxiliary, are the first ``E`` rows. Its checks are device contracts (``require``).
-
-    Raises:
-        FloatingPointError: eagerly, on a non-finite cost, surrogate or gradient, before the step.
-        RuntimeError: if the rule recorded no decisions.
-    """
-    tokens, pos, targets, mask, valid, weights, uniforms, epsilon = values
-    e = int(tokens.shape[0]) // ROLLOUTS
-    dense = (
-        _Dense(tokens[:e], pos[:e], targets[:e], mask[:e], weights[:e], dense_weight)
-        if dense_weight > 0.0
-        else None
-    )
-    loss = _update_loss(
-        model, tokens, pos, targets, mask, valid, weights, uniforms, epsilon, depth_cost, dense
-    )
-    costs, rule = loss.costs, loss.rule
-    if rule.decisions is None:
-        msg = "the sampled rule recorded no decisions"
-        raise RuntimeError(msg)
-    opt.zero_grad(set_to_none=True)
-    torch.autograd.backward([loss.total])
-    group_norms = _group_grad_norms(opt)
-    grad_norm = nn.utils.clip_grad_norm_(list(params), GRAD_CLIP)
-    finite = (
-        torch.isfinite(costs.cost).all() & torch.isfinite(loss.total) & torch.isfinite(grad_norm)
-    )
-    try:
-        require(finite, NON_FINITE)
-    except ContractError as error:
-        raise FloatingPointError(NON_FINITE) from error
-    _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
-    return _Step(
-        loss.score.detach(),
-        loss.pathwise.detach(),
-        loss.dense.detach(),
-        costs.cost,
-        costs.objective,
-        costs.nll,
-        costs.depth,
-        costs.ce.detach(),
-        grad_norm.detach(),
-        group_norms,
-        rule.decisions,
-        loss.result.n_iters,
-    )
 
 
 def _episode_counts(model: Vesper, y: Tensor, ep: Episodes) -> Tensor:
@@ -927,27 +628,6 @@ def _admit(
     }
 
 
-def _precision(*, cuda: bool) -> dict[str, object]:
-    """TF32 off and the highest float32 matmul precision (the design's arithmetic), as set.
-
-    On ``cuda`` the update is captured (``WarmedGraph``) with the capturable optimizer, whose
-    device-side step arithmetic is not bitwise the CPU optimizer's, and trains under torch's
-    deterministic algorithms (``vesper.graphs.deterministic_algorithms``, whose effective
-    settings the result records as ``determinism``); recorded here.
-    """
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-    return {
-        "matmul_allow_tf32": cast("bool", torch.backends.cuda.matmul.allow_tf32),
-        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
-        "float32_matmul_precision": torch.get_float32_matmul_precision(),
-        "autocast": None,
-        "cuda_graph": cuda,
-        "optimizer_capturable": cuda,
-    }
-
-
 def _write_line(log: TextIO, record: dict[str, object]) -> None:
     _ = log.write(json.dumps(record) + "\n")
     log.flush()
@@ -978,7 +658,7 @@ def _checked(
         raise ValueError(msg)
     target = torch.device(device)
     scan = TRAIN_SCAN[device]
-    _ = check_scan(scan, target)
+    _ = check_capturable_scan(scan, target)
     if updates < 1 or (not preflight and any(not 0 <= s <= updates for s in save_at)):
         msg = f"updates must be at least 1 and every save point within 0..{updates}"
         raise ValueError(msg)
@@ -1032,18 +712,6 @@ def _check_options(
         raise ValueError(msg)
 
 
-def _release_backbone(model: Vesper) -> list[nn.Parameter]:
-    """Make every parameter outside the halting head trainable (a joint run); those parameters.
-
-    Called after the admission, which measures the source with the head at its start; the head
-    keeps that start, so a joint cell and its head-only reference begin from the same weights.
-    """
-    backbone = [p for name, p in model.named_parameters() if not name.startswith("loop.halting")]
-    for p in backbone:
-        _ = p.requires_grad_()
-    return backbone
-
-
 def _train(
     model: Vesper,
     head: list[nn.Parameter],
@@ -1060,7 +728,7 @@ def _train(
     evaluation against the source's (which stays the comparison target).
     """
     cuda = plan.target.type == "cuda"
-    opt = _optimizer(head, backbone, capturable=cuda)
+    opt = optimizer(head, backbone, capturable=cuda)
     graph = WarmedGraph() if cuda else None  # every update on CUDA: captured after the warm ones
     params = head + backbone
     data = generator_for(TRAIN_SPLIT, plan.seed)
@@ -1068,8 +736,7 @@ def _train(
     t_max = model.loop.t_max
     consumed, draws, training = "", "", 0.0
     evaluations: dict[str, object] = {}
-    if cuda:
-        torch.cuda.reset_peak_memory_stats(plan.target)
+    reset_memory_peak(plan.target)
     started = time.monotonic()
     with (
         # CUDA runs repeat (10-19); the settings in effect are recorded from inside the scope
@@ -1138,7 +805,7 @@ def _train(
         "train_seconds": training,
         "seconds_per_update": training / plan.updates,
         "wall_seconds": time.monotonic() - started,
-        "peak_memory_bytes": torch.cuda.max_memory_allocated(plan.target) if cuda else None,
+        "peak_reserved_bytes": memory_peak(plan.target) if cuda else None,
         "evaluations": evaluations,
         "determinism": determinism,
     }
@@ -1183,8 +850,8 @@ def run(  # noqa: PLR0913
 
     ``depth_cost`` other than the design's ``DEPTH_COST``, ``label_weight`` other than
     ``LABEL_WEIGHT`` (``_label_weights``), ``train="joint"`` (the backbone trains too, from the
-    same source and head start, at ``BACKBONE_LR``; ``_update_loss``) or a ``dense_weight``
-    above 0 (joint only) is an exploratory run, diagnostic by ``trial_protocol``.
+    same source and head start, at ``BACKBONE_LR``; ``joint_update.update_loss``) or a
+    ``dense_weight`` above 0 (joint only) is an exploratory run, diagnostic by ``trial_protocol``.
 
     ``preflight`` runs ``updates`` disposable updates with no evaluation and no saved heads.
     ``required_accuracy`` is the admission floor every full-depth class must exceed (the
@@ -1270,8 +937,8 @@ def run(  # noqa: PLR0913
     fixed, full_counts = (None, None) if preflight else fixed_depths(model, eval_set)
     if fixed is not None:
         result["fixed"] = fixed
-    backbone = _release_backbone(model) if train == "joint" else []
-    precision = _precision(cuda=target.type == "cuda")
+    backbone = release_backbone(model) if train == "joint" else []
+    precision = training_precision(cuda=target.type == "cuda")
     model = model.to(target)
     _ = set_scan(model, scan)
     plan = _Plan(

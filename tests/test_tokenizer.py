@@ -108,10 +108,13 @@ def test_save_and_load_give_identical_encodings(tok: Tokenizer, tmp_path: Path) 
     path = tmp_path / "tok.json"
     tok.save(path)
     loaded = Tokenizer.load(path)
-    assert loaded.vocab_size == tok.vocab_size
-    for text in CORPUS[:6]:
-        assert torch.equal(loaded.encode(text), tok.encode(text))
-    assert loaded.pre_tokens("foo123bar baz") == ["foo123bar", " baz"]
+    parsed = Tokenizer.parse(path.read_bytes())  # the bytes of the same file
+    for again in (loaded, parsed):
+        assert again.vocab_size == tok.vocab_size
+        assert again.rule == tok.rule
+        for text in CORPUS[:6]:
+            assert torch.equal(again.encode(text), tok.encode(text))
+        assert again.pre_tokens("foo123bar baz") == ["foo123bar", " baz"]
 
 
 def test_decode_accepts_int64_and_rejects_other_dtypes(tok: Tokenizer) -> None:

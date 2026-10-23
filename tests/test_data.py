@@ -290,6 +290,15 @@ def test_positions_are_stream_positions_consecutive_within_and_across_chunks() -
     for s in range(2):
         seen = torch.cat([c.pos[s] for c in two])
         assert torch.equal(seen, torch.arange(seen.numel()))
+    # a PARTLY padded chunk too: slot 0 has 3 inputs, so its second chunk is one input and one
+    # pad, and its third (slot 1 still running) all padding; the count continues over the pad
+    # (an attention cache keeps every position of a chunk, padding included, and the windowed
+    # kernel needs the next chunk to follow it: found by the full gate, 2026-10-21)
+    partial = drain([doc("a", 1, 2, 3, 4), doc("b", 4, 5, 6, 7, 8, 9, 10)], slots=2, chunk=2)
+    assert len(partial) == 3
+    for s in range(2):
+        seen = torch.cat([c.pos[s] for c in partial])
+        assert torch.equal(seen, torch.arange(seen.numel())), (s, seen)
 
 
 def test_doc_ids_name_the_documents_that_gave_inputs_in_order() -> None:

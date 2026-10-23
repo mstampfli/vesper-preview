@@ -7,6 +7,138 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-23, 09:16Z: early stopping on text can now train with the model held still
+
+**What changed.** The first longer test of early stopping on web text (3000 updates from the days
+run's step 189778, exploratory, one seed) made the model stop after about 2.9 of 8 passes, but
+the language model itself got worse at every depth while it learned (by 0.22 to 0.57 nats; 0.22
+at depth 5), so the saving cost far more than it was worth; and on its own changed model the stopping choices beat
+random stopping only slightly and lost to simply using 2-3 passes everywhere. Maintainer B's design for
+the next step separates the two problems: train only the stopping head while the language model
+stays exactly as it was. `vesper.halting_text` now has that mode (`--backbone frozen`): no update
+reaches the language model, and the tests check it both ways (every weight and every fixed-depth
+prediction unchanged after real updates, on the CPU and across captured GPU updates; the head's
+gradient equal to an independent calculation; deliberate breakages all caught).
+
+**What it means for you.** The next run asks one cleaner question: can the stopping head find
+tokens that need fewer passes in a model that already works, without changing it? A positive
+result gives a useful baseline with the model held still; a negative one, from one bounded run,
+does not show that the model offers no such signal. Neither outcome alone explains why the
+joint training damaged the model.
+
+**What is next.** Maintainer B's code review, then the 3000-update head-only run on this box's GPU between
+checkpoint evaluations. Details: docs/registry.md (halting_text row), the days-run science export
+for maintainer B (NOTE addenda 7-11).
+
+## 2026-10-21, 14:05Z: the next batch of text is prepared while the GPU trains on this one
+
+**What changed.** Measured on the 5090 with the real corpus, not synthetic text: of a 274 ms
+training step, 42 ms went to reading and tokenizing the next batch while the GPU waited. The
+trainer now starts the step on the GPU first and prepares the next batch during it. The batches
+and their order are exactly what they were; a checkpoint records the data position of the last
+batch actually trained, so stopping and resuming gives the same run (tested, and seven deliberate
+breakages of it were all caught).
+
+**What it means for you.** Real training on the 5090 went from 274 to 224 ms per step: about
+73,000 tokens per second at batch 16 (61,900 before this change, 31,000 this morning). The earlier
+0.228 s figure was measured on synthetic text and did not include reading real data. Nothing has
+been trained with it yet. Also found today: the settings sweep on the faster step (batch 16, one
+micro-batch, no recomputation, one loss slice is the fastest that fits), and maintainer B found four
+numerical problems in the new loss kernel, all fixed before any training used it.
+
+**What is next.** Maintainer B's review, then your call on the longer runs. Details: docs/registry.md
+(train, kernels rows).
+
+## 2026-10-21, 12:50Z: the windowed attention runs as one tiled kernel on the GPU
+
+**What changed.** On the GPU in bf16, the attention over the last 512 tokens now runs as
+flash-linear-attention's windowed kernel (the same library as the scan) instead of PyTorch's
+blocked attention with a mask. It skips the blocks outside the window instead of computing and
+masking them. The CPU and float32 keep the old path, and the tests compare the two.
+
+**What it means for you.** On the 5090 the d512 step went from 0.250 to 0.228 s (about 72,000
+tokens per second, 2.3x this morning's 31,000; about 37 % of the card's peak arithmetic as
+useful work). Nothing has been trained with it yet.
+
+**What is next.** The settings sweep on the faster step, then the longer runs. Details:
+docs/registry.md (kernels, attention rows).
+
+## 2026-10-21, 11:55Z: training on the GPU is twice as fast, and every GPU path runs as a CUDA graph
+
+**What changed.** You set a hard rule this morning: anything on the GPU runs as a captured CUDA
+graph. The text trainer (`vesper.train`) did not; now every training step, every checkpoint
+evaluation and the phase-2 evaluations are captured, and a CUDA run without a graph is refused.
+Then the step itself was profiled on the rented RTX 5090 and made faster, one measured fix at a
+time: the head's loss became one kernel that never makes float32 copies of the 32768-wide
+scores (2.35x faster on its own); the layer norm, the key filter with its normalization and the
+FFN's squared ReLU became one kernel each way; a float32 detour in the FFN went away; torch's
+deterministic mode no longer fills every new tensor; the loop skips the halting bookkeeping when
+every token runs every pass anyway; and without recomputation the head keeps its scores for the
+backward pass. Each fix has tests against the old arithmetic (several bit for bit) and mutants.
+Memory is now measured as what the card really holds (the old figure missed the graph's memory).
+
+**What it means for you.** On the 5090, the d512 recipe went from 31,000 to about 65,000 tokens
+per second (0.525 to 0.25 s per step, median of 40 captured steps; batch 16, one group, no
+recomputation, about 20 GiB of the card's 32). The card does about 34 % of its peak arithmetic
+as useful work, from about 16 %; a model twice as wide measured 38 %. The scan stays exact (your
+call): the faster bf16 scan saves ~9 %, but in the 10-17 comparison of one pair the bf16 arm
+missed the two-step escape within its 36,000 updates while the exact arm escaped at 19,000 (a
+contrast between the two scan policies at that horizon, not a proven cause or a permanent block;
+corrected after maintainer B's review of 571b5f9), and an exact parallel scan measured 3x slower on this
+card. Nothing has been trained with the new code
+yet.
+
+**What is next.** A settings sweep on the faster step, more small fixes (each ~1 %), maintainer B's
+review, then the longer runs. Details: docs/registry.md (kernels, graphs, train, evals rows).
+
+## 2026-10-21, 07:20Z: the code that teaches the model to stop early on real text is built and reviewed
+
+**What changed.** Phase 2 of the text pilot now has its code (`vesper/halting_text.py`): it
+takes a model trained by phase 1 and trains it to decide, token by token, when to stop thinking,
+with a price on every extra pass. Each row of text is read as its own fresh context, losses
+are counted over real tokens, and the validation set is tied to the test set we fixed
+yesterday, so no tuning ever reads the test part. Maintainer B reviewed it in full, with their
+own numerical checks and full gate (both green), and found three faults that this entry's
+commit fixes: (1) the price of extra passes averaged per row instead of over all real tokens, so
+short rows counted as much as long ones; (2) the loader checked a file's fingerprint and then
+read the file a second time, so a file swapped in between would have been used under the old
+fingerprint (the weights, the run record, the config, the test pin, the tokenizer and the data
+receipt now go through one shared read-once check, and so does the trainer's resume); (3) the
+command line touched the source model before refusing a bad option. Each fix has a test that
+fails on the old behaviour.
+
+**What it means for you.** This is checked code, not a result. Nothing has been trained with
+phase 2 yet, and its memory use and speed on the GPU are not measured. Separately, the phase-1
+measurements it will start from improved overnight: with four times the training, extra passes
+help much more (best at 3 passes, 0.15 nats better than 1, where the 1-hour runs gained 0.035,
+measured from fresh contexts). That is a measurement of fixed depths, two runs, with the
+training length and the learning-rate schedule changed together.
+
+**What is next.** Maintainer B rechecks the three fixes; a short GPU preflight measures memory
+and speed; then the first phase-2 runs at three prices around the overnight model's measured
+gain.
+
+**Details.** `vesper/halting_text.py`, `vesper/keys.py` (`hashed_bytes`, `verified_bytes`),
+`vesper/joint_update.py` (`pooled_depth`), docs/registry.md; the plan in
+docs/reviews/2026-10-20-real-data-halting-pilot.md. Written by maintainer A.
+
+## 2026-10-20: refresh the TLS trust bundle after a new dependency advisory
+
+**What changed.** The dependency audit began rejecting Certifi 2026.7.22 after advisory
+GHSA-6q48-6c7w-9gw2 was published. The lock now selects Certifi 2026.10.19, and a transitive
+version floor keeps later resolutions from selecting an affected release. The same constraint
+applies to the CPU and GPU dependency sets.
+
+**What it means for you.** The certificate bundle used by the project's HTTP clients removes
+the affected emSign root. The model, data recipe and training code are unchanged. Existing
+environments take the update when synchronized with the new lock.
+
+**What is next.** Complete the normal dependency audit and code gate, then peer review before
+merging. The running training jobs keep their recorded environments.
+
+**Details.** `pyproject.toml`, `uv.lock`;
+https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2.
+
 ## 2026-10-20, 14:25Z: the halting work moves to real text: depth-first training and a per-depth measurement
 
 **What changed.** The adaptive-depth results so far come from a synthetic task built so that
@@ -18,9 +150,10 @@ reviewed the code, checked it independently and accepted it.
 
 **What it means for you.** The first question the pilot answers is simple: on real text, at a
 size this card can train in about an hour, does the loss go down when the model thinks longer?
-If it does not, there is nothing for adaptive stopping to save, and the pilot stops and reports
-that (for this size and budget only). If it does, the per-pass gain sets the price of an extra
-pass in the second phase, which trains the stopping itself.
+A flat mean curve is a practical stopping point for this measured size and budget, not proof
+that individual tokens cannot benefit; paired per-token changes remain part of the check.
+When there is a useful gain, remeasure it under phase 2's independent-chunk, fresh-state
+context before setting the price for learning to stop.
 
 **What is next.** A short timing run picks the model size, then the first phase-1 runs. Nothing
 has been trained on text with this yet.

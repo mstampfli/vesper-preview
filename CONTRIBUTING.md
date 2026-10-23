@@ -46,7 +46,8 @@ keeps this same training meaning. Historical checkpoint rows used the ambiguous 
 old rows as held-out measurements. This logging correction changes no checkpoint payload,
 model parameters, objective or training schedule.
 
-Every step line carries `peak_memory_bytes`. `--recompute` trades about half again the step time
+Every step line carries `peak_reserved_bytes` (`graphs.memory_peak`: the allocator's reservation,
+which counts a captured graph's pool; allocated bytes do not, a replay allocates nothing). `--recompute` trades about half again the step time
 for the internal activations of each column application, which are rebuilt on demand (the
 boundary tensors and the carried states still scale with the columns and passes); `--loss-slices`
 computes the head and the loss over position slices instead of `[b, n, V]` float32 logits at

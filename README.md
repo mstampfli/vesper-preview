@@ -6,7 +6,8 @@ state carries the session; an episodic store (the ledger) holds what fell out of
 window; a consolidation pass (dusk) writes what was learned into the slow weights while the
 model is idle.
 
-The design is in docs/spec.md. How the code is laid out and what it must never break is in
+The design is in docs/spec.md; the model as it actually trains today, on one page, is in
+docs/model-card.md. How the code is laid out and what it must never break is in
 ARCHITECTURE.md; how to build, test and change it is in CONTRIBUTING.md. Every public
 function and its tensor contract is listed in docs/registry.md. For readers who are not
 machine-learning specialists, docs/explained.md walks through the architecture in plain words,

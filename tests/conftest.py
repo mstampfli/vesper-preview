@@ -1,8 +1,12 @@
 """Shared helpers: the shrunk Vesper-S config and a fake Standard Ebooks repository."""
 
-from collections.abc import Callable
+import contextlib
+import io
+import os
+from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -96,3 +100,48 @@ def write_book(root: Path, language: str, chapters: dict[str, str]) -> Path:
 @pytest.fixture(name="book_builder")
 def _book_builder() -> Callable[[Path, str, dict[str, str]], Path]:
     return write_book
+
+
+class _Open(Protocol):
+    def __call__(self, file: object, mode: str = ..., /, *args: object, **kwargs: object) -> object:
+        """``io.open``'s call shape, as the patch below passes it through."""
+        ...
+
+
+def _write(path: Path, data: bytes) -> None:
+    """``data`` into ``path`` at the OS level: never through the patched ``open``."""
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    try:
+        _ = os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def replaced_after_first_read(path: Path, replacement: bytes) -> Generator[list[str]]:
+    """``path`` replaced on disk by ``replacement`` right after its FIRST open for reading.
+
+    The first open (through ``open`` or ``Path``'s readers) gets the original bytes; the file
+    on disk then holds ``replacement``, so any later read, by Python or by a library reading
+    the file itself, sees the replacement: a file swapped between a hash and a reread (maintainer
+    B's reviews of f55bfb3 and 72c9d31). Yields the modes of the opens seen; the original bytes
+    are restored on exit.
+    """
+    target = path.resolve()
+    original = path.read_bytes()
+    real = cast("_Open", io.open)  # the original, called for every other file
+    opens: list[str] = []
+
+    def fake(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if isinstance(file, (str, os.PathLike)) and Path(cast("str", file)).resolve() == target:
+            opens.append(mode)
+            if len(opens) == 1:
+                _write(target, replacement)
+                return io.BytesIO(original) if "b" in mode else io.StringIO(original.decode())
+        return real(file, mode, *args, **kwargs)
+
+    try:
+        with patch("io.open", fake), patch("builtins.open", fake):
+            yield opens
+    finally:
+        _ = target.write_bytes(original)

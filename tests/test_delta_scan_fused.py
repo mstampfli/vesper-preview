@@ -11,7 +11,14 @@ import torch
 from torch import Tensor, nn
 
 from conftest import small_config
-from vesper.column import ColumnShape, RecurrentSublayer, scan_of, set_scan
+from vesper.column import (
+    ColumnShape,
+    RecurrentSublayer,
+    check_capturable_scan,
+    check_scan,
+    scan_of,
+    set_scan,
+)
 from vesper.contracts import ContractError
 from vesper.data import Document, Stream
 from vesper.kernels import delta_scan as fused_module
@@ -181,6 +188,14 @@ def test_set_scan_refuses_unknown_names_and_models_without_a_recurrence() -> Non
         with pytest.raises(ValueError, match="fused scan needs"):
             _ = set_scan(model, impl)  # on CPU: no device here, or no CUDA parameters
     assert scan_of(model) == "reference"  # a refused switch changed nothing
+    # the reference scan's block inverse cannot be captured, and CUDA work is always captured
+    # (the project owner 2026-10-21): a driver's choice on CUDA is a fused scan; the check needs no
+    # GPU to refuse. The plain validity check keeps the reference valid on CUDA: the eager oracle
+    # the equivalence tests below compare the fused kernels against
+    with pytest.raises(ValueError, match="cannot run as a captured CUDA graph"):
+        _ = check_capturable_scan("reference", torch.device("cuda"))
+    assert check_capturable_scan("reference", torch.device("cpu")) == "reference"
+    assert check_scan("reference", torch.device("cuda")) == "reference"
 
 
 def test_set_scan_reaches_every_sublayer_and_scan_of_reads_them_back() -> None:

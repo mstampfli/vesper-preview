@@ -75,9 +75,10 @@ def evaluation_model(model: Vesper) -> Vesper:
 class evaluating:  # noqa: N801  # a context manager, named as the statement reads
     """``with evaluating(model) as m``: ``evaluation_model(model)`` in eval mode, no gradients.
 
-    The mode is restored on exit. Every measurement goes through this: in train mode the
-    recurrent read adds noise (``recurrence.state_read_noise``), so a count taken in the
-    caller's mode would depend on it.
+    The mode is restored on exit. Every measurement goes through this, so none depends on the
+    caller's mode. Corrected 2026-10-20: this said train mode adds noise to the recurrent read
+    (``recurrence.state_read_noise``); that field is declared in the config and applied by no
+    module, and no module reads the mode today, so the switch is defensive.
     """
 
     def __init__(self, model: Vesper) -> None:

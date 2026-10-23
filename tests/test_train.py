@@ -13,10 +13,14 @@ import torch
 import yaml
 from torch.nn import functional
 
-from conftest import small_config, small_raw
+import vesper.model
+import vesper.train
+from conftest import replaced_after_first_read, small_config, small_raw
+from vesper.column import set_scan
 from vesper.config import VesperConfig, parse
 from vesper.corpus import Component, finalize
 from vesper.data import Chunk, Document, Stream, is_held_out
+from vesper.kernels.nll import linear_nll
 from vesper.keys import file_sha256
 from vesper.learning import LossWeights
 from vesper.loop import DenseRule, HaltingHead
@@ -30,6 +34,10 @@ from vesper.train import (
     Layout,
     Progress,
     Recipe,
+    StepGraphs,
+    _device_step,  # pyright: ignore[reportPrivateUsage]
+    _read_step,  # pyright: ignore[reportPrivateUsage]
+    _scan_for,  # pyright: ignore[reportPrivateUsage]
     _to_device,  # pyright: ignore[reportPrivateUsage]
     checkpoint,
     decays,
@@ -572,14 +580,15 @@ def test_cuda_states_from_a_bf16_autocast_step_restore_on_the_cpu_and_move_back(
         for i in range(4)
     ]
     model = Vesper(cfg, torch.Generator().manual_seed(0)).to(cuda)
-    opt = optimizer(model, cfg)
+    _ = set_scan(model, "fused-fp32")  # on CUDA the step is captured; the reference cannot be
+    opt = optimizer(model, cfg, capturable=True)
     groups = [
         Group(
             Stream(iter(docs), slots=2, chunk=cfg.training.chunk_tokens),
             model.init_states(2, torch.float32, cuda),
         )
     ]
-    _ = step(model, opt, groups, phase_schedule(0, 0, cfg), cfg, cuda)
+    _ = step(model, opt, groups, phase_schedule(0, 0, cfg), cfg, cuda, graphs=StepGraphs())
     saved = groups[0].states
     assert any(float(z.abs().max()) > 0 for s in saved for z in s.key_history)  # it transitioned
     where = tmp_path / "step-1"
@@ -730,6 +739,122 @@ def test_a_restored_run_follows_the_uninterrupted_trajectory(tmp_path: Path) -> 
         model_a.named_parameters(), model_c.named_parameters(), strict=True
     ):
         assert torch.allclose(a, c, atol=1e-7, rtol=1e-6), name
+
+
+def test_chunks_drawn_ahead_train_the_same_steps_and_are_not_checkpointed(tmp_path: Path) -> None:
+    # the run draws the next step's chunks while the device runs the current one
+    # (Group.draw_ahead through step's ahead): every step must train exactly the chunks it would
+    # have drawn itself, and a checkpoint taken with a chunk drawn ahead records the stream from
+    # before that chunk, so a resume continues the same trajectory
+    cfg = training_config()
+    docs = [
+        Document(
+            f"d{i}",
+            torch.randint(1, 64, (24,), generator=torch.Generator().manual_seed(i)).to(torch.int32),
+        )
+        for i in range(12)
+    ]
+    chunk = cfg.training.chunk_tokens
+
+    def fresh() -> tuple[Vesper, torch.optim.AdamW, list[Group]]:
+        model = Vesper(cfg, torch.Generator().manual_seed(0))
+        stream = Stream(iter(docs), slots=2, chunk=chunk)
+        return (
+            model,
+            optimizer(model, cfg),
+            [Group(stream, model.init_states(2, torch.float32, CPU))],
+        )
+
+    model_a, opt_a, groups_a = fresh()
+    losses_a: list[float] = []
+    tokens = 0
+    for index in range(3):
+        result = step(model_a, opt_a, groups_a, phase_schedule(tokens, index, cfg), cfg, CPU)
+        assert result is not None
+        losses_a.append(result.loss)
+        tokens += result.tokens
+
+    model_b, opt_b, groups_b = fresh()
+    drawn: list[int] = []
+
+    def ahead() -> None:
+        drawn.append(len(drawn))
+        for group in groups_b:
+            group.draw_ahead()
+
+    first = step(model_b, opt_b, groups_b, phase_schedule(0, 0, cfg), cfg, CPU, ahead=ahead)
+    assert first is not None
+    assert drawn == [0]
+    recorded, live = groups_b[0].stream_state(), groups_b[0].stream.state()
+    assert recorded.slots[0].emitted < live.slots[0].emitted  # the drawn chunk is not recorded
+    progress = Progress(1, first.tokens, {}, {}, "")
+    _ = checkpoint(
+        tmp_path / "step-1", model_b, opt_b, groups_b, progress, identity(), recipe(), reason="x"
+    )
+    losses_b, tokens = [first.loss], first.tokens
+    for index in range(1, 3):
+        phase = phase_schedule(tokens, index, cfg)
+        result = step(model_b, opt_b, groups_b, phase, cfg, CPU, ahead=ahead)
+        assert result is not None
+        losses_b.append(result.loss)
+        tokens += result.tokens
+    assert losses_b == losses_a  # the same chunks, the same arithmetic
+
+    model_c, opt_c, _ = fresh()
+    restored = restore(tmp_path / "step-1", model_c, opt_c, identity(), Layout(1, 2))
+    taken = restored.streams[0].documents_taken
+    groups_c = [Group(Stream.restore(restored.streams[0], iter(docs[taken:])), restored.states[0])]
+    losses_c, tokens = [first.loss], restored.progress.tokens_seen
+    for index in range(1, 3):
+        result = step(model_c, opt_c, groups_c, phase_schedule(tokens, index, cfg), cfg, CPU)
+        assert result is not None
+        losses_c.append(result.loss)
+        tokens += result.tokens
+    assert losses_c == losses_a
+    with pytest.raises(ValueError, match="already drawn ahead"):
+        groups_b[0].draw_ahead()  # the last step drew one; a second would skip it
+    # a step without drawing ahead takes the drawn chunk; the record is the live stream again
+    assert step(model_b, opt_b, groups_b, phase_schedule(tokens, 3, cfg), cfg, CPU) is not None
+    assert (
+        groups_b[0].stream_state().slots[0].emitted == groups_b[0].stream.state().slots[0].emitted
+    )
+
+
+def test_the_next_chunks_are_drawn_after_the_launch_and_before_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the point of drawing ahead is the overlap: launched, then drawn, then waited for
+    cfg = training_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    docs = [Document(f"d{i}", torch.arange(1, 30, dtype=torch.int32)) for i in range(4)]
+    groups = [
+        Group(
+            Stream(iter(docs), slots=2, chunk=cfg.training.chunk_tokens),
+            model.init_states(2, torch.float32, CPU),
+        )
+    ]
+    events: list[str] = []
+
+    def recorded[**P, R](name: str, fn: Callable[P, R]) -> Callable[P, R]:
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            events.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(vesper.train, "_device_step", recorded("launch", _device_step))
+    monkeypatch.setattr(vesper.train, "_read_step", recorded("read", _read_step))
+    result = step(
+        model,
+        optimizer(model, cfg),
+        groups,
+        phase_schedule(0, 0, cfg),
+        cfg,
+        CPU,
+        ahead=lambda: events.append("ahead"),
+    )
+    assert result is not None
+    assert events == ["launch", "ahead", "read"]
 
 
 def run_fixture(
@@ -894,7 +1019,7 @@ def test_the_run_writes_a_log_checkpoints_and_resumes(  # noqa: PLR0915
     assert sum(cast("dict[str, int]", steps[-1]["consumed"]).values()) < sum(
         cast("dict[str, int]", steps[-1]["shares"]).values()
     )
-    assert all(line["peak_memory_bytes"] == 0 for line in steps)  # the CPU has no counter
+    assert all(line["peak_reserved_bytes"] == 0 for line in steps)  # the CPU has no counter
     checkpoints = [line for line in lines if line["kind"] == "checkpoint"]
     assert checkpoints[-1]["tokens_seen"] == seen[-1]
     last = Path(cast("str", checkpoints[-1]["path"]))
@@ -1036,6 +1161,38 @@ def test_the_run_writes_a_log_checkpoints_and_resumes(  # noqa: PLR0915
             seed=0,
             device=CPU,
         )
+
+
+def test_the_run_draws_each_steps_chunks_ahead(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # every step of a run draws the next one's chunks for every group while the device works
+    # (the resume test above shows the checkpoints stay those of the trained chunks)
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+    calls: list[int] = []
+    draw = Group.draw_ahead
+
+    def counted(group: Group) -> None:
+        calls.append(1)
+        draw(group)
+
+    monkeypatch.setattr(Group, "draw_ahead", counted)
+    _ = run(
+        cfg,
+        config_path=config_path,
+        parts=parts,
+        finalization_receipt=receipt,
+        tokenizer_path=tokenizer_path,
+        out=tmp_path / "run",
+        micro=1,
+        steps=3,
+        resume=None,
+        seed=0,
+        device=CPU,
+    )
+    assert len(calls) == 3 * cfg.training.batch_chunks  # micro 1: one group per chunk of a batch
 
 
 def test_a_fixed_run_records_its_objective_and_the_static_profile_and_keeps_it(
@@ -1385,3 +1542,99 @@ def test_the_resolver_parses_exactly_the_bytes_it_hashed_and_checks_the_schema_f
     _ = (not_json / "manifest.json").write_text(json.dumps(not_json_manifest))
     with pytest.raises(ValueError, match="malformed"):
         _ = resumed_components(data, not_json)
+
+
+@pytest.mark.parametrize("name", ["model.pt", "optimizer.pt", "states.pt"])
+def test_a_resume_loads_each_checkpoint_file_from_the_bytes_it_checked(
+    tmp_path: Path, book_builder: Builder, name: str
+) -> None:
+    # restore hashed every file against the manifest and then loaded it by path again (the
+    # shape of maintainer B's reviews of f55bfb3 and 72c9d31): a file replaced after its check (here
+    # by bytes torch cannot read) must never be what the resume loads
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+    out = tmp_path / "run"
+
+    def run_for(steps: int, resume: Path | None) -> Path:
+        return run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=out,
+            micro=1,
+            steps=steps,
+            resume=resume,
+            seed=0,
+            device=CPU,
+        )
+
+    _ = run_for(4, None)
+    last = out / "step-4"
+    with replaced_after_first_read(last / name, b"not the checked file") as opens:
+        log_path = run_for(1, last)
+    assert len(opens) == 1
+    lines = [
+        cast("dict[str, object]", json.loads(line)) for line in log_path.read_text().splitlines()
+    ]
+    assert [line["step"] for line in lines if line["kind"] == "step"][-1] == 5
+
+
+def test_the_command_line_scan_defaults_to_a_capturable_one_on_cuda() -> None:
+    # CUDA work is always captured (the project owner 2026-10-21) and the reference scan cannot be:
+    # without --scan a CUDA run takes the fused float32 scan, a CPU run the reference; a choice
+    # stays
+    assert _scan_for(None, torch.device("cuda")) == "fused-fp32"
+    assert _scan_for(None, CPU) == "reference"
+    assert _scan_for("fused", torch.device("cuda")) == "fused"
+
+
+@pytest.mark.parametrize("objective", ["act", "fixed"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_the_head_keeps_its_logits_exactly_when_activations_are_kept(
+    objective: str,
+    recompute: bool,  # noqa: FBT001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # one switch trades memory for speed everywhere (2026-10-21): without recomputation the
+    # head keeps its logits for the backward pass too, with it they are recomputed
+    seen: list[bool] = []
+
+    def spy(
+        x: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor, *, keep_logits: bool = False
+    ) -> torch.Tensor:
+        seen.append(keep_logits)
+        return linear_nll(x, weight, targets, keep_logits=keep_logits)
+
+    monkeypatch.setattr(vesper.model, "linear_nll", spy)
+    cfg = training_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    docs = [
+        Document(
+            f"d{i}",
+            torch.randint(1, 64, (40,), generator=torch.Generator().manual_seed(i)).to(torch.int32),
+        )
+        for i in range(8)
+    ]
+    groups = [
+        Group(
+            Stream(iter(docs), slots=2, chunk=cfg.training.chunk_tokens),
+            model.init_states(2, torch.float32, CPU),
+        )
+    ]
+    phase = phase_schedule(int(cfg.training.total_tokens * 0.5), 20, cfg)
+    result = step(
+        model,
+        optimizer(model, cfg),
+        groups,
+        phase,
+        cfg,
+        CPU,
+        recompute=recompute,
+        objective=objective,
+    )
+    assert result is not None
+    assert seen  # the head ran through the kernel
+    assert set(seen) == {not recompute}

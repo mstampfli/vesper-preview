@@ -23,7 +23,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from vesper.graphs import CUBLAS_WORKSPACES, deterministic_algorithms
+from vesper.graphs import CUBLAS_WORKSPACES, deterministic_algorithms, fill_uninitialized_memory
 from vesper.halting_calibration import run
 from vesper.halting_experiment import run as experiment_run
 from vesper.kernels.delta_scan import fused_scan_available
@@ -84,6 +84,34 @@ def test_the_switch_is_strict_inside_and_restores_both_flags(
             with pytest.raises(ValueError, match=boom), deterministic_algorithms():
                 raise ValueError(boom)
             assert _flags() == (enabled, warn_only)  # an exception inside restores both
+
+
+def test_uninitialized_memory_is_not_filled_inside_and_the_setting_is_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-10-21, 5090: torch fills every new tensor under deterministic mode (~2700 kernels of a
+    # ~6000-kernel step); the scope turns that off, records it, and restores the caller's value
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    before = fill_uninitialized_memory()
+    try:
+        for outside in (True, False):
+            torch.utils.deterministic.fill_uninitialized_memory = outside  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+            with _keeping_flags(), deterministic_algorithms() as settings:
+                assert fill_uninitialized_memory() is False
+                assert settings["fill_uninitialized_memory"] is False
+                with deterministic_algorithms():
+                    assert fill_uninitialized_memory() is False
+                assert fill_uninitialized_memory() is False
+            assert fill_uninitialized_memory() is outside
+            with (
+                _keeping_flags(),
+                pytest.raises(ValueError, match="boom"),
+                deterministic_algorithms(),
+            ):
+                raise ValueError("boom")  # noqa: EM101
+            assert fill_uninitialized_memory() is outside
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = before  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_a_cublas_preset_outside_the_reproducible_ones_is_refused(

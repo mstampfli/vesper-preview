@@ -16,7 +16,13 @@ from torch import Tensor
 from vesper.column import scan_of, set_scan
 from vesper.config import VesperConfig, load, parse
 from vesper.contracts import ContractError
-from vesper.graphs import WARM_STEPS, CapturedStep, WarmedGraph
+from vesper.graphs import (
+    WARM_STEPS,
+    CapturedStep,
+    WarmedGraph,
+    memory_peak,
+    reset_memory_peak,
+)
 from vesper.halting_common import evaluation_model
 from vesper.halting_experiment import (
     GraphedTraining,
@@ -174,6 +180,27 @@ def test_a_warmed_graph_runs_eagerly_then_captures_once_and_replays_on_its_own_b
     assert (graph.captures, len(calls)) == (1, 4)  # eager again after a reset
     with pytest.raises(ContractError, match="value 0 is on cpu"):
         _ = graph(step, [torch.zeros(3), torch.ones(3, device=CUDA)])
+
+
+@needs_fused
+def test_the_memory_peak_counts_a_replayed_graphs_pool() -> None:
+    floats = 64 * 2**20
+    size = 4 * floats  # bytes of an intermediate the step frees before it returns
+
+    def step(values: Sequence[Tensor]) -> list[Tensor]:
+        return [values[0].repeat(floats).sum().reshape(1)]
+
+    graph = WarmedGraph(warm=1)
+    x = torch.ones(1, device=CUDA)
+    torch.cuda.empty_cache()
+    base = torch.cuda.memory_reserved(CUDA)
+    _ = graph(step, [x])  # eager
+    _ = graph(step, [x])  # capture: the graph's own pool keeps a block for the intermediate
+    reset_memory_peak(CUDA)
+    (out,) = graph(step, [x])  # a replay allocates nothing
+    assert float(out) == floats
+    assert memory_peak(CUDA) - base >= size  # yet the pool is held, and counted
+    assert memory_peak(torch.device("cpu")) == 0
 
 
 @needs_fused

@@ -13,7 +13,6 @@ from typing import override
 
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint  # pyright: ignore[reportUnknownVariableType]
 
 from vesper.column import (
     Column,
@@ -25,7 +24,7 @@ from vesper.column import (
     init_column_state,
 )
 from vesper.config import VesperConfig
-from vesper.contracts import require
+from vesper.contracts import Dims, check_shape, require
 from vesper.data import Chunk
 from vesper.embedding import TiedEmbedding
 from vesper.exits import (
@@ -35,7 +34,8 @@ from vesper.exits import (
     kl_uniform_aggregate,
     kl_uniform_local,
 )
-from vesper.learning import LossWeights, check_mode, loss_weights, ntp_loss, wake_loss, wake_total
+from vesper.kernels.nll import linear_nll
+from vesper.learning import LossWeights, check_mode, loss_weights, wake_loss, wake_total
 from vesper.loop import ExitRule, HaltingHead, Loop, LoopResult
 
 # the halting experiment's all-pass conditions (docs/reviews/2026-10-15-halting-experiment-plan.md):
@@ -119,6 +119,14 @@ class Vesper(nn.Module):
             exit_rule=exit_rule,
         )
 
+    def position_losses(self, y: Tensor, targets: Tensor) -> Tensor:
+        """Next-token losses ``[...]`` of outputs ``y [..., d]`` against ``targets [...]``.
+
+        ``token_losses`` through this model's head, without ``[..., V]`` float32 logits: what
+        every evaluation scores (``evals``, ``halting_text``), one call per chunk or depth.
+        """
+        return token_losses(self, y, targets)
+
     def head(self, y: Tensor) -> Tensor:
         """Halting-weighted outputs ``[b, n, d]`` to logits ``[b, n, V]``: output norm, then ``E``.
 
@@ -134,19 +142,18 @@ class Vesper(nn.Module):
         weights: LossWeights | None = None,
         *,
         slices: int = 1,
+        keep_logits: bool = False,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """The wake objective from the loop's result, the head applied to the loss positions only.
 
         The same value and gradients as ``wake_objective(forward logits, ...)``: the positions
         ``chunk.loss_mask`` marks are selected from ``result.y`` first (a masked position's value
         has no path into the loss or its gradient), split into ``slices`` consecutive ranges, and
-        each range's logits are computed in at least float32 (``_loss_logits``) and scored against
-        its targets; the per-token
-        losses are summed over the ranges and divided by the count, so the mean and the softmax
-        over the full vocabulary per position are those of the unsliced objective. With more than
-        one slice each range's head runs under recomputation, so only one range's logits exist
-        at a time (the memory row: ``[b, n, V]`` float32 logits at the recipe's chunk size are
-        half a gibibyte plus the loss's own copies).
+        each range is scored against its targets by ``token_losses``; the per-token losses are
+        summed over the ranges and divided by the count, so the mean and the softmax over the
+        full vocabulary per position are those of the unsliced objective. No range's logits are
+        kept for the backward pass unless ``keep_logits`` (``token_losses``); ``slices`` bounds
+        the one transient ``[N, V]`` buffer of a call (``b n / slices`` rows).
 
         Raises:
             ContractError: if no position carries a loss.
@@ -168,7 +175,7 @@ class Vesper(nn.Module):
         for start in range(0, rows.shape[0], width):
             end = min(start + width, rows.shape[0])
             ranged = (rows[start:end], targets[start:end], keep[start:end])
-            summed = summed + _slice_loss(self, *ranged, slices)
+            summed = summed + _slice_loss(self, *ranged, keep_logits=keep_logits)
         count = mask.sum()
         return wake_total(
             summed / count,
@@ -184,12 +191,14 @@ class Vesper(nn.Module):
         condition: str,
         beta: float,
         slices: int = 1,
+        keep_logits: bool = False,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """The halting experiment's all-pass objective from a DENSE forward (``DenseRule``).
 
         Every pass's output is scored by the head at the loss positions (pass by pass, in
-        ``slices`` ranges whose head is always recomputed in the backward pass, so one range's
-        vocabulary logits exist at a time); the exit distribution comes from the learned logits
+        ``slices`` ranges through ``token_losses``, whose logits the backward recomputes unless
+        ``keep_logits``, so one range's vocabulary logits exist at a time by default); the
+        exit distribution comes from the learned logits
         through ``hazard_logits`` and ``exit_log_probs``, in float64.
         ``condition``: ``fixed`` uses zero logits (exactly uniform weights, no head gradient);
         ``local`` and ``aggregate`` use the head's logits on the same per-pass outputs and add
@@ -230,7 +239,12 @@ class Vesper(nn.Module):
             [
                 torch.cat(
                     [
-                        _token_losses(self, rows[s : s + width], targets[s : s + width])
+                        token_losses(
+                            self,
+                            rows[s : s + width],
+                            targets[s : s + width],
+                            keep_logits=keep_logits,
+                        )
                         for s in range(0, b * n, width)
                     ]
                 )
@@ -283,45 +297,43 @@ def _loss_rows(y: Tensor, targets: Tensor, mask: Tensor) -> tuple[Tensor, Tensor
     return rows, torch.where(mask, targets, 0).reshape(b * n), keep
 
 
-def _slice_loss(model: "Vesper", y: Tensor, targets: Tensor, keep: Tensor, slices: int) -> Tensor:
-    """The summed per-token loss of the kept rows of one range, recomputed when sliced."""
-
-    def compute(y_range: Tensor, t_range: Tensor, k_range: Tensor) -> Tensor:
-        losses = ntp_loss(_loss_logits(model, y_range), t_range[None, :])[0]
-        return torch.where(k_range, losses, 0.0).sum()
-
-    if slices == 1:
-        return compute(y, targets, keep)
-    return checkpoint(compute, y, targets, keep, use_reentrant=False)
+def _slice_loss(
+    model: "Vesper", y: Tensor, targets: Tensor, keep: Tensor, *, keep_logits: bool
+) -> Tensor:
+    """The summed per-token loss of the kept rows of one range."""
+    losses = token_losses(model, y, targets, keep_logits=keep_logits)
+    return torch.where(keep, losses, 0.0).sum()
 
 
-def _token_losses(model: "Vesper", y: Tensor, targets: Tensor) -> Tensor:
-    """Per-token losses ``[N]`` (at least float32) of one range of positions, ALWAYS recomputed.
+def token_losses(
+    model: "Vesper", y: Tensor, targets: Tensor, *, keep_logits: bool = False
+) -> Tensor:
+    """PRIMITIVE per-token losses ``[...]`` (at least float32) of positions through the head.
 
-    The per-token sibling of ``_slice_loss`` for objectives that score every pass: with ``T``
-    passes, keeping each range's vocabulary logits for the backward pass would hold ``T`` of
-    them (maintainer B's review of 49c92cf, finding 3: four per-pass vocabulary intermediates at
-    ``slices = 1``), so the head runs again in the backward pass and only one range's logits
-    exist at a time, forward or backward, whatever the slice count.
+    ``y [..., d]`` are positions (one range ``[N, d]``, or a chunk's ``[b, n, d]``) and
+    ``targets [...]`` their targets, the same leading shape: the head's norm,
+    then ``kernels.nll.linear_nll`` over the tied embedding, which keeps no vocabulary logits for
+    the backward pass (it recomputes one call's logits there), so with ``T`` passes no ``T``
+    vocabulary intermediates are held (maintainer B's review of 49c92cf, finding 3) and a caller's
+    slices bound the one transient ``[N, V]`` buffer of a call. The logits are never copied to
+    float32: bf16 under CUDA autocast as the matmul gives them, float32 or float64 otherwise (a
+    plain ``.float()`` once demoted a float64 model's logits and failed a slice test on CI).
+
+    For: every objective's loss of the head (``objective``, ``all_pass_objective``,
+    ``joint_update.label_nll``) and the evaluations, one range at a time. Not for: a mask; every
+    row is scored, the caller selects or zeroes afterwards.
     """
-
-    def compute(y_range: Tensor, t_range: Tensor) -> Tensor:
-        return ntp_loss(_loss_logits(model, y_range), t_range[None, :])[0]
-
-    return checkpoint(compute, y, targets, use_reentrant=False)
-
-
-def _loss_logits(model: "Vesper", y: Tensor) -> Tensor:
-    """The head's logits ``[1, N, V]`` for selected positions ``[N, d]``, in at least float32.
-
-    The selected positions form one row of a batch (the head's norm takes ``[b, n, d]``). bf16
-    logits under autocast are promoted to float32 for the loss; float32 and float64 are kept. A
-    plain ``.float()`` demoted a float64 model's logits, so the sliced objective differed from
-    ``wake_objective`` there by float32 rounding, amplified about 60x by cancellation in the
-    gradient of ``loop.u`` (the slice test's margin was 0.7 of its bound and failed on CI).
-    """
-    logits = model.head(y[None, :, :])
-    return logits.to(torch.promote_types(logits.dtype, torch.float32))
+    # the declared contract before any flattening: targets exactly y's leading shape (maintainer B's
+    # review of 571b5f9: y [2, 3, d] with targets [3, 2] was flattened and accepted)
+    lead = tuple(f"lead{i}" for i in range(y.dim() - 1))
+    dims: Dims = {}
+    check_shape("y", y, (*lead, "d"), dims)
+    check_shape("targets", targets, lead, dims)
+    rows = y.reshape(1, -1, y.shape[-1])
+    x = model.norm_out.forward(rows)[0]
+    flat = targets.reshape(-1)
+    losses = linear_nll(x, model.embedding.weight, flat, keep_logits=keep_logits)
+    return losses.view(targets.shape)
 
 
 def wake_objective(

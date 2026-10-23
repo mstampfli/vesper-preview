@@ -25,7 +25,7 @@ from torch import Tensor
 
 from vesper.contracts import Dims, check_shape
 
-_KEY_NORM_FLOOR = 1e-6
+KEY_NORM_FLOOR = 1e-6  # normalize_keys' denominator floor; kernels.keys uses the same one
 
 
 def write_strength(logits: Tensor, m: Tensor | None = None, alpha: float | None = None) -> Tensor:
@@ -100,7 +100,7 @@ def normalize_keys(k: Tensor) -> Tensor:
         return k
     # This positive scale cancels algebraically. Treating it as constant keeps
     # an unnecessary, numerically cancelling derivative out of autograd.
-    scale = k.detach().abs().amax(dim=-1, keepdim=True).clamp_min(_KEY_NORM_FLOOR)
+    scale = k.detach().abs().amax(dim=-1, keepdim=True).clamp_min(KEY_NORM_FLOOR)
     scaled = k / scale
     # If scale exceeds the floor, one scaled component has magnitude one;
     # otherwise scale is the floor. Thus max(||scaled||, 1) is the right

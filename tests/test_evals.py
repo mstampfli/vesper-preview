@@ -10,9 +10,9 @@ from conftest import small_config, small_raw
 from vesper.column import ColumnState, Modulation
 from vesper.config import VesperConfig, parse
 from vesper.data import Chunk, Document, Stream
-from vesper.evals import evaluate, iteration_histogram, perplexity, static_profile
+from vesper.evals import depth_losses, evaluate, iteration_histogram, perplexity, static_profile
 from vesper.learning import ntp_loss
-from vesper.loop import DenseRule, LoopResult
+from vesper.loop import DenseRule, ExitRule, LoopResult
 from vesper.model import Vesper
 
 CPU = torch.device("cpu")
@@ -24,9 +24,10 @@ class ScriptedEvaluation(Vesper):
     def __init__(self) -> None:
         super().__init__(small_config(), torch.Generator().manual_seed(0))
         self.calls: int = 0
+        self.scored: int = 0
 
     @override
-    def forward(
+    def run(
         self,
         tokens: torch.Tensor,
         pos: torch.Tensor,
@@ -35,8 +36,10 @@ class ScriptedEvaluation(Vesper):
         passes: int | None = None,
         *,
         recompute: bool = False,
-    ) -> tuple[torch.Tensor, LoopResult]:
+        exit_rule: ExitRule | None = None,
+    ) -> LoopResult:
         del pos, modulation, recompute
+        assert exit_rule is None
         assert not torch.is_grad_enabled()
         assert not torch.is_autocast_enabled("cpu")
         assert passes == 2
@@ -44,20 +47,28 @@ class ScriptedEvaluation(Vesper):
         assert all(bool((h == self.calls).all().item()) for s in states for h in s.h)
         self.calls += 1
         carried = tuple(replace(s, h=tuple(h + 1 for h in s.h)) for s in states)
-        probabilities = [0.5, 0.0, 0.0, 0.0] if self.calls == 1 else [0.25, 0.125, 0.0, 0.0]
-        logits = torch.full((1, 4, 64), math.nan)
-        for i, p in enumerate(probabilities):
-            if p:
-                logits[0, i, :] = math.log((1 - p) / 63)
-                logits[0, i, 0] = math.log(p)
         depths = [1, 2, 2, 2] if self.calls == 1 else [2, 1, 2, 2]
-        return logits, LoopResult(
+        return LoopResult(
             y=torch.zeros(1, 4, 32),
             states=carried,
             n_iters=ints(*depths).reshape(1, 4),
             ponder=torch.zeros(1, 4),
             per_pass=torch.zeros(2, 1, 4, 32),
         )
+
+    @override
+    def position_losses(self, y: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # the scripted head: the probability of target 0 at each position of this call's chunk
+        assert self.scored == self.calls - 1  # one scoring per forward, of that forward's output
+        self.scored += 1
+        assert tuple(y.shape) == (1, 4, 32)
+        probabilities = [0.5, 0.0, 0.0, 0.0] if self.calls == 1 else [0.25, 0.125, 0.0, 0.0]
+        logits = torch.full((1, 4, 64), math.nan)
+        for i, p in enumerate(probabilities):
+            if p:
+                logits[0, i, :] = math.log((1 - p) / 63)
+                logits[0, i, 0] = math.log(p)
+        return ntp_loss(logits, targets)
 
 
 def test_evaluate_counts_the_same_masked_positions_once_with_carried_states() -> None:
@@ -235,3 +246,86 @@ def test_iteration_histogram_accepts_pass_counts_on_the_gpu() -> None:
     cuda = torch.device("cuda")
     expected: list[float] = [1 / 3, 2 / 3]
     assert iteration_histogram([ints(1, 2, 2).to(cuda)], t_max=2) == pytest.approx(expected)
+
+
+def test_evaluate_keeps_o_t_max_results_per_chunk_not_per_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Maintainer B's review of 571b5f9 (410cdc1): evaluate held every chunk's per-token losses and
+    # pass counts on the device until the end, against the registry's O(T_max) metric storage; each
+    # chunk is now reduced inside its pass, so what run_chunks keeps is a few numbers per chunk
+    import vesper.evals  # noqa: PLC0415
+
+    kept: list[int] = []
+    run_chunks = vesper.evals.run_chunks
+
+    def counted(*args: object, **kwargs: object) -> list[list[torch.Tensor]]:
+        out = run_chunks(*args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        kept.extend(t.numel() for chunk in out for t in chunk)
+        return out
+
+    monkeypatch.setattr(vesper.evals, "run_chunks", counted)
+    cfg = small_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    docs = [Document(f"d{i}", torch.arange(1, 40, dtype=torch.int32)) for i in range(3)]
+    stream = Stream(iter(docs), slots=2, chunk=cfg.training.chunk_tokens)
+    chunks = [c for c in (stream.next() for _ in range(3)) if c is not None]
+    _ = evaluate(model, chunks, cfg, passes=2)
+    assert kept
+    assert max(kept) <= cfg.model.t_max + 1
+
+
+def _kept_by(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Every element ``evals.run_chunks`` returns, counted (what stays until the read)."""
+    import vesper.evals  # noqa: PLC0415
+
+    kept: list[int] = []
+    run_chunks = vesper.evals.run_chunks
+
+    def counted(*args: object, **kwargs: object) -> list[list[torch.Tensor]]:
+        out = run_chunks(*args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        kept.append(sum(t.numel() for row in out for t in row))
+        return out
+
+    monkeypatch.setattr(vesper.evals, "run_chunks", counted)
+    return kept
+
+
+def _held_out(cfg: VesperConfig, n_chunks: int) -> list[Chunk]:
+    docs = [
+        Document(f"d{i}", torch.arange(i, 90 + i, dtype=torch.int32) % 60 + 1) for i in range(6)
+    ]
+    stream = Stream(iter(docs), slots=2, chunk=cfg.training.chunk_tokens)
+    chunks = [c for c in (stream.next() for _ in range(n_chunks)) if c is not None]
+    assert len(chunks) == n_chunks
+    return chunks
+
+
+def test_evaluation_storage_does_not_grow_with_the_number_of_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Maintainer B 9e3066c: a row of reductions per chunk is still O(chunks * T), not the registry's
+    # O(T_max); evaluate and the static profile keep running totals instead
+    cfg = three_pass_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    kept = _kept_by(monkeypatch)
+    for n_chunks in (2, 8):
+        chunks = _held_out(cfg, n_chunks)
+        _ = evaluate(model, chunks, cfg, passes=2)
+        _ = static_profile(model, chunks, cfg)
+    evaluate_2, profile_2, evaluate_8, profile_8 = kept
+    assert evaluate_2 == evaluate_8 == 1 + 1 + cfg.model.t_max + 1
+    assert profile_2 == profile_8 == cfg.model.t_max
+
+
+def test_the_static_profile_sums_the_per_label_matrix_of_depth_losses() -> None:
+    cfg = three_pass_config()
+    model = Vesper(cfg, torch.Generator().manual_seed(0))
+    chunks = _held_out(cfg, 5)
+    matrix = depth_losses(model, chunks, carried=True)
+    profile = static_profile(model, chunks, cfg)
+    assert profile.tokens_with_loss == matrix.shape[1]
+    for got, want in zip(
+        profile.loss_sums, [float(s) for s in matrix.sum(1).unbind()], strict=True
+    ):
+        assert got == pytest.approx(want, rel=1e-12)

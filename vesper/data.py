@@ -130,7 +130,7 @@ class _Slot:
         self.offset: int = 0  # tokens of queue[0] already emitted as inputs
         self.pending: int = 0  # tokens not yet emitted as inputs, over the whole queue
         self.segment: int = 0  # document number of queue[0] within this slot
-        self.emitted: int = 0  # inputs emitted so far: the stream position of the next one
+        self.emitted: int = 0  # positions emitted so far, padding included: the next one's
 
     def state(self) -> SlotState:
         """The packing state as values (the queued documents are shared, not copied)."""
@@ -205,7 +205,7 @@ class _Slot:
                 self.segment += 1
         valid[:m] = True
         segment[m:] = self.segment
-        self.emitted += m
+        self.emitted += n  # a padded tail continues the count (Chunk.pos)
         return tuple(ids), tuple(spans)
 
 
@@ -229,6 +229,11 @@ class Stream:
         self._slots: list[_Slot] = [_Slot() for _ in range(slots)]
         self._exhausted: bool = False
         self.documents_taken: int = 0  # non-empty documents pulled from the iterator so far
+
+    @property
+    def slots(self) -> int:
+        """``b``: the number of document streams (rows of every chunk)."""
+        return len(self._slots)
 
     def state(self) -> StreamState:
         """The stream's packing state for a checkpoint."""

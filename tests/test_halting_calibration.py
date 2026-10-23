@@ -24,30 +24,20 @@ from vesper.config import VesperConfig, load
 from vesper.contracts import ContractError
 from vesper.exits import HAZARD_LIMIT, floored_stop_log_probs, hazard_baseline
 from vesper.halting_calibration import (
-    BACKBONE_LR,
     DEPTH_COST,
-    HEAD_BIAS,
     LABEL_WEIGHT,
-    PEAK_LR,
     PREFLIGHT_UPDATES,
     REQUIRED_ACCURACY,
-    ROLLOUTS,
     SAVE_AT,
     TRAIN_MODE,
     UPDATES,
     _admit,  # pyright: ignore[reportPrivateUsage]
-    _Dense,  # pyright: ignore[reportPrivateUsage]
     _floor_at,  # pyright: ignore[reportPrivateUsage]
     _label_weights,  # pyright: ignore[reportPrivateUsage]
-    _learning_rate,  # pyright: ignore[reportPrivateUsage]
-    _optimizer,  # pyright: ignore[reportPrivateUsage]
-    _update_loss,  # pyright: ignore[reportPrivateUsage]
-    actor_loss,
     evaluate_policy,
     fixed_depths,
     main,
     run,
-    start_head,
     static_frontier,
     train_update,
     trial_protocol,
@@ -55,6 +45,18 @@ from vesper.halting_calibration import (
 )
 from vesper.halting_common import load_weights
 from vesper.halting_experiment import run as experiment_run
+from vesper.joint_update import (
+    BACKBONE_LR,
+    HEAD_BIAS,
+    PEAK_LR,
+    ROLLOUTS,
+    Dense,
+    actor_loss,
+    learning_rate,
+    optimizer,
+    start_head,
+    update_loss,
+)
 from vesper.loop import CdfRule, DenseRule, SampledRule
 from vesper.model import Vesper
 from vesper.synthetic import CLASSES, TERMINAL_MIX, Episodes, episodes, generator_for
@@ -341,9 +343,9 @@ def test_the_floor_and_rate_schedules() -> None:
         _ = _floor_at("linear", 0)
     with pytest.raises(ValueError, match="non-negative"):
         _ = _floor_at("taper", -1)
-    assert _learning_rate(0) == pytest.approx(PEAK_LR / 100)
-    assert _learning_rate(99) == PEAK_LR
-    assert _learning_rate(1999) == PEAK_LR
+    assert learning_rate(0) == pytest.approx(PEAK_LR / 100)
+    assert learning_rate(99) == PEAK_LR
+    assert learning_rate(1999) == PEAK_LR
 
 
 def test_the_start_freezes_the_backbone_and_its_policy_exits_at_the_last_pass() -> None:
@@ -381,7 +383,7 @@ def test_training_moves_only_the_head_and_its_records_are_finite() -> None:
     _ = model.eval()
     _moderate_head(model)
     before = {k: v.clone() for k, v in cast("dict[str, Tensor]", model.state_dict()).items()}
-    opt = _optimizer(params, [])
+    opt = optimizer(params, [])
     data = generator_for("frozen", 0)
     action = generator_for("frozen-action", 0)
     t_max = model.loop.t_max
@@ -464,7 +466,7 @@ def test_an_update_minimizes_the_paired_surrogate_of_the_trajectory_cost(
     cost = (objective + depth_cost * depth / t_max).view(ROLLOUTS, episodes_)
     log_probs = rule.log_prob.detach().sum(1).view(ROLLOUTS, episodes_)
     expected = float(((cost - cost.flip(0)) * log_probs).mean())
-    opt = _optimizer(params, [])
+    opt = optimizer(params, [])
     record = train_update(model, opt, params, ep, uniforms, 0.3, 0, depth_cost, scheme)
     assert record["surrogate"] == pytest.approx(expected, rel=1e-5)
     assert record["nll"] == pytest.approx(float(nll.mean()), rel=1e-5)  # ordinary, any scheme
@@ -1175,7 +1177,7 @@ def test_the_update_loss_is_unbiased_for_the_exact_joint_gradient() -> None:
         uniforms = torch.stack(
             [_forced(first, j.positions, t_max, n), _forced(second, j.positions, t_max, n)], dim=1
         )
-        loss = _update_loss(
+        loss = update_loss(
             model,
             _twice(c.tokens),
             _twice(c.pos),
@@ -1206,11 +1208,11 @@ def test_the_dense_auxiliary_is_rho_times_the_mean_over_passes_and_reaches_only_
     model, c = j.model, j.episode.chunk
     t_max, n = model.loop.t_max, int(c.tokens.shape[1])
     rho = 0.1
-    dense = _Dense(c.tokens, c.pos, c.targets, c.loss_mask, j.weights, rho)
+    dense = Dense(c.tokens, c.pos, c.targets, c.loss_mask, j.weights, rho)
     uniforms = torch.stack(
         [_forced((1, 2), j.positions, t_max, n), _forced((3, 1), j.positions, t_max, n)], dim=1
     )
-    loss = _update_loss(
+    loss = update_loss(
         model,
         _twice(c.tokens),
         _twice(c.pos),
@@ -1247,7 +1249,7 @@ def test_the_dense_auxiliary_is_rho_times_the_mean_over_passes_and_reaches_only_
     assert all(g is None for g in on_head)  # no decision credit: the head never sees it
     on_embedding = torch.autograd.grad(loss.dense, [model.embedding.weight])[0]
     assert float((on_embedding * on_embedding).sum()) > 0.0
-    without = _update_loss(
+    without = update_loss(
         model,
         _twice(c.tokens),
         _twice(c.pos),

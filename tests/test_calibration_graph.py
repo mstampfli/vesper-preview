@@ -19,15 +19,17 @@ from vesper.contracts import ContractError
 from vesper.exits import floored_stop_log_probs
 from vesper.graphs import WARM_STEPS, WarmedGraph
 from vesper.halting_calibration import (
-    ROLLOUTS,
-    _Dense,  # pyright: ignore[reportPrivateUsage]
     _floor_at,  # pyright: ignore[reportPrivateUsage]
     _label_weights,  # pyright: ignore[reportPrivateUsage]
-    _optimizer,  # pyright: ignore[reportPrivateUsage]
-    _release_backbone,  # pyright: ignore[reportPrivateUsage]
-    _update_loss,  # pyright: ignore[reportPrivateUsage]
-    start_head,
     train_update,
+)
+from vesper.joint_update import (
+    ROLLOUTS,
+    Dense,
+    optimizer,
+    release_backbone,
+    start_head,
+    update_loss,
 )
 from vesper.kernels.delta_scan import fused_scan_available
 from vesper.model import Vesper
@@ -65,8 +67,8 @@ def _trained(*, graph: WarmedGraph | None, joint: bool, dense_weight: float) -> 
     w_h = model.loop.halting_head().w_h
     with torch.no_grad():  # a head whose stops vary across tokens, so decisions differ
         _ = w_h.copy_(torch.randn(w_h.shape, generator=torch.Generator().manual_seed(7)))
-    backbone = _release_backbone(model) if joint else []
-    opt = _optimizer(head, backbone, capturable=True)
+    backbone = release_backbone(model) if joint else []
+    opt = optimizer(head, backbone, capturable=True)
     data, action = generator_for("graph-train", 0), generator_for("graph-action", 0)
     t_max = model.loop.t_max
     records: list[dict[str, object]] = []
@@ -129,7 +131,7 @@ def test_the_update_gives_the_dense_auxiliary_each_unique_episode_once() -> None
     # trains on equals the term of the unique episodes given explicitly (before the step)
     model = Vesper(load(CONFIG), torch.Generator().manual_seed(0))
     head = start_head(model)
-    backbone = _release_backbone(model)
+    backbone = release_backbone(model)
     ep = episodes(generator_for("dense-wiring", 0), 3, "d", TERMINAL_MIX)
     c = ep.chunk
     weights = _label_weights(ep.task, "class")
@@ -139,7 +141,7 @@ def test_the_update_gives_the_dense_auxiliary_each_unique_episode_once() -> None
     def twice(t: Tensor) -> Tensor:
         return torch.cat([t] * ROLLOUTS)
 
-    want = _update_loss(
+    want = update_loss(
         model,
         twice(c.tokens),
         twice(c.pos),
@@ -150,11 +152,11 @@ def test_the_update_gives_the_dense_auxiliary_each_unique_episode_once() -> None
         uniforms,
         0.0,
         10.0,
-        _Dense(c.tokens, c.pos, c.targets, c.loss_mask, weights, 0.1),
+        Dense(c.tokens, c.pos, c.targets, c.loss_mask, weights, 0.1),
     ).dense
     record = train_update(
         model,
-        _optimizer(head, backbone),
+        optimizer(head, backbone),
         head + backbone,
         ep,
         uniforms,
@@ -190,7 +192,7 @@ def test_a_non_finite_update_raises_before_the_step_and_changes_nothing() -> Non
     head = start_head(model)
     with torch.no_grad():
         _ = model.loop.halting_head().b_h.fill_(float("nan"))  # every stop logit is NaN
-    opt = _optimizer(head, [])
+    opt = optimizer(head, [])
     before = [p.detach().clone() for p in head]
     ep = episodes(generator_for("nan", 0), 2, "nan", TERMINAL_MIX)
     n = int(ep.chunk.tokens.shape[1])
