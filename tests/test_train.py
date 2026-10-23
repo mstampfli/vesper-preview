@@ -1,10 +1,14 @@
 import copy
+import hashlib
 import json
 import math
-from collections.abc import Callable, Sequence
+import shutil
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from itertools import accumulate, pairwise
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Protocol, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -18,7 +22,7 @@ import vesper.train
 from conftest import replaced_after_first_read, small_config, small_raw
 from vesper.column import set_scan
 from vesper.config import VesperConfig, parse
-from vesper.corpus import Component, finalize
+from vesper.corpus import CYCLE_ORDER_RULE, Component, MixerState, finalize
 from vesper.data import Chunk, Document, Stream, is_held_out
 from vesper.kernels.nll import linear_nll
 from vesper.keys import file_sha256
@@ -32,16 +36,20 @@ from vesper.train import (
     Group,
     Identity,
     Layout,
+    Phase,
     Progress,
     Recipe,
     StepGraphs,
+    StepResult,
     _device_step,  # pyright: ignore[reportPrivateUsage]
+    _plain,  # pyright: ignore[reportPrivateUsage]
     _read_step,  # pyright: ignore[reportPrivateUsage]
     _scan_for,  # pyright: ignore[reportPrivateUsage]
     _to_device,  # pyright: ignore[reportPrivateUsage]
     checkpoint,
     decays,
     detach_states,
+    identity_of,
     optimizer,
     phase_schedule,
     restore,
@@ -1638,3 +1646,635 @@ def test_the_head_keeps_its_logits_exactly_when_activations_are_kept(
     assert result is not None
     assert seen  # the head ran through the kernel
     assert set(seen) == {not recompute}
+
+
+def test_safety_saves_change_no_training_keep_only_the_newest_and_resume(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # any positive interval has passed by the end of a step here, so every step that is not an
+    # evaluated checkpoint gets a safety save: the steps equal those of a run without them, only
+    # the newest safety save is kept, and a resume from it equals the uninterrupted next step
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+
+    def train(out: Path, steps: int, resume: Path | None, safety: float | None) -> Path:
+        return run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=out,
+            micro=1,
+            steps=steps,
+            resume=resume,
+            seed=0,
+            device=CPU,
+            safety_seconds=safety,
+        )
+
+    lines = read_log(train(tmp_path / "safe", 4, None, 1e-9))
+    assert lines[0]["safety_seconds"] == 1e-9
+    evaluated = {line["step"] for line in lines if line["kind"] == "checkpoint"}
+    saved = [line for line in lines if line["kind"] == "safety"]
+    trained = [line["step"] for line in lines if line["kind"] == "step"]
+    # every step got exactly one save of one kind (the last one both: its final checkpoint
+    # follows the step's safety save)
+    assert [line["step"] for line in saved] == [s for s in trained if s not in evaluated or s == 4]
+    assert len(saved) >= 2
+    assert all(cast("float", line["seconds"]) >= 0 for line in saved)
+    newest = Path(cast("str", saved[-1]["path"]))
+    assert newest.parent == tmp_path / "safe" / "safety"
+    assert newest.name == f"{lines[0]['run_id']}-step-4"
+    assert sorted(p.name for p in newest.parent.iterdir()) == [newest.name]
+    assert (newest / "manifest.json").is_file()
+    record = cast(
+        "dict[str, object]", json.loads((newest / "train.json").read_text(encoding="utf-8"))
+    )
+    assert record["reason"] == "safety"
+    assert cast("dict[str, object]", record["progress"])["step"] == 4
+    plain = read_log(train(tmp_path / "plain", 4, None, None))
+    assert plain[0]["safety_seconds"] is None
+    assert not (tmp_path / "plain" / "safety").exists()
+    assert not [line for line in plain if line["kind"] == "safety"]
+    for ours, theirs in zip(
+        [line for line in lines if line["kind"] == "step"],
+        [line for line in plain if line["kind"] == "step"],
+        strict=True,
+    ):
+        assert ours["loss"] == theirs["loss"]
+        assert ours["shares"] == theirs["shares"]
+        assert ours["tokens_seen"] == theirs["tokens_seen"]
+    # resume from the second-to-last safety save's step: a fresh copy of the run up to there
+    middle = cast("int", saved[-2]["step"])
+    _ = train(tmp_path / "upto", middle, None, 1e-9)
+    kept = sorted((tmp_path / "upto" / "safety").iterdir())
+    assert len(kept) == 1
+    assert kept[0].name.endswith(f"-step-{middle}")
+    resumed = read_log(train(tmp_path / "upto", 1, kept[0], None))
+    header = [line for line in resumed if line["kind"] == "run"][-1]
+    assert header["resumed_from"] == str(kept[0])
+    after = [line for line in resumed if line["kind"] == "step"][-1]
+    straight = [line for line in plain if line["kind"] == "step"][middle]
+    assert after["step"] == middle + 1
+    assert after["loss"] == pytest.approx(cast("float", straight["loss"]), rel=1e-6)
+    assert after["shares"] == straight["shares"]
+    assert after["tokens_seen"] == straight["tokens_seen"]
+
+
+def test_a_failed_safety_save_is_logged_keeps_the_previous_and_training_goes_on(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+    calls: list[Path] = []
+
+    def failing_second(  # noqa: PLR0913
+        path: Path,
+        model: Vesper,
+        opt: torch.optim.AdamW,
+        groups: Sequence[Group],
+        progress: Progress,
+        identity: Identity,
+        recipe: Recipe,
+        *,
+        reason: str,
+        mixer: MixerState | None = None,
+    ) -> Path:
+        if reason == "safety":
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device")
+        return checkpoint(
+            path, model, opt, groups, progress, identity, recipe, reason=reason, mixer=mixer
+        )
+
+    monkeypatch.setattr(vesper.train, "checkpoint", failing_second)
+    out = tmp_path / "run"
+    lines = read_log(
+        run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=out,
+            micro=1,
+            steps=4,
+            resume=None,
+            seed=0,
+            device=CPU,
+            safety_seconds=1e-9,
+        )
+    )
+    kinds = [line["kind"] for line in lines if line["kind"] in {"safety", "safety_failed"}]
+    assert kinds[:2] == ["safety", "safety_failed"]
+    failed = next(line for line in lines if line["kind"] == "safety_failed")
+    assert "No space left" in cast("str", failed["error"])
+    assert lines[-1]["kind"] == "end"
+    assert lines[-1]["step"] == 4
+    saved = [Path(cast("str", line["path"])) for line in lines if line["kind"] == "safety"]
+    remaining = sorted(p.name for p in (out / "safety").iterdir())
+    if len(saved) == 1:  # nothing succeeded after the failure: the first save is still there
+        assert remaining == [saved[0].name]
+    else:
+        assert remaining == [saved[-1].name]
+    assert not calls[1].exists()
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, math.nan, math.inf])
+def test_a_safety_interval_that_is_not_a_positive_finite_time_is_refused_first(
+    tmp_path: Path, book_builder: Builder, bad: float
+) -> None:
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+    with pytest.raises(ValueError, match="safety_seconds"):
+        _ = run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=tmp_path / "run",
+            micro=1,
+            steps=1,
+            resume=None,
+            seed=0,
+            device=CPU,
+            safety_seconds=bad,
+        )
+    assert not (tmp_path / "run").exists()
+
+
+def test_the_command_line_takes_safety_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[object] = []
+
+    def fake_run(*_args: object, **kwargs: object) -> Path:
+        seen.append(kwargs["safety_seconds"])
+        return tmp_path / "log.jsonl"
+
+    def no_components(**_: object) -> list[Component]:
+        return []
+
+    monkeypatch.setattr(vesper.train, "components_for", no_components)
+    monkeypatch.setattr(vesper.train, "run", fake_run)
+    config_path = tmp_path / "config.yaml"
+    _ = config_path.write_text(yaml.safe_dump(small_raw()), encoding="utf-8")
+    common = [
+        "--config", str(config_path), "--finalization", str(tmp_path / "f.json"),
+        "--tokenizer", str(tmp_path / "t.json"), "--out", str(tmp_path / "out"),
+        "--micro-chunks", "1", "--device", "cpu",
+    ]  # fmt: skip
+    assert vesper.train.main([*common, "--safety-minutes", "10"]) == 0
+    assert vesper.train.main(common) == 0
+    assert seen == [600.0, None]
+
+
+def test_the_command_line_takes_cycling_and_the_finite_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[object, object]] = []
+
+    def fake_run(*_args: object, **kwargs: object) -> Path:
+        seen.append((kwargs["cycle"], kwargs["from_finite"]))
+        return tmp_path / "log.jsonl"
+
+    def no_components(**_: object) -> list[Component]:
+        return []
+
+    monkeypatch.setattr(vesper.train, "components_for", no_components)
+    monkeypatch.setattr(vesper.train, "run", fake_run)
+    config_path = tmp_path / "config.yaml"
+    _ = config_path.write_text(yaml.safe_dump(small_raw()), encoding="utf-8")
+    common = [
+        "--config", str(config_path), "--finalization", str(tmp_path / "f.json"),
+        "--tokenizer", str(tmp_path / "t.json"), "--out", str(tmp_path / "out"),
+        "--micro-chunks", "1", "--device", "cpu",
+    ]  # fmt: skip
+    assert vesper.train.main(common) == 0
+    assert vesper.train.main([*common, "--cycle-components"]) == 0
+    assert vesper.train.main([*common, "--cycle-components", "--from-finite-checkpoint"]) == 0
+    assert seen == [(False, False), (True, False), (True, True)]
+
+
+class Train(Protocol):
+    def __call__(
+        self,
+        out: Path,
+        steps: int | None,
+        *,
+        resume: Path | None = None,
+        cycle: bool = False,
+        from_finite: bool = False,
+    ) -> list[dict[str, object]]: ...
+
+
+def cycling_runs(tmp_path: Path, book_builder: Builder) -> tuple[Train, int]:
+    """A runner over one small corpus, and the step at which its finite run is exhausted."""
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 100_000, 1
+    )
+
+    def train(
+        out: Path,
+        steps: int | None,
+        *,
+        resume: Path | None = None,
+        cycle: bool = False,
+        from_finite: bool = False,
+    ) -> list[dict[str, object]]:
+        return read_log(
+            run(
+                cfg,
+                config_path=config_path,
+                parts=parts,
+                finalization_receipt=receipt,
+                tokenizer_path=tokenizer_path,
+                out=out,
+                micro=1,
+                steps=steps,
+                resume=resume,
+                seed=0,
+                device=CPU,
+                cycle=cycle,
+                from_finite=from_finite,
+            )
+        )
+
+    finite = train(tmp_path / "finite", None)
+    assert finite[-1]["reason"] == "exhausted"
+    return train, cast("int", finite[-1]["step"])
+
+
+def steps_of(lines: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [line for line in lines if line["kind"] == "step"]
+
+
+def assert_same_steps(ours: list[dict[str, object]], theirs: list[dict[str, object]]) -> None:
+    assert [s["step"] for s in ours] == [s["step"] for s in theirs]
+    for a, b in zip(ours, theirs, strict=True):
+        assert a["loss"] == pytest.approx(cast("float", b["loss"]), rel=1e-6)
+        assert a["shares"] == b["shares"]
+        assert a["consumed"] == b["consumed"]
+        assert a["tokens_seen"] == b["tokens_seen"]
+
+
+def final_record(out: Path, step: int) -> dict[str, object]:
+    return cast("dict[str, object]", json.loads((out / f"step-{step}" / "train.json").read_text()))
+
+
+def test_a_cycling_run_trains_past_every_run_out_and_resumes_on_both_sides_of_one(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    train, exhausted = cycling_runs(tmp_path, book_builder)
+    total = exhausted + 8
+    straight = train(tmp_path / "straight", total, cycle=True)
+    header = straight[0]
+    assert cast("dict[str, object]", header["recipe"])["component_passes"] == CYCLE_ORDER_RULE
+    assert header["transition"] is None
+    assert straight[-1]["reason"] == "steps"
+    assert [s["groups_active"] for s in steps_of(straight)] == [2] * total
+    saved = cast(
+        "dict[str, object]",
+        torch.load(tmp_path / "straight" / f"step-{total}" / "states.pt", weights_only=True),
+    )
+    mixer = cast("dict[str, object]", saved["mixer"])
+    assert max(cast("list[int]", mixer["passes"])) >= 1  # some component wrapped
+    # before any run-out the cycling run is the finite one
+    finite = read_log(tmp_path / "finite" / "log.jsonl")
+    assert steps_of(straight)[0]["loss"] == steps_of(finite)[0]["loss"]
+    for cut in (2, exhausted + 3):  # before the first run-out, after a wrap
+        out = tmp_path / f"upto-{cut}"
+        _ = train(out, cut, cycle=True)
+        resumed = train(out, total - cut, resume=out / f"step-{cut}", cycle=True)
+        assert_same_steps(steps_of(resumed)[cut:], steps_of(straight)[cut:])
+        ours, theirs = final_record(out, total), final_record(tmp_path / "straight", total)
+        assert ours["progress"] == theirs["progress"]  # documents digest, counts, consumed
+        a = cast(
+            "dict[str, torch.Tensor]",
+            torch.load(out / f"step-{total}" / "model.pt", weights_only=True),
+        )
+        b = cast(
+            "dict[str, torch.Tensor]",
+            torch.load(tmp_path / "straight" / f"step-{total}" / "model.pt", weights_only=True),
+        )
+        for name, tensor in a.items():
+            torch.testing.assert_close(tensor, b[name], rtol=1e-5, atol=1e-6)
+
+
+def test_a_finite_checkpoint_enters_cycling_only_through_the_recorded_transition(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    train, exhausted = cycling_runs(tmp_path, book_builder)
+    total = exhausted + 4
+    out = tmp_path / "parent"
+    parent = train(out, 2)
+    checkpoint = out / "step-2"
+    with pytest.raises(ValueError, match="needs both"):
+        _ = train(tmp_path / "no-cycle", 1, resume=checkpoint, from_finite=True)
+    with pytest.raises(ValueError, match="needs both"):
+        _ = train(tmp_path / "no-resume", 1, cycle=True, from_finite=True)
+    assert not (tmp_path / "no-cycle").exists()
+    assert not (tmp_path / "no-resume").exists()
+    # without the transition a finite checkpoint is another recipe's, refused as always
+    with pytest.raises(ValueError, match="recipe"):
+        _ = train(out, 1, resume=checkpoint, cycle=True)
+    # a finite checkpoint taken after a run-out (here the exhausted terminal one) is refused
+    # before any cycling run is recorded (maintainer B bba62d1: it accepted and then trained
+    # nothing)
+    terminal = tmp_path / "finite" / f"step-{exhausted}"
+    with pytest.raises(ValueError, match="cycling cannot continue"):
+        _ = train(tmp_path / "late", 2, resume=terminal, cycle=True, from_finite=True)
+    assert not (tmp_path / "late" / "log.jsonl").exists()
+    child = train(out, total - 2, resume=checkpoint, cycle=True, from_finite=True)
+    header = [line for line in child if line["kind"] == "run"][-1]
+    assert header["transition"] == {
+        "from": "finite",
+        "to": CYCLE_ORDER_RULE,
+        "parent_identity": parent[0]["identity"],
+    }
+    assert header["identity"] != parent[0]["identity"]
+    # it continues exactly as a run that cycled from the start (pass 0 is the finite order)
+    straight = train(tmp_path / "straight", total, cycle=True)
+    assert_same_steps(steps_of(child)[2:], steps_of(straight)[2:])
+    assert final_record(out, total)["identity"] == straight[0]["identity"]
+    # its checkpoints are the cycling recipe's: they resume under cycling, not under finite
+    more = train(out, 1, resume=out / f"step-{total}", cycle=True)
+    assert steps_of(more)[-1]["step"] == total + 1
+    with pytest.raises(ValueError, match="recipe"):
+        _ = train(out, 1, resume=out / f"step-{total}")
+
+
+def test_a_finite_recipe_keeps_the_record_and_hash_it_had_before_cycling(tmp_path: Path) -> None:
+    finite = recipe()
+    cycling = replace(finite, component_passes=CYCLE_ORDER_RULE)
+    plain = _plain(finite)  # the record and hash under test
+    assert "component_passes" not in plain
+    assert _plain(cycling)["component_passes"] == CYCLE_ORDER_RULE
+    t, c, f = (tmp_path / name for name in ("t", "c", "f"))
+    for path in (t, c, f):
+        _ = path.write_text(path.name, encoding="utf-8")
+    canonical = json.dumps(plain, sort_keys=True, separators=(",", ":")).encode()
+    assert identity_of(t, c, f, finite).recipe_sha256 == hashlib.sha256(canonical).hexdigest()
+    assert identity_of(t, c, f, cycling).recipe_sha256 != identity_of(t, c, f, finite).recipe_sha256
+
+
+def test_a_safety_save_waits_for_its_interval_since_the_last_save_of_either_kind(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a clock that moves only while a step trains (10 s per step), so evaluations take no time:
+    # with a 25 s interval a safety save falls on every third step after the last save of
+    # either kind, never sooner (a budget of about 12 steps with an evaluated checkpoint every 6)
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 12 * 2 * 16, 2
+    )
+    clock = [0.0]
+    real_step = vesper.train.step
+
+    def ticking(  # noqa: PLR0913
+        model: Vesper,
+        opt: torch.optim.AdamW,
+        groups: Sequence[Group],
+        phase: Phase,
+        cfg: VesperConfig,
+        device: torch.device,
+        *,
+        recompute: bool = False,
+        slices: int = 1,
+        objective: str = "act",
+        graphs: StepGraphs | None = None,
+        ahead: Callable[[], None] | None = None,
+    ) -> StepResult | None:
+        result = real_step(
+            model,
+            opt,
+            groups,
+            phase,
+            cfg,
+            device,
+            recompute=recompute,
+            slices=slices,
+            objective=objective,
+            graphs=graphs,
+            ahead=ahead,
+        )
+        clock[0] += 10.0
+        return result
+
+    monkeypatch.setattr(vesper.train, "step", ticking)
+    monkeypatch.setattr(vesper.train, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    lines = read_log(
+        run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=tmp_path / "run",
+            micro=1,
+            steps=8,
+            resume=None,
+            seed=0,
+            device=CPU,
+            safety_seconds=25.0,
+        )
+    )
+    # the final checkpoint is written after the loop, so only the interval ones reset the clock
+    interval = {
+        line["step"]
+        for line in lines
+        if line["kind"] == "checkpoint" and line["reason"] == "interval"
+    }
+    assert interval
+    expected: list[int] = []
+    last = 0.0
+    for s in range(1, 9):
+        now = 10.0 * s
+        if s in interval:
+            last = now
+        elif now - last >= 25.0:
+            expected.append(s)
+            last = now
+    assert [line["step"] for line in lines if line["kind"] == "safety"] == expected
+    assert expected  # the interval was reached at least once
+
+
+def _safety_run(tmp_path: Path, book_builder: Builder) -> Callable[[Path], Path]:
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+
+    def train(out: Path) -> Path:
+        return run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=out,
+            micro=1,
+            steps=4,
+            resume=None,
+            seed=0,
+            device=CPU,
+            safety_seconds=1e-9,
+        )
+
+    return train
+
+
+def test_a_failed_cleanup_is_reported_with_its_published_save_and_training_goes_on(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Maintainer B's ccb4e69 fixture: removing an older save fails after the new one is published;
+    # the run must record the save, report the cleanup failure and train on (it aborted before)
+    train = _safety_run(tmp_path, book_builder)
+    out = tmp_path / "run"
+    safety = out / "safety"
+    original = shutil.rmtree
+
+    def refusing(path: str | Path, *_args: object, **_kwargs: object) -> None:
+        if Path(path).parent == safety and not Path(path).name.startswith("."):
+            raise PermissionError(13, "injected cleanup refusal", str(path))
+        original(path)
+
+    monkeypatch.setattr(shutil, "rmtree", refusing)
+    lines = read_log(train(out))
+    assert lines[-1]["kind"] == "end"
+    assert lines[-1]["step"] == 4
+    saved = [line for line in lines if line["kind"] == "safety"]
+    assert len(saved) >= 2
+    assert saved[0]["cleanup_error"] is None  # nothing older to remove yet
+    assert saved[0]["removed"] == []
+    for line in saved[1:]:
+        assert "PermissionError" in cast("str", line["cleanup_error"])
+        assert line["removed"] == []
+    assert not [line for line in lines if line["kind"] == "safety_failed"]
+    # every published save is still there and complete
+    names = sorted(Path(cast("str", line["path"])).name for line in saved)
+    assert sorted(p.name for p in safety.iterdir()) == names
+    assert all((safety / name / "manifest.json").is_file() for name in names)
+
+
+def test_the_cleanup_removes_only_safety_saves_it_owns(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # Maintainer B's ccb4e69 fixtures: an operator's directory and a regular file in out/safety were
+    # deleted or aborted the run; only real directories named like a safety save are removed
+    train = _safety_run(tmp_path, book_builder)
+    out = tmp_path / "run"
+    safety = out / "safety"
+    safety.mkdir(parents=True)
+    note = safety / "operator-note"
+    note.mkdir()
+    _ = (note / "keep.txt").write_text("not a checkpoint", encoding="utf-8")
+    _ = (safety / "notes.txt").write_text("not a checkpoint", encoding="utf-8")
+    stale = safety / "20200101T000000000000Z-1-step-7"  # an older run's save: owned
+    stale.mkdir()
+    _ = (stale / "model.pt").write_bytes(b"old")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _ = (elsewhere / "keep.txt").write_text("outside", encoding="utf-8")
+    linked = safety / "20200101T000000000000Z-2-step-9"  # a save's name, but a symlink
+    linked.symlink_to(elsewhere, target_is_directory=True)
+    named_file = safety / "20200101T000000000000Z-3-step-1"  # a save's name, but a file
+    _ = named_file.write_text("not a directory", encoding="utf-8")
+    lines = read_log(train(out))
+    assert lines[-1]["kind"] == "end"
+    assert lines[-1]["step"] == 4
+    saved = [line for line in lines if line["kind"] == "safety"]
+    assert all(line["cleanup_error"] is None for line in saved)
+    assert saved[0]["removed"] == [stale.name]
+    newest = Path(cast("str", saved[-1]["path"])).name
+    assert sorted(p.name for p in safety.iterdir()) == sorted(
+        [newest, note.name, "notes.txt", linked.name, named_file.name]
+    )
+    assert (note / "keep.txt").read_text(encoding="utf-8") == "not a checkpoint"
+    assert (elsewhere / "keep.txt").read_text(encoding="utf-8") == "outside"
+    assert linked.is_symlink()
+
+
+def test_a_failed_listing_of_the_safety_saves_is_reported_and_training_goes_on(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train = _safety_run(tmp_path, book_builder)
+    out = tmp_path / "run"
+    safety = out / "safety"
+    original = Path.iterdir
+
+    def refusing(self: Path) -> Iterator[Path]:
+        if self == safety:
+            raise OSError(5, "injected listing failure", str(self))
+        return original(self)
+
+    monkeypatch.setattr(Path, "iterdir", refusing)
+    lines = read_log(train(out))
+    assert lines[-1]["kind"] == "end"
+    assert lines[-1]["step"] == 4
+    saved = [line for line in lines if line["kind"] == "safety"]
+    assert saved
+    assert all("injected listing failure" in cast("str", line["cleanup_error"]) for line in saved)
+    monkeypatch.undo()
+    names = sorted(Path(cast("str", line["path"])).name for line in saved)
+    assert sorted(p.name for p in safety.iterdir()) == names
+
+
+def test_a_real_serializer_failure_in_a_safety_save_is_logged_and_training_goes_on(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Maintainer B 8d6c1c7: a real write limit makes torch.save raise RuntimeError
+    # (inline_container.cc), not OSError, and the trainer stopped. Here the second safety save's
+    # files are really written to /dev/full (every write fails with ENOSPC), through torch's own
+    # writer
+    train = _safety_run(tmp_path, book_builder)
+    out = tmp_path / "run"
+    original: Callable[[object, str | Path], None] = torch.save
+    saves: list[str] = []
+    safety = out / "safety"
+
+    def full_disk(obj: object, f: Path) -> None:  # checkpoint's call: torch.save(obj, path)
+        target: str | Path = f
+        # a safety save's file: out/safety/.<name>.<random>.staging/<name>/<file>
+        if f.parent.parent.parent == safety:
+            if f.parent.name not in saves:
+                saves.append(f.parent.name)
+            if len(saves) == 2:
+                target = "/dev/full"
+        original(obj, target)
+
+    monkeypatch.setattr(torch, "save", full_disk)
+    lines = read_log(train(out))
+    assert lines[-1]["kind"] == "end"
+    assert lines[-1]["step"] == 4
+    failed = [line for line in lines if line["kind"] == "safety_failed"]
+    assert len(failed) == 1
+    assert cast("str", failed[0]["error"]).startswith("RuntimeError: ")
+    saved = [line for line in lines if line["kind"] == "safety"]
+    assert len(saved) >= 2
+    # the failed save left nothing published; the newest successful one is the only save kept
+    assert sorted(p.name for p in (out / "safety").iterdir() if not p.name.startswith(".")) == [
+        Path(cast("str", saved[-1]["path"])).name
+    ]
+
+
+def test_an_error_outside_the_save_boundary_is_not_absorbed_by_the_safety_policy(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # only file-system and serializer failures are a failed safety save; anything else (here a
+    # ValueError, as checkpoint raises for an existing directory) stops the run as before
+    train = _safety_run(tmp_path, book_builder)
+
+    def refusing(path: Path, *_args: object, reason: str, **_kwargs: object) -> Path:
+        if reason == "safety":
+            msg = f"{path}: a checkpoint already exists there"
+            raise ValueError(msg)
+        return path / "manifest.json"
+
+    monkeypatch.setattr(vesper.train, "checkpoint", refusing)
+    with pytest.raises(ValueError, match="already exists"):
+        _ = train(tmp_path / "run")

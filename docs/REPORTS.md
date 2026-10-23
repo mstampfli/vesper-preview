@@ -7,6 +7,37 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-23, 11:58Z: a data source that runs out starts over instead of dropping out
+
+**What changed.** The days run trains on a mix of web text (80 %), code (15 %), Wikipedia (4 %)
+and books (1 %). At about step 226,650 the code ran out: the run had used all of its roughly 0.56
+billion code tokens, and the mixer is built to carry on with the other sources when one runs
+dry. From then on the run trained on web and Wikipedia text only. The training loss stepped up
+(about 3.42 to 3.68) at that point and the next checkpoint scored worse on the held-out text at
+every depth (fixed depth 5: perplexity 32.9 to 43.8); split by source, all of it was code (code
+perplexity on these labels 14.5 to 220, while web, books and Wikipedia improved). The run was
+sized at 7 billion tokens without comparing that with what each source holds; that was a
+planning miss. Now a run can cycle its sources (`--cycle-components`): a source that runs out
+starts again from the beginning in a new, fixed order, so the mix stays at its shares for any
+length of run. The first pass is exactly the old order, the counters and the record of what was
+read carry on across passes, and a resume continues exactly where it stopped, also after several
+restarts of a source (tested). Moving an existing run onto this recipe is one explicit, logged
+step (`--from-finite-checkpoint`), allowed only from a checkpoint taken before any source ran
+out (maintainer B's review: from a later one, cycling would silently leave that source out); without it
+the old checkpoint is refused as another recipe.
+
+**What it means for you.** A long run keeps learning from every source instead of quietly
+dropping one. Code is then seen a second time, which is normal practice for small data
+sources.
+
+**What is next.** Done on 10-23 at 13:57Z, after maintainer B's acceptance: the days run continues from
+step 225,362 (the last checkpoint before the code ran out) on this recipe; the original run and
+its later checkpoints are kept as history. For later runs: download enough data first and check
+supply against the budget before starting.
+
+**Where the details are.** docs/registry.md (`corpus.Mixer`, `train.run`); tests in
+tests/test_corpus.py and tests/test_train.py: 20 mutant variants red, the unchanged control green.
+
 ## 2026-10-23, 09:16Z: early stopping on text can now train with the model held still
 
 **What changed.** The first longer test of early stopping on web text (3000 updates from the days
@@ -29,6 +60,51 @@ joint training damaged the model.
 **What is next.** Maintainer B's code review, then the 3000-update head-only run on this box's GPU between
 checkpoint evaluations. Details: docs/registry.md (halting_text row), the days-run science export
 for maintainer B (NOTE addenda 7-11).
+
+**Update, 10-23 afternoon.** Both head-only runs are done (exploratory, one seed each, checked by
+maintainer B). The language model stayed exactly unchanged, as designed. At the original price the head
+learned to stop after about 3.1 of 8 passes, at half the price after about 4.7. The original-price
+run scored slightly better than its four random controls (by 0.0020-0.0035 nats per label); the
+half-price run scored between its four controls. Both were worse than the fixed-depth benchmark
+at the same mean depth. Average depth was still falling at the 3000-update cap. These runs show
+learned depth reduction, without a useful allocation advantage over the fixed-depth controls.
+No further run is planned on this line until it is discussed.
+
+## 2026-10-22, 16:41Z (revised 17:3xZ after maintainer B's review): a crash costs minutes, not up to an hour and a half
+
+**What changed.** On 10-22 around 16:22Z the rented 5090's host rebooted. The days run lost
+the 8749 steps (about 68 minutes) since its last checkpoint, because a run saved its state only at
+its 36 evaluated checkpoints, about 93 minutes apart, and everything between them lived only in
+GPU memory. The run resumed from that checkpoint, optimizer and data position included. Now a run
+can also make safety saves (`--safety-minutes M`): after the first step that ends M minutes or
+more after the last save, the whole resumable state is written without an evaluation, and older
+safety saves are removed (only the run's own; anything else in that folder is left alone). The
+training itself does not change, and a resume from a safety save continues exactly like one from
+a checkpoint (both tested). A failed save (a file-system error, or the writer's own error on a full or
+limited disk) or a failed cleanup is logged and training goes on (maintainer B found that all three
+stopped the run in the first version; fixed before it ever ran). The live analysis now
+also copies the two newest checkpoints' optimizer states to the home box, checked by their hash,
+so even a host that never comes back cannot take the resumable state with it.
+
+**What it means for you.** A reboot or crash costs the training since the last successful save:
+about M minutes plus one step when saving works (10 minutes for the days run, an estimated 3-5
+seconds of saving each time, under 1 % of the training; measured once it runs). A dead host costs
+the time since the last checkpoint whose optimizer reached the home box. The safety saves stay on
+the rented card; the optimizer copies are extra network transfer (about 0.5 GB per checkpoint,
+about 2 cents at the GPU provider's $0.039 per GB).
+
+**What is next.** The days run switches to safety saves by restarting from a checkpoint right
+after it is written, once maintainer B has checked the correction.
+
+**Where the details are.** docs/registry.md (`train.run`); 14 tests in tests/test_train.py,
+each mutant of the save, the cleanup and the interval red on its own test.
+
+**Update, 10-23.** After maintainer B's acceptance, the switch was armed on 10-22 at 18:50Z and
+executed at 19:37Z; the resumed training header is at 19:38Z. The selected 59 successful saves
+took about 2.4 seconds each at a target interval of 10 minutes. That successful-row selection
+does not establish that no other save failed. Scope
+(maintainer B): recovery assumes the training log stays writable; a failure of the whole volume is not
+shown survivable.
 
 ## 2026-10-21, 14:05Z: the next batch of text is prepared while the GPU trains on this one
 

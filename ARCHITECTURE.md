@@ -51,7 +51,8 @@ protocol is docs/registry.md.
                      one rename, or removed; receipts, dropped-id files and checkpoints use it
       corpus.py      parquet to documents: finalize (membership decided once, by ids, against the
                      pinned inputs), Split and select_documents, block shuffle, the mixes by byte
-                     share and by token share (Mixer: balances, pulled count, digest of the ids),
+                     share and by token share (Mixer: balances, pulled count, digest of the ids;
+                     optionally cycling a component that runs out, training only),
                      tokenization into Documents
       collect.py     the non-web components to compact parquet with provenance: code, Wikipedia,
                      books; published whole or not at all; receipts

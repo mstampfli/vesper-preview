@@ -681,12 +681,42 @@ def iter_mixed_documents(
     return mixer.documents()
 
 
+CYCLE_ORDER_RULE = "cycle-v1"
+"""How a cycling ``Mixer`` orders a component's later passes (``pass_seed``): pass 0 is the
+reader's own seeded order, pass ``p > 0`` the same reader keyed by ``pass_seed``. A change of this
+rule changes every cycling run's later passes, so it is recorded in the recipe."""
+
+
+def pass_seed(seed: int, component: str, index: int) -> int:
+    """The reader seed of a component's ``index``-th pass.
+
+    ``seed`` itself for pass 0 (the finite mixer's order, unchanged), else the first 8 bytes of
+    sha256 over the rule, the root seed, the component name and the pass number, so each
+    component and each pass gets its own order and the same inputs give the same order in every
+    process.
+
+    Raises:
+        ValueError: on a negative ``index``.
+    """
+    if index < 0:
+        msg = f"a pass index is at least 0, got {index}"
+        raise ValueError(msg)
+    if index == 0:
+        return seed
+    digest = hashlib.sha256(f"{CYCLE_ORDER_RULE}:{seed}:{component}:{index}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
 @dataclass(frozen=True)
 class MixerState:
     """Where a ``Mixer`` stands.
 
     Every reader's cursor as ``(pair, row)``, the components still active, the tokens handed out
-    per component, the documents handed out and the digest over their ids.
+    per component, the documents handed out and the digest over their ids. A cycling mixer also
+    keeps each reader's pass (``passes``) and the documents handed out in that pass so far
+    (``yielded``); empty tuples mean every reader is in pass 0 with nothing counted, which is
+    what a finite mixer (and a record written before cycling existed) stands at; ``restore``
+    then takes ``yielded`` as 1 for every component with a balance (see there).
     """
 
     cursors: tuple[tuple[int, int], ...]
@@ -694,6 +724,49 @@ class MixerState:
     emitted: dict[str, int]
     pulled: int
     digest: str
+    passes: tuple[int, ...] = ()
+    yielded: tuple[int, ...] = ()
+
+
+def _checked_passes(
+    components: Sequence[Component], state: MixerState, *, cycle: bool
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """A state's passes and per-pass hand-out counts, checked for a (cycling) mixer.
+
+    A record without passes (a finite run's, or one written before cycling existed) stands in
+    pass 0 everywhere, so a component's balance is its pass-0 hand-out: whether that pass handed
+    out anything, which is all ``yielded`` decides, follows from it exactly.
+
+    Raises:
+        ValueError: on passes or counts of another length or below zero, a finite mixer asked to
+            stand past pass 0, or a cycling mixer asked to continue a finite run-out (a component
+            out of the mix after handing out documents: a cycling mixer drops one only after a
+            pass that handed out nothing, and a finite history that already dropped it differs
+            from any cycling one; maintainer B bba62d1).
+    """
+    passes = state.passes or (0,) * len(components)
+    yielded = (
+        state.yielded
+        if state.passes
+        else tuple(int(state.emitted.get(c.name, 0) > 0) for c in components)
+    )
+    if len(passes) != len(components) or len(yielded) != len(components):
+        msg = f"mixer state holds passes for {len(passes)} and counts for {len(yielded)} readers"
+        raise ValueError(msg)
+    if any(p < 0 for p in passes) or any(y < 0 for y in yielded):
+        msg = f"mixer state holds a negative pass or count: {passes}, {yielded}"
+        raise ValueError(msg)
+    if not cycle and any(passes):
+        msg = f"mixer state stands past pass 0 ({passes}); only a cycling mixer restores it"
+        raise ValueError(msg)
+    dropped = [c.name for i, c in enumerate(components) if i not in state.active and yielded[i]]
+    if cycle and dropped:
+        msg = (
+            f"mixer state has {dropped} out of the mix after handing out documents (a finite"
+            " run-out); cycling cannot continue from it: use a checkpoint from before"
+        )
+        raise ValueError(msg)
+    return passes, yielded
 
 
 class Mixer:
@@ -708,6 +781,12 @@ class Mixer:
     state; ``replay`` (pulling without yielding) stays as the test oracle that a restored mixer
     hands out the same documents as the uninterrupted one.
 
+    ``cycle`` (training only; held-out streams stay finite): a component that runs out starts
+    its next pass in a new order (``pass_seed``) instead of leaving the mix, so the shares hold
+    for any budget. The balances, the count and the digest run on across passes; a pass that
+    handed out no document (an empty or wholly filtered component) ends the component as the
+    finite mixer would, so nothing spins. Without ``cycle`` the mixer is the finite one exactly.
+
     Raises:
         ValueError: on no components, a share that is not positive or shares that do not sum to
             one.
@@ -721,6 +800,7 @@ class Mixer:
         split: Split,
         *,
         tokens_emitted: dict[str, int] | None = None,
+        cycle: bool = False,
     ) -> None:
         """Open one seeded reader per component; nothing is pulled yet."""
         _check_shares(components)
@@ -728,11 +808,15 @@ class Mixer:
         for c in components:
             _ = emitted.setdefault(c.name, 0)
         self.components: Sequence[Component] = components
+        self.seed: int = seed
         self.tokenizer: Tokenizer = tokenizer
         self.split: Split = split
+        self.cycle: bool = cycle
         self.emitted: dict[str, int] = emitted
         self.pulled: int = 0
         self.readers: list[RawReader] = [RawReader(c.paths, seed) for c in components]
+        self.passes: list[int] = [0] * len(components)
+        self.yielded: list[int] = [0] * len(components)
         self.active: list[int] = list(range(len(components)))
         self._digest: SequenceDigest = SequenceDigest()
 
@@ -746,14 +830,20 @@ class Mixer:
         state: MixerState,
         *,
         tokens_emitted: dict[str, int] | None = None,
+        cycle: bool = False,
     ) -> "Mixer":
         """A mixer standing where ``state`` says, over the same components, seed and split.
 
+        Each reader opens in its stored pass's order and seeks within that pass; no earlier pass
+        is replayed.
+
         Raises:
             ValueError: when the state has another number of readers, names an unknown
-                component, or a cursor lies outside its reader (``RawReader.seek``).
+                component, holds a pass or count outside the readers or below zero, stands past
+                pass 0 for a finite mixer, or a cursor lies outside its reader
+                (``RawReader.seek``).
         """
-        mixer = cls(components, seed, tokenizer, split, tokens_emitted=tokens_emitted)
+        mixer = cls(components, seed, tokenizer, split, tokens_emitted=tokens_emitted, cycle=cycle)
         if len(state.cursors) != len(mixer.readers):
             msg = (
                 f"mixer state has {len(state.cursors)} readers, the components {len(mixer.readers)}"
@@ -763,8 +853,14 @@ class Mixer:
         if set(state.emitted) - names or any(not 0 <= i < len(components) for i in state.active):
             msg = f"mixer state names components outside {sorted(names)}"
             raise ValueError(msg)
+        passes, yielded = _checked_passes(components, state, cycle=cycle)
+        for index, c in enumerate(components):
+            if passes[index]:
+                mixer.readers[index] = RawReader(c.paths, pass_seed(seed, c.name, passes[index]))
         for reader, (pair, row) in zip(mixer.readers, state.cursors, strict=True):
             reader.seek(ReaderCursor(pair=pair, row=row))
+        mixer.passes = list(passes)
+        mixer.yielded = list(yielded)
         mixer.active = list(state.active)
         for name, count in state.emitted.items():
             mixer.emitted[name] = count
@@ -781,6 +877,8 @@ class Mixer:
             emitted=dict(self.emitted),
             pulled=self.pulled,
             digest=self.digest(),
+            passes=tuple(self.passes),
+            yielded=tuple(self.yielded),
         )
 
     def ratio(self, index: int) -> float:
@@ -793,16 +891,27 @@ class Mixer:
             index = min(self.active, key=self.ratio)
             raw = self._next_kept(index)
             if raw is None:
-                self.active.remove(index)
+                if self.cycle and self.yielded[index] > 0:
+                    self._next_pass(index)
+                else:
+                    self.active.remove(index)
                 continue
             if not raw.text:
                 continue
             tokens = self.tokenizer.encode(raw.text)
             self.emitted[self.components[index].name] += int(tokens.numel())
+            self.yielded[index] += 1
             self.pulled += 1
             self._digest.add(raw.doc_id.encode("utf-8"))
             return Document(doc_id=raw.doc_id, tokens=tokens, source=self.components[index].name)
         return None
+
+    def _next_pass(self, index: int) -> None:
+        """Start the component's next pass: a fresh reader in that pass's order, nothing yielded."""
+        c = self.components[index]
+        self.passes[index] += 1
+        self.yielded[index] = 0
+        self.readers[index] = RawReader(c.paths, pass_seed(self.seed, c.name, self.passes[index]))
 
     def _next_kept(self, index: int) -> RawDocument | None:
         """The component's next document on the split's side, or None when it is out."""

@@ -21,6 +21,8 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -47,6 +49,7 @@ from vesper.column import (
 )
 from vesper.config import VesperConfig, load
 from vesper.corpus import (
+    CYCLE_ORDER_RULE,
     FINALIZE_RULE,
     SPLIT_RULE,
     Component,
@@ -219,6 +222,11 @@ class Recipe:
     record goes into the run header and ``train.json``: a run under another recipe is a labeled
     fork, never a continuation (maintainer B's review of b797837: another seed from the same
     checkpoint passed a count check over equal-length documents and diverged).
+
+    ``component_passes`` is "finite" (a component that runs out leaves the mix) or the cycling
+    rule (``corpus.CYCLE_ORDER_RULE``: it starts again in a new order). The finite value is left
+    out of the plain record (``_plain``), so a finite recipe's record and hash are the ones
+    written before the field existed and every finite checkpoint stays resumable as it was.
     """
 
     seed: int
@@ -229,6 +237,7 @@ class Recipe:
     split_rule: str
     schema: int
     objective: str
+    component_passes: str = "finite"
 
 
 @dataclass(frozen=True)
@@ -828,6 +837,47 @@ def _check_objective(objective: str) -> None:
         raise ValueError(msg)
 
 
+# a safety save's directory name: the run's id (UTC stamp to the microsecond, pid), then the step
+_SAFETY_SAVE_NAME = re.compile(r"\d{8}T\d{12}Z-\d+-step-\d+")
+
+
+def _remove_older_safety_saves(safety: Path, keep: Path) -> tuple[list[str], str | None]:
+    """Remove the safety saves in ``safety`` other than ``keep``, never raising.
+
+    Returns the removed names and the error that stopped the cleanup (None when it finished).
+    Owned entries only: a real directory (not a symlink) whose name is a safety save's
+    (``_SAFETY_SAVE_NAME``). Anything else there stays: staging directories, an operator's files
+    and directories. A failure while listing or removing stops the cleanup and is returned, never
+    raised, because ``keep`` is already published: the caller reports it and trains on, and the
+    saves left over are removed by a later cleanup.
+
+    Not for: evaluated checkpoints (immutable, never removed by the run).
+    """
+    removed: list[str] = []
+    try:
+        for entry in sorted(safety.iterdir()):
+            owned = _SAFETY_SAVE_NAME.fullmatch(entry.name) is not None
+            if entry == keep or not owned or entry.is_symlink() or not entry.is_dir():
+                continue
+            shutil.rmtree(entry)
+            removed.append(entry.name)
+    except OSError as error:
+        return removed, f"{type(error).__name__}: {error}"
+    return removed, None
+
+
+def _check_safety_seconds(safety_seconds: float | None) -> None:
+    if safety_seconds is not None and not 0 < safety_seconds < math.inf:
+        msg = f"safety_seconds must be a positive finite number of seconds, got {safety_seconds}"
+        raise ValueError(msg)
+
+
+def _check_transition(*, cycle: bool, from_finite: bool, resume: Path | None) -> None:
+    if from_finite and not (cycle and resume is not None):
+        msg = "from_finite is the transition of a resumed finite run to cycling: it needs both"
+        raise ValueError(msg)
+
+
 def _state_record(states: Sequence[ColumnState]) -> list[dict[str, object]]:
     return [
         {
@@ -924,7 +974,8 @@ def checkpoint(  # noqa: PLR0913
     the mixer's state (the readers' cursors, balances and digest: what a resume continues from
     at bounded cost; None only in unit tests that step over plain iterators, and such a
     checkpoint cannot be resumed by ``run``); ``train.json`` the progress, the identity, the
-    recipe, the layout, the reason (``interval``, ``budget``, ``steps`` or ``exhausted``) and the
+    recipe, the layout, the reason (``interval``, ``budget``, ``steps``, ``exhausted`` or
+    ``safety``) and the
     label; ``manifest.json`` the sha256 of each file. The directory is staged and published by
     one rename (``publish.staged``), so a failed save leaves nothing at ``path`` and a retry is
     not refused. Returns the manifest's path.
@@ -1053,6 +1104,9 @@ def _mixer_from_record(record: dict[str, object]) -> MixerState:
         emitted=dict(cast("dict[str, int]", record["emitted"])),
         pulled=cast("int", record["pulled"]),
         digest=cast("str", record["digest"]),
+        # absent in records written before cycling existed: pass 0 everywhere (MixerState)
+        passes=tuple(int(p) for p in cast("list[int]", record.get("passes", []))),
+        yielded=tuple(int(y) for y in cast("list[int]", record.get("yielded", []))),
     )
 
 
@@ -1174,12 +1228,17 @@ def resumed_components(data: Path, resume: Path) -> list[Component]:
 
 
 def recipe_of(
-    parts: Sequence[Component], seed: int, cfg: VesperConfig, objective: str = "act"
+    parts: Sequence[Component],
+    seed: int,
+    cfg: VesperConfig,
+    objective: str = "act",
+    *,
+    cycle: bool = False,
 ) -> Recipe:
     """The run's recipe.
 
     The seed, the ordered components with their shares and generation pins, the split, the rules,
-    the training objective.
+    the training objective, and whether the training mix cycles its components.
     """
     return Recipe(
         seed=seed,
@@ -1190,6 +1249,7 @@ def recipe_of(
         split_rule=SPLIT_RULE,
         schema=CHECKPOINT_SCHEMA,
         objective=objective,
+        component_passes=CYCLE_ORDER_RULE if cycle else "finite",
     )
 
 
@@ -1229,6 +1289,8 @@ def _plain(
     # through JSON and back, so tuples become lists and the result compares equal to a record
     # read from train.json
     plain = cast("dict[str, object]", asdict(value))
+    if isinstance(value, Recipe) and value.component_passes == "finite":
+        del plain["component_passes"]  # the record and hash a finite recipe always had
     return cast("dict[str, object]", json.loads(json.dumps(plain)))
 
 
@@ -1261,6 +1323,22 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="compute the head and the loss over this many position slices: same objective",
+    )
+    _ = parser.add_argument(
+        "--safety-minutes",
+        type=float,
+        default=None,
+        help="also save the resumable state (no evaluation, newest only, out/safety) this often",
+    )
+    _ = parser.add_argument(
+        "--cycle-components",
+        action="store_true",
+        help="a training component that runs out starts again in a new order (part of the recipe)",
+    )
+    _ = parser.add_argument(
+        "--from-finite-checkpoint",
+        action="store_true",
+        help="with --cycle-components and --resume: the recorded transition from a finite run",
     )
     _ = parser.add_argument(
         "--scan",
@@ -1301,8 +1379,31 @@ def run(  # noqa: C901, PLR0913, PLR0915
     slices: int = 1,
     scan: str = "reference",
     objective: str = "act",
+    safety_seconds: float | None = None,
+    cycle: bool = False,
+    from_finite: bool = False,
 ) -> Path:
     """The run: streams, schedule, steps, log lines, checkpoints with evaluations.
+
+    ``cycle`` makes the training mix start a component that runs out again in a new order
+    (``corpus.Mixer``, ``CYCLE_ORDER_RULE``) instead of dropping it, so the shares hold for any
+    budget; it is part of the recipe and so of the identity, and the held-out stream stays
+    finite. ``from_finite`` (with ``cycle`` and ``resume`` only) is the one recorded transition
+    from a finite run: the checkpoint is checked against the identity of the SAME recipe with
+    finite passes, not against the cycling one, and the run line names it (``transition``);
+    every checkpoint after it carries the cycling identity. Without it, a finite checkpoint
+    under ``cycle`` is refused like any other identity mismatch.
+
+    ``safety_seconds`` (None: off) adds safety saves between the evaluated checkpoints. The
+    interval is checked after each step: the first step that ends at least that much wall time
+    after the last save of either kind writes its full resumable state without an evaluation to
+    ``out/safety/<run_id>-step-<n>`` (a target cadence: a save lands up to one step later, and a
+    failed save moves the next attempt one interval on). After a successful save the older
+    safety saves there are removed (``_remove_older_safety_saves``: owned entries only); a
+    failed cleanup is reported on the save's line (``cleanup_error``) and the run trains on. A
+    failed save is logged (``safety_failed``), the previous one kept, and the run trains on. So
+    a crash loses the training since the last SUCCESSFUL save. A safety save resumes like any
+    checkpoint. It is no part of the recipe (it changes no training).
 
     ``objective`` (``OBJECTIVES``, ``step``) is part of the run's recipe and so of its identity:
     the run line records it and ``restore`` refuses a checkpoint of another objective. Every
@@ -1333,10 +1434,19 @@ def run(  # noqa: C901, PLR0913, PLR0915
     if micro < 1 or t.batch_chunks % micro != 0:
         msg = f"micro_chunks must divide batch_chunks ({t.batch_chunks}), got {micro}"
         raise ValueError(msg)
+    _check_safety_seconds(safety_seconds)
+    _check_transition(cycle=cycle, from_finite=from_finite, resume=resume)
     finalization = load_finalization(finalization_receipt)
     check_inputs(finalization, parts)
-    recipe = recipe_of(parts, seed, cfg, objective)
+    recipe = recipe_of(parts, seed, cfg, objective, cycle=cycle)
     identity = identity_of(tokenizer_path, config_path, finalization_receipt, recipe)
+    # the identity the checkpoint must carry: the finite recipe's for the recorded transition
+    finite = recipe_of(parts, seed, cfg, objective)
+    parent = (
+        identity_of(tokenizer_path, config_path, finalization_receipt, finite)
+        if from_finite
+        else identity
+    )
     layout = Layout(groups=t.batch_chunks // micro, slots=micro)
     # every random choice goes through an explicit generator: the model's initialization here,
     # the corpus order through the seed; nothing reads torch's global generator. The scan is
@@ -1358,7 +1468,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
     split = Split(finalization, t.held_out_fraction)
     held = Split(finalization, t.held_out_fraction, held_out=True)
     counts: dict[str, int] = {}
-    mixer = Mixer(parts, seed, tokenizer, split, tokens_emitted=counts)
+    mixer = Mixer(parts, seed, tokenizer, split, tokens_emitted=counts, cycle=cycle)
     progress = Progress(
         step=0,
         tokens_seen=0,
@@ -1376,14 +1486,16 @@ def run(  # noqa: C901, PLR0913, PLR0915
             for _ in range(layout.groups)
         ]
     else:
-        restored = restore(resume, model, opt, identity, layout)
+        restored = restore(resume, model, opt, parent, layout)
         progress = restored.progress
         if restored.mixer is None:
             msg = f"{resume}: the checkpoint holds no mixer state; it cannot be resumed"
             raise ValueError(msg)
         # bounded cost: the readers seek to their cursors, the digest continues from its state;
         # the three records of the same facts (mixer state, progress, streams) must agree
-        mixer = Mixer.restore(parts, seed, tokenizer, split, restored.mixer, tokens_emitted=counts)
+        mixer = Mixer.restore(
+            parts, seed, tokenizer, split, restored.mixer, tokens_emitted=counts, cycle=cycle
+        )
         taken = sum(s.documents_taken for s in restored.streams)
         if (
             mixer.digest() != progress.documents_sha256
@@ -1416,6 +1528,12 @@ def run(  # noqa: C901, PLR0913, PLR0915
             "objective": objective,
             "device": str(device),
             "resumed_from": str(resume) if resume else None,
+            "transition": (
+                {"from": "finite", "to": recipe.component_passes, "parent_identity": _plain(parent)}
+                if from_finite
+                else None
+            ),
+            "safety_seconds": safety_seconds,
             "environment": environment(),
         }
     )
@@ -1445,8 +1563,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
         for group in groups:
             group.draw_ahead()
 
-    def save(reason: str) -> None:
-        nonlocal checkpointed_at
+    def write(where: Path, reason: str) -> None:
         mixer_state, emitted, digest = handed_out()
         current = Progress(
             step=step_index,
@@ -1455,10 +1572,53 @@ def run(  # noqa: C901, PLR0913, PLR0915
             tokens_consumed=dict(consumed),
             documents_sha256=digest,
         )
-        where = out / f"step-{step_index}"
         _ = checkpoint(
             where, model, opt, groups, current, identity, recipe, reason=reason, mixer=mixer_state
         )
+
+    safety = out / "safety"
+    saved_at = time.monotonic()  # the last save of either kind, for the safety interval
+
+    def safety_save() -> None:
+        nonlocal saved_at
+        due = safety_seconds is not None and time.monotonic() - saved_at >= safety_seconds
+        if not due or step_index == checkpointed_at:  # an evaluated checkpoint was just saved
+            return
+        where = safety / f"{run_id}-step-{step_index}"
+        started = time.monotonic()
+        try:
+            safety.mkdir(exist_ok=True)
+            write(where, "safety")
+        # the serialization boundary only: the file system raises OSError, torch.save's writer a
+        # RuntimeError (maintainer B 8d6c1c7: a real file-size limit, inline_container.cc); the
+        # staged directory is never published, the previous safety save stays and the run goes on
+        except (OSError, RuntimeError) as error:
+            emit(
+                {
+                    "kind": "safety_failed",
+                    "step": step_index,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            )
+        else:
+            # the new save is published: a failed cleanup is reported with it, never raised
+            removed, cleanup_error = _remove_older_safety_saves(safety, where)
+            emit(
+                {
+                    "kind": "safety",
+                    "step": step_index,
+                    "path": str(where),
+                    "seconds": time.monotonic() - started,
+                    "removed": removed,
+                    "cleanup_error": cleanup_error,
+                }
+            )
+        saved_at = time.monotonic()
+
+    def save(reason: str) -> None:
+        nonlocal checkpointed_at, saved_at
+        where = out / f"step-{step_index}"
+        write(where, reason)
         checkpointed_at = step_index
         chunks = held_out_chunks(parts, seed, tokenizer, held, micro, cfg)
         # captured on CUDA; built per checkpoint so their memory is not held while training
@@ -1488,6 +1648,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
                 "training_t_max": training_passes,
             }
         )
+        saved_at = time.monotonic()  # after the evaluation: the safety interval counts training
 
     def stopped() -> str | None:
         if tokens_seen >= t.total_tokens:
@@ -1549,6 +1710,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
         if tokens_seen >= next_checkpoint:
             next_checkpoint += every
             save("interval")
+        safety_save()
     if step_index != checkpointed_at:
         save(reason)
     emit(
@@ -1607,6 +1769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     legacy_layout = cast("bool", args.legacy_layout)
     web = cast("Path | None", args.web)
     mix = cast("Path | None", args.mix)
+    safety_minutes = cast("float | None", args.safety_minutes)
     try:
         if (
             resume is not None
@@ -1634,6 +1797,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             resume=resume,
             seed=cast("int", args.seed),
             device=device,
+            safety_seconds=None if safety_minutes is None else safety_minutes * 60,
+            cycle=cast("bool", args.cycle_components),
+            from_finite=cast("bool", args.from_finite_checkpoint),
         )
     except (RuntimeError, ValueError, TypeError):
         log.exception("stopped")

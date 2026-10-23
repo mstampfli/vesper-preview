@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -27,6 +28,7 @@ from vesper.corpus import (
     iter_raw_documents,
     iter_training_texts,
     load_finalization,
+    pass_seed,
 )
 from vesper.data import is_held_out
 from vesper.keys import dedup_key
@@ -449,6 +451,161 @@ def test_mixed_documents_track_token_shares_and_resume_by_skipping(
     train = list(iter_mixed_documents(parts, 0, tok, halves))
     assert len(held) + len(train) == 42
     assert {d.doc_id for d in held}.isdisjoint({d.doc_id for d in train})
+
+
+def ids_of(mixer: Mixer, count: int) -> list[str]:
+    out: list[str] = []
+    for _ in range(count):
+        document = mixer.pull()
+        assert document is not None
+        out.append(document.doc_id)
+    return out
+
+
+def test_a_cycling_mixer_starts_an_exhausted_component_again_and_keeps_the_shares(
+    tmp_path: Path, tok: Tokenizer
+) -> None:
+    # a: 40 documents at 3/4, b: 2 documents at 1/4 (b1 is a's duplicate): the finite mixer hands
+    # out 42 and drops b after its second; the cycling one keeps both in the mix for any length
+    parts, training = mixed_components(tmp_path)
+    finite = [d.doc_id for d in iter_mixed_documents(parts, 0, tok, training)]
+    assert len(finite) == 42
+    cycling = Mixer(parts, 0, tok, training, cycle=True)
+    seen = ids_of(cycling, 400)
+    a_seen = [i for i in seen if i.startswith("a")]
+    b_seen = [i for i in seen if i.startswith("b")]
+    # pass 0 is the finite order exactly, per component and up to b's first run-out overall
+    assert a_seen[:40] == [i for i in finite if i.startswith("a")]
+    assert b_seen[:2] == [i for i in finite if i.startswith("b")]
+    first_wrap = [k for k, i in enumerate(seen) if i.startswith("b")][2]  # b's third hand-out
+    assert seen[:first_wrap] == finite[:first_wrap]
+    # every later pass is a whole pass over the same kept documents, in its own order
+    for p in range(len(a_seen) // 40):
+        assert sorted(a_seen[40 * p : 40 * (p + 1)]) == sorted(a_seen[:40])
+    for p in range(len(b_seen) // 2):
+        assert sorted(b_seen[2 * p : 2 * (p + 1)]) == ["b0", "b2"]
+    assert a_seen[40:80] != a_seen[:40]
+    assert cycling.passes == [len(a_seen) // 40, (len(b_seen) - 1) // 2]
+    assert cycling.passes[1] >= 3  # b wrapped several times
+    # the balances run on across passes (never reset): every handed-out token counted once, and
+    # the realized token shares track 3:1 at document granularity
+    lengths = {d.doc_id: int(d.tokens.numel()) for d in Mixer(parts, 0, tok, training).documents()}
+    assert cycling.emitted == {
+        "a": sum(lengths[i] for i in a_seen),
+        "b": sum(lengths[i] for i in b_seen),
+    }
+    share_a = cycling.emitted["a"] / (cycling.emitted["a"] + cycling.emitted["b"])
+    assert abs(share_a - 0.75) < max(lengths.values()) / sum(cycling.emitted.values())
+    assert cycling.pulled == 400
+    # deterministic in the root seed: the same seed gives the same order, another seed another
+    again = Mixer(parts, 0, tok, training, cycle=True)
+    again.replay(400)
+    assert again.digest() == cycling.digest()
+    other = Mixer(parts, 1, tok, training, cycle=True)
+    other.replay(400)
+    assert other.digest() != cycling.digest()
+    # the finite default is unchanged: it ends after 42
+    plain = Mixer(parts, 0, tok, training)
+    plain.replay(400)
+    assert plain.pulled == 42
+    assert plain.pull() is None
+    assert pass_seed(7, "a", 0) == 7
+    assert len({pass_seed(7, name, p) for name in ("a", "b") for p in (1, 2, 3)}) == 6
+    with pytest.raises(ValueError, match="at least 0"):
+        _ = pass_seed(7, "a", -1)
+
+
+def test_a_cycling_mixer_resumes_on_both_sides_of_a_run_out_and_across_wraps(
+    tmp_path: Path, tok: Tokenizer
+) -> None:
+    parts, training = mixed_components(tmp_path)
+    straight = Mixer(parts, 0, tok, training, cycle=True)
+    whole = ids_of(straight, 300)
+    for cut in (1, 3, 4, 41, 57, 120, 199):  # before b's first run-out, at it, after several
+        before = Mixer(parts, 0, tok, training, cycle=True)
+        assert ids_of(before, cut) == whole[:cut]
+        state = before.state()
+        restored = Mixer.restore(parts, 0, tok, training, state, cycle=True)
+        assert restored.passes == before.passes
+        assert restored.digest() == before.digest()
+        assert ids_of(restored, 300 - cut) == whole[cut:]
+        assert restored.emitted == straight.emitted
+        assert restored.digest() == straight.digest()
+        assert restored.pulled == straight.pulled
+        assert restored.passes == straight.passes
+    late = Mixer(parts, 0, tok, training, cycle=True)
+    late.replay(120)
+    state = late.state()
+    assert any(state.passes)
+    # a state past pass 0 is a cycling mixer's: a finite restore refuses it
+    with pytest.raises(ValueError, match="only a cycling"):
+        _ = Mixer.restore(parts, 0, tok, training, state)
+    with pytest.raises(ValueError, match="passes for 1"):
+        _ = Mixer.restore(
+            parts, 0, tok, training, replace(state, passes=(1,), yielded=(0,)), cycle=True
+        )
+    with pytest.raises(ValueError, match="negative"):
+        _ = Mixer.restore(parts, 0, tok, training, replace(state, passes=(0, -1)), cycle=True)
+
+
+def test_a_finite_state_continues_under_cycling_as_a_cycling_run_would(
+    tmp_path: Path, tok: Tokenizer
+) -> None:
+    # the recorded transition: a finite mixer's state (as a record from before cycling existed,
+    # without passes or counts) restored under cycling continues exactly as a mixer that cycled
+    # from the start, including b's run-out right after the cut
+    parts, training = mixed_components(tmp_path)
+    cycling = Mixer(parts, 0, tok, training, cycle=True)
+    whole = ids_of(cycling, 200)
+    # right after b's last pass-0 document: the next b pull meets its end at once, and only the
+    # pass-0 hand-out the old record implies lets it start again rather than leave
+    after_last_b = [k for k, i in enumerate(whole) if i.startswith("b")][1] + 1
+    for cut in (0, 1, after_last_b):
+        finite = Mixer(parts, 0, tok, training)
+        finite.replay(cut)
+        full = finite.state()
+        old = MixerState(full.cursors, full.active, full.emitted, full.pulled, full.digest)
+        restored = Mixer.restore(parts, 0, tok, training, old, cycle=True)
+        assert ids_of(restored, 200 - cut) == whole[cut:]
+        assert restored.digest() == cycling.digest()
+    # after the finite mixer has DROPPED b (a run-out), cycling cannot continue from the state: it
+    # is refused in both record formats rather than silently leaving b out (maintainer B bba62d1);
+    # the finite restore of the same state still works
+    finite = Mixer(parts, 0, tok, training)
+    while 1 in finite.active:
+        assert finite.pull() is not None
+    dropped = finite.state()
+    legacy = MixerState(
+        dropped.cursors, dropped.active, dropped.emitted, dropped.pulled, dropped.digest
+    )
+    for state in (dropped, legacy):
+        with pytest.raises(ValueError, match="finite run-out"):
+            _ = Mixer.restore(parts, 0, tok, training, state, cycle=True)
+        assert Mixer.restore(parts, 0, tok, training, state).pulled == dropped.pulled
+
+
+def test_an_empty_or_wholly_filtered_component_leaves_a_cycling_mix_instead_of_spinning(
+    tmp_path: Path, tok: Tokenizer
+) -> None:
+    parts, _ = mixed_components(tmp_path)
+    empty = tmp_path / "empty.parquet"
+    pq.write_table(pa.Table.from_pydict({"id": ["e0", "e1"], "text": ["", ""]}), str(empty))
+    with_empty = [
+        Component("a", parts[0].paths, 0.5),
+        Component("b", parts[1].paths, 0.25),
+        Component("e", (empty,), 0.25),
+    ]
+    training = Split(finalize(with_empty, tmp_path / "fin3"), 0.0)
+    mixer = Mixer(with_empty, 0, tok, training, cycle=True)
+    seen = ids_of(mixer, 100)
+    assert not [i for i in seen if i.startswith("e")]
+    assert 2 not in mixer.active  # the empty component left after one pass that handed out none
+    alone = [Component("e", (empty,), 1.0)]
+    only = Mixer(alone, 0, tok, Split(finalize(alone, tmp_path / "fin4"), 0.0), cycle=True)
+    assert only.pull() is None  # terminates
+    # wholly filtered: every document of b on the held-out side of a split
+    held_all = Split(finalize(parts, tmp_path / "fin5"), 1.0)
+    assert Mixer(parts, 0, tok, held_all, cycle=True).pull() is None
 
 
 def test_a_reader_continues_from_its_cursor(tmp_path: Path) -> None:
