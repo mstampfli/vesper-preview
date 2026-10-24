@@ -7,6 +7,66 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-24, 17:11Z: the days run finished: 427,000 steps, held-out perplexity 25.3
+
+**What changed.** This Vesper run used d1024 and 64 M parameters,
+recurrent memory restarted at mixed intervals per slot, 427,000 steps (about 7 billion tokens of
+web text, code, Wikipedia and books) on one rented RTX 5090, from 10-22 02:42Z to 10-24 16:42Z,
+with CUDA-graph training after warm-up. It was repaired once on the way: at step 226,650 the code
+ran out (entry of 10-23, 11:58Z), and from step 225,362 it continued on the cycling recipe.
+Held-out perplexity at a fixed 5 passes, the measurement that stays comparable across
+checkpoints:
+
+| step | repaired run | original run (code ran out) |
+|---|---|---|
+| 225,362 (before the run-out) | 32.88 | 32.88 |
+| 237,223 | 31.94 | 43.77 |
+| 249,084 | 31.07 | 43.83 |
+| 260,945 | 31.13 | (stopped) |
+| 272,806 | 30.03 | |
+| 284,667 | 29.44 | |
+| 296,528 | 29.06 | |
+| 308,389 | 29.42 | |
+| 320,250 | 28.38 | |
+| 332,112 | 27.93 | |
+| 343,973 | 27.47 | |
+| 355,834 | 26.56 | |
+| 367,695 | 26.59 | |
+| 379,556 | 26.20 | |
+| 391,417 | 25.71 | |
+| 403,278 | 25.31 | |
+| 415,139 | 25.39 | |
+| 427,000 (final) | 25.26 | |
+
+Per source at depth 5 (web, books, code and Wikipedia, measured at 237,223, 249,084, 260,945
+and 272,806): at 237,223 all four were better than before the run-out, at 272,806 all four were
+better than at 249,084, and 260,945 was a mixed move (code better, the other three slightly
+worse). Five passes beat one by about 0.32 to 0.34 nats at every checkpoint of the repaired run,
+and depth 5 is the best fixed depth at the final step too (3.2293 nats; 3.5590 at one pass). A
+separate policy evaluation on the analysis box gives 25.25 when cold at the start and 25.40 when
+initialized from the saved training state. These policy measurements are distinct from the
+fixed-depth-5 score. Cost: about $55 for the whole rental up to the run's end, estimated as
+hours times the rental's on-demand rate of $0.686/h: the card was rented on 10-21 at 08:31Z and
+this run ended on 10-24 at 16:42Z, about 80.2 hours. The rental is longer than this run (about
+62 hours) because the same card first ran the earlier text runs of 10-21 and the first days run
+of 10-22; about $0.10 of failed starts on other cards comes on top.
+
+**What it means for you.** The repaired trajectory improved overall through the remaining
+201,638 updates, with four upward checkpoint moves (260,945, 308,389, 367,695 and 415,139).
+The selected generation examples show recognizable English and answer/list/code formatting,
+but also factual errors and repetition. These examples are not a systematic factuality or
+instruction-following evaluation. This run does not establish a model-size requirement for
+instruction following; whether instruction tuning helps this checkpoint remains untested.
+
+**What is next.** Your call on the rented card (it stays until you say). The next jobs are not
+ready to run: the instruction-tuning test on the final model has to be built first, and phase 2
+of adaptive stopping on text needs a discussion with maintainer B. The final model, its memory state and
+its optimizer are kept on the analysis box, so training can continue from here later.
+
+**Where the details are.** The run's logs and every checkpoint of the repaired run (the final
+one with its optimizer) on the analysis box, each copy checked against the run's manifest; the
+evidence receipts with the component splits; the entry of 10-23, 11:58Z for the repair.
+
 ## 2026-10-23, 11:58Z: a data source that runs out starts over instead of dropping out
 
 **What changed.** The days run trains on a mix of web text (80 %), code (15 %), Wikipedia (4 %)
