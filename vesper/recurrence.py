@@ -1,4 +1,7 @@
-"""Recurrent core: the gated delta-rule fast-weight state (spec 3a), reference implementation.
+"""Recurrent core: the delta-rule fast-weight state (spec 3a), reference implementation.
+
+There is no decay gate (the "gated" delta rule's alpha): the state changes only through the
+write below, so nothing fades with time alone.
 
 Pure PyTorch and deliberately simple: the Triton kernels are tested against this file, never
 the other way around. Per head the state is a matrix ``H`` of shape ``[dk, dk]`` read as

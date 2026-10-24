@@ -47,12 +47,13 @@ from vesper.column import (
     state_tensors,
     with_state_tensors,
 )
-from vesper.config import VesperConfig, load
+from vesper.config import VesperConfig, load, parse_bytes
 from vesper.corpus import (
     CYCLE_ORDER_RULE,
     FINALIZE_RULE,
     SPLIT_RULE,
     Component,
+    Finalization,
     Mixer,
     MixerState,
     Split,
@@ -70,7 +71,7 @@ from vesper.graphs import (
     reset_memory_peak,
     signature,
 )
-from vesper.keys import file_sha256, verified_bytes
+from vesper.keys import file_sha256, hashed_bytes, verified_bytes
 from vesper.learning import LossWeights, check_mode
 from vesper.loop import DenseRule, HaltingHead
 from vesper.model import Vesper
@@ -872,6 +873,32 @@ def _check_safety_seconds(safety_seconds: float | None) -> None:
         raise ValueError(msg)
 
 
+def _read_inputs(
+    tokenizer_path: Path, config_path: Path, finalization_receipt: Path, cfg: VesperConfig
+) -> tuple[bytes, Finalization, tuple[str, str, str]]:
+    """The tokenizer's bytes, the finalization and the three files' hashes, one snapshot each.
+
+    The tokenizer and config are each read once here. The caller parses those tokenizer bytes;
+    the config bytes must parse to the supplied ``cfg``. The receipt is read for its hash, then
+    reread with that hash verified before parsing (``load_finalization``). Thus parsed content
+    and recorded identity stay bound even though the receipt has two reads (maintainer B's
+    identity_of follow-up of 10-21: the identity hashed paths independently of the content the run
+    used).
+
+    Raises:
+        ValueError: when the config file no longer parses to ``cfg``, or the receipt changes
+            between its hash and its parse.
+    """
+    tokenizer_bytes, tokenizer_sha256 = hashed_bytes(tokenizer_path)
+    config_bytes, config_sha256 = hashed_bytes(config_path)
+    if parse_bytes(config_bytes, str(config_path)) != cfg:
+        msg = f"{config_path}: changed since it was parsed for this run"
+        raise ValueError(msg)
+    _, finalization_sha256 = hashed_bytes(finalization_receipt)
+    finalization = load_finalization(finalization_receipt, sha256=finalization_sha256)
+    return tokenizer_bytes, finalization, (tokenizer_sha256, config_sha256, finalization_sha256)
+
+
 def _check_transition(*, cycle: bool, from_finite: bool, resume: Path | None) -> None:
     if from_finite and not (cycle and resume is not None):
         msg = "from_finite is the transition of a resumed finite run to cycling: it needs both"
@@ -1254,14 +1281,18 @@ def recipe_of(
 
 
 def identity_of(
-    tokenizer_path: Path, config_path: Path, finalization_receipt: Path, recipe: Recipe
+    tokenizer_sha256: str, config_sha256: str, finalization_sha256: str, recipe: Recipe
 ) -> Identity:
-    """The hashes of the three files a run reads and of its recipe."""
+    """The identity of a run: the hashes of the three files it read and of its recipe.
+
+    The caller hashes the bytes it actually parses (``keys.hashed_bytes``), so the identity
+    describes what the run used, never a later read of the same paths.
+    """
     canonical = json.dumps(_plain(recipe), sort_keys=True, separators=(",", ":"))
     return Identity(
-        tokenizer_sha256=file_sha256(tokenizer_path),
-        config_sha256=file_sha256(config_path),
-        finalization_sha256=file_sha256(finalization_receipt),
+        tokenizer_sha256=tokenizer_sha256,
+        config_sha256=config_sha256,
+        finalization_sha256=finalization_sha256,
         recipe_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     )
 
@@ -1436,17 +1467,15 @@ def run(  # noqa: C901, PLR0913, PLR0915
         raise ValueError(msg)
     _check_safety_seconds(safety_seconds)
     _check_transition(cycle=cycle, from_finite=from_finite, resume=resume)
-    finalization = load_finalization(finalization_receipt)
+    tokenizer_bytes, finalization, files = _read_inputs(
+        tokenizer_path, config_path, finalization_receipt, cfg
+    )
     check_inputs(finalization, parts)
     recipe = recipe_of(parts, seed, cfg, objective, cycle=cycle)
-    identity = identity_of(tokenizer_path, config_path, finalization_receipt, recipe)
+    identity = identity_of(*files, recipe)
     # the identity the checkpoint must carry: the finite recipe's for the recorded transition
     finite = recipe_of(parts, seed, cfg, objective)
-    parent = (
-        identity_of(tokenizer_path, config_path, finalization_receipt, finite)
-        if from_finite
-        else identity
-    )
+    parent = identity_of(*files, finite) if from_finite else identity
     layout = Layout(groups=t.batch_chunks // micro, slots=micro)
     # every random choice goes through an explicit generator: the model's initialization here,
     # the corpus order through the seed; nothing reads torch's global generator. The scan is
@@ -1464,7 +1493,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
     if resume is None and log_path.exists():
         msg = f"{log_path}: already holds a run; resume one of its checkpoints or use another out"
         raise ValueError(msg)
-    tokenizer = Tokenizer.load(tokenizer_path)
+    tokenizer = Tokenizer.parse(tokenizer_bytes)
     split = Split(finalization, t.held_out_fraction)
     held = Split(finalization, t.held_out_fraction, held_out=True)
     counts: dict[str, int] = {}

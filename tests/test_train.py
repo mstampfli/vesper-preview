@@ -2010,15 +2010,61 @@ def test_a_finite_checkpoint_enters_cycling_only_through_the_recorded_transition
         _ = train(out, 1, resume=out / f"step-{total}")
 
 
-def test_a_finite_recipe_keeps_the_record_and_hash_it_had_before_cycling(tmp_path: Path) -> None:
+def test_the_run_hashes_exactly_the_files_it_uses(tmp_path: Path, book_builder: Builder) -> None:
+    # the identity's three file hashes and what the run parses are one snapshot of each file
+    # (maintainer B's identity_of follow-up of 10-21: it hashed the paths, then loaded them again)
+    cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
+        tmp_path, book_builder, 6 * 2 * 16, 2
+    )
+
+    def train(out: Path) -> list[dict[str, object]]:
+        return read_log(
+            run(
+                cfg,
+                config_path=config_path,
+                parts=parts,
+                finalization_receipt=receipt,
+                tokenizer_path=tokenizer_path,
+                out=out,
+                micro=1,
+                steps=1,
+                resume=None,
+                seed=0,
+                device=CPU,
+            )
+        )
+
+    # the tokenizer is read once: swapped after that read, the run still uses and names the
+    # file it read
+    original = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
+    with replaced_after_first_read(tokenizer_path, b"not the checked tokenizer") as opens:
+        lines = train(tmp_path / "tok")
+    assert len(opens) == 1
+    identity = cast("dict[str, object]", lines[0]["identity"])
+    assert identity["tokenizer_sha256"] == original
+    # the finalization receipt swapped between its hash and its parse is refused, not recorded
+    with (
+        replaced_after_first_read(receipt, b"{}") as opens,
+        pytest.raises(ValueError, match="finalization receipt"),
+    ):
+        _ = train(tmp_path / "fin")
+    assert not (tmp_path / "fin" / "log.jsonl").exists()
+    # a config file that no longer says what the run was given is refused before anything runs
+    edited = cast("dict[str, dict[str, object]]", yaml.safe_load(config_path.read_text("utf-8")))
+    edited["training"]["eval_chunks"] = 2
+    _ = config_path.write_text(yaml.safe_dump(edited), encoding="utf-8")
+    with pytest.raises(ValueError, match="changed since"):
+        _ = train(tmp_path / "cfg")
+    assert not (tmp_path / "cfg").exists()
+
+
+def test_a_finite_recipe_keeps_the_record_and_hash_it_had_before_cycling() -> None:
     finite = recipe()
     cycling = replace(finite, component_passes=CYCLE_ORDER_RULE)
     plain = _plain(finite)  # the record and hash under test
     assert "component_passes" not in plain
     assert _plain(cycling)["component_passes"] == CYCLE_ORDER_RULE
-    t, c, f = (tmp_path / name for name in ("t", "c", "f"))
-    for path in (t, c, f):
-        _ = path.write_text(path.name, encoding="utf-8")
+    t, c, f = "1" * 64, "2" * 64, "3" * 64
     canonical = json.dumps(plain, sort_keys=True, separators=(",", ":")).encode()
     assert identity_of(t, c, f, finite).recipe_sha256 == hashlib.sha256(canonical).hexdigest()
     assert identity_of(t, c, f, cycling).recipe_sha256 != identity_of(t, c, f, finite).recipe_sha256

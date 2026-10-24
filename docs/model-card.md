@@ -93,4 +93,5 @@ run it is still about 90 % of its peak.
 - Surprise modulation of the write strength: implemented, not used in training.
 - Quantization-aware training / int8: `training.qat_from` is parsed, nothing reads it.
 - `recurrence.state_read_noise`: parsed and validated, applied nowhere.
-- A decay gate in the recurrence ("gated delta rule" in recurrence.py's docstring): none exists.
+- A decay gate in the recurrence (spec 3a's "gated delta-rule" wording): none exists;
+  recurrence.py's docstring says so since 10-23.
