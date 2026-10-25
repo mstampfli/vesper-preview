@@ -7,6 +7,76 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-25, 09:25Z: adaptive stopping on text passes a held-out test
+
+**What changed.** This text pilot has its first positive held-out result for a rule that chooses
+how many passes each token gets. It predicts better than the best mixture of fixed-depth runs
+at the same average number of passes. The rule was frozen before one test on a bundle reserved
+from the model evaluations in the accepted read inventory.
+
+- The model: the days run's final backbone (step 427,000), unchanged. Only the small stopping
+  head was trained: 20,000 updates at one depth price (0.672), one seed. This head training used
+  the existing development card, with no additional rental.
+- The rule (Bounded23): every token runs at least 2 passes and at most 3. It keeps the head's
+  stopping-probability mass from both first passes: stop after pass 2 if their cumulative
+  probability reaches 0.5; otherwise take a third pass and stop. Decisions use this execution's
+  own states.
+- The test: 1,048,576 tokens (981 documents) from the part of the held-out data that is
+  untouched under the accepted read inventory. The rule, the trained head and the pass
+  criterion were fixed before the run, and it ran exactly once.
+- The result:
+  - The rule averages 2.63 passes; 37 % of tokens stop at 2 and 63 % go to 3.
+  - Its loss is 3.3369 nats against 3.3400 for the best fixed-depth mixture at the same average
+    number of passes: better by 0.0031.
+  - It also beats four random stopping controls sampled from its exit histogram, by 0.0076
+    to 0.0080 nats. Their realized average depths differ slightly.
+  - The predefined criterion was to beat that fixed-depth benchmark and all four random draws;
+    both conditions held.
+
+**How we got there.** These measurements were independently checked by maintainer B.
+
+1. A fixed-weight diagnostic compared one and five passes on validation text. The tenth of
+   scored positions with the largest observed gains accounts for about 69 % of the net loss
+   reduction. That uses known next-token labels; it does not by itself show what the head can
+   predict before seeing them.
+2. The first trained rule, with exits from 1 to 8, did not beat the fixed-depth benchmark.
+   Changing its original pass-2 exits to pass 3 improved mean loss at positions whose own
+   exits stayed unchanged by 0.0078 nats. A reverse intervention from fixed pass 3 worsened
+   those positions by 0.0073 nats on average. This establishes an effect on other tokens in
+   those traces, not a unique explanation of the failure or a separate recurrence mechanism.
+3. A hybrid trace beat the benchmark but borrowed its decisions from another execution. That
+   motivated the live 2/3 rule, which beat the validation benchmark using its own states: by
+   0.0024 for the 20,000-update head and 0.0019 for the 10,000-update head. The 20,000-update
+   candidate was frozen before the one held-out test above.
+
+**What it means for you.** Vesper's central idea of learning to allocate passes per token now
+has its first positive held-out result on real text. The size is modest, and the scope is
+narrow:
+
+- One trained head from one training run, not shown across fresh runs.
+- Saving is in passes, not measured running time.
+- Fixed 3 passes for every token still predicts better (by 0.020 nats); the rule uses 12 % fewer
+  passes than that.
+- Against 5 passes for every token, the best fixed depth, the rule uses about half the passes
+  for 0.031 nats more loss.
+
+**What is next.** Not decided yet, each needs a choice with maintainer B:
+
+- repeating the head training with other seeds and prices;
+- testing whether training the whole model with the stopping rule reduces the cost that early
+  stops impose on other tokens;
+- or the instruction-tuning test.
+
+A correction to the entry below: on 10-25 the final step's optimizer state was deleted with the
+other finished runs' optimizer files (the box's disk was nearly full). The weights and memory
+state are kept, but the retained artifacts no longer support exact training continuation
+from step 427,000.
+
+**Where the details are.** The evidence exports phase2-final-test-result (the test),
+phase2-final-bounded and phase2-final-bounded-10k (validation), phase2-final-tracecross (the
+cross-token effect), phase2-final-qreplay and phase2-final-pilot (the first rule), and stopA-427000
+(the fixed-weight diagnostic), each with SHA256SUMS and maintainer B's reviews.
+
 ## 2026-10-24, 17:11Z: the days run finished: 427,000 steps, held-out perplexity 25.3
 
 **What changed.** This Vesper run used d1024 and 64 M parameters,
