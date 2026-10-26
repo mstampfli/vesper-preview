@@ -1,10 +1,19 @@
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 import yaml
 
-from vesper.config import ConfigError, InstructConfig, load, parse, parse_instruct_bytes
+from vesper.config import (
+    ConfigError,
+    InstructConfig,
+    ReplayConfig,
+    load,
+    parse,
+    parse_instruct_bytes,
+    validate_instruct,
+)
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
@@ -162,6 +171,61 @@ def test_an_inconsistent_instruct_config_is_refused(
     raw = _instruct_raw()
     raw[section][key] = value
     with pytest.raises(ConfigError, match=message):
+        _ = _instruct(raw)
+
+
+def test_the_shipped_replay_config_differs_only_in_rate_and_replay() -> None:
+    plain = parse_instruct_bytes((CONFIGS / "instruct-dolly.yaml").read_bytes(), "plain")
+    replay = parse_instruct_bytes((CONFIGS / "instruct-dolly-replay.yaml").read_bytes(), "replay")
+    assert replay.replay is not None
+    assert (replay.replay.weight, replay.replay.rows, replay.replay.length) == (1.0, 2, 1024)
+    assert replay.replay.seed != replay.seed  # its own stream order
+    assert replay.peak_lr == 1e-5
+    assert replace(replay, peak_lr=plain.peak_lr, replay=None) == plain
+
+
+def test_the_replay_section_is_optional_typed_and_checked() -> None:
+    # replay of the source's training text beside each update (maintainer B 758b4fd); absent means
+    # none
+    assert _instruct(_instruct_raw()).replay is None
+    raw = _instruct_raw()
+    raw["replay"] = {"weight": 1.0, "rows": 2, "length": 1024, "seed": 7}
+    replay = _instruct(raw).replay
+    assert replay is not None
+    assert (replay.weight, replay.rows, replay.length, replay.seed) == (1.0, 2, 1024, 7)
+    raw["replay"]["weight"] = 0  # weight 0: the update without replay (no rows are read)
+    assert _instruct(raw).replay == replace(replay, weight=0.0)
+    for key, value, message in [
+        ("weight", -0.5, "replay.weight"),
+        ("weight", float("nan"), "replay.weight"),
+        ("weight", float("inf"), "replay.weight"),
+        ("rows", 0, "replay.rows"),
+        ("length", 1, "replay.length"),
+        ("seed", -1, "replay.seed"),
+        ("rows", 2.0, "expected an integer"),
+    ]:
+        raw = _instruct_raw()
+        raw["replay"] = {"weight": 1.0, "rows": 2, "length": 1024, "seed": 7, key: value}
+        with pytest.raises(ConfigError, match=message):
+            _ = _instruct(raw)
+    # the relations hold for a typed config too, not only on the YAML path (maintainer B, a771dee)
+    shipped = _instruct(_instruct_raw())
+    for bad, message in [
+        (ReplayConfig(-1.0, 2, 1024, 7), "replay.weight"),
+        (ReplayConfig(float("nan"), 2, 1024, 7), "replay.weight"),
+        (ReplayConfig(1.0, 0, 1024, 7), "replay.rows"),
+        (ReplayConfig(1.0, 2, 1, 7), "replay.length"),
+        (ReplayConfig(1.0, 2, 1024, -1), "replay.seed"),
+    ]:
+        with pytest.raises(ConfigError, match=message):
+            validate_instruct(replace(shipped, replay=bad))
+    validate_instruct(replace(shipped, replay=ReplayConfig(0.0, 1, 2, 0)))
+    raw = _instruct_raw()
+    raw["replay"] = {"weight": 1.0, "rows": 2, "length": 1024}
+    with pytest.raises(ConfigError, match="missing key 'seed'"):
+        _ = _instruct(raw)
+    raw["replay"] = {"weight": 1.0, "rows": 2, "length": 1024, "seed": 7, "cycle": True}
+    with pytest.raises(ConfigError, match="unknown keys: cycle"):
         _ = _instruct(raw)
 
 

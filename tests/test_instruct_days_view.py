@@ -9,6 +9,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -126,6 +127,63 @@ def test_the_days_view_refuses_a_checkpoint_other_than_the_loaded_one(
         _ = days_view(o.source, other, o.tok, bound, data=data, finalization=fin, pin=pin)
     _, again = days_view(o.source, o.loaded, o.tok, bound, data=data, finalization=fin, pin=pin)
     assert again == before
+
+
+def _reshared(o: Owned) -> tuple[bytes, bytes]:
+    """A self-consistent replacement of the checkpoint's header and manifest: other shares, the
+    recipe's own identity digest, the manifest's train.json hash (maintainer B's 01e2b3f
+    fixture)."""
+    record = cast(
+        "dict[str, dict[str, object]]", json.loads((o.source / "train.json").read_bytes())
+    )
+    recipe, identity = record["recipe"], record["identity"]
+    names = [cast("str", c[0]) for c in cast("list[list[object]]", recipe["components"])]
+    recipe["components"] = [
+        [name, 0.99 if i == 0 else 0.01 / (len(names) - 1)] for i, name in enumerate(names)
+    ]
+    canonical = json.dumps(recipe, sort_keys=True, separators=(",", ":"))
+    identity["recipe_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+    header = json.dumps(record).encode()
+    manifest = cast("dict[str, str]", json.loads((o.source / "manifest.json").read_bytes()))
+    manifest["train.json"] = hashlib.sha256(header).hexdigest()
+    return header, json.dumps(manifest).encode()
+
+
+def test_the_source_corpus_resolves_the_one_snapshot_it_bound_to_the_loaded_checkpoint(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Maintainer B's review of 01e2b3f: files replaced while the components were resolved, and
+    # restored before the next check, resolved other shares; the snapshot read once is what resolves
+    from vesper.instruct import _source_corpus  # pyright: ignore[reportPrivateUsage]  # noqa: PLC0415
+
+    o = owned(tmp_path, book_builder)
+    header, manifest = o.source / "train.json", o.source / "manifest.json"
+    original = (header.read_bytes(), manifest.read_bytes())
+    replacement = _reshared(o)
+    shares = [[c.name, c.share] for c in o.parts]
+    real_read = t.checked_record
+
+    def swapped_while_read(path: Path) -> t.CheckedRecord:
+        # every later read of the record (a resolver's own) sees the replacement, restored after
+        _ = header.write_bytes(replacement[0])
+        _ = manifest.write_bytes(replacement[1])
+        try:
+            return real_read(path)
+        finally:
+            _ = header.write_bytes(original[0])
+            _ = manifest.write_bytes(original[1])
+
+    monkeypatch.setattr("vesper.train.checked_record", swapped_while_read)
+    parts, _ = _source_corpus(o.source, o.loaded, data=o.data, finalization=o.fin)
+    assert [[c.name, c.share] for c in parts] == shares
+    monkeypatch.undo()
+    # the replacement in place from the start: its own identity is not the loaded one
+    _ = header.write_bytes(replacement[0])
+    _ = manifest.write_bytes(replacement[1])
+    with pytest.raises(ValueError, match="no longer the checkpoint"):
+        _ = _source_corpus(o.source, o.loaded, data=o.data, finalization=o.fin)
+    _ = header.write_bytes(original[0])
+    _ = manifest.write_bytes(original[1])
 
 
 def test_the_days_view_is_the_checkpoints_pins_and_checks_every_input(

@@ -7,6 +7,41 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-26, 21:03Z: replaying general text during instruction tuning removes most of the forgetting
+
+This entry's wording is not yet reviewed by maintainer B (their weekly review budget is nearly used up);
+the numbers in it are the ones maintainer B reproduced independently when accepting the trial.
+
+**What changed.** Instruction tuning made the model worse at ordinary text: on the days run's
+held-out view, perplexity rose from 25.26 to 29.53 at a peak rate of 3e-5 and to 27.20 at 1e-5.
+A third trial repeated the 1e-5 run exactly (same model, examples, order, schedule and selection
+rule) but added, to every update, two rows of 1,024 positions of the source run's own training
+text. The two losses are added with equal weight and make one optimizer step together. Every
+replayed row is recorded and checked to come from the training side: none of its 2,378
+documents or 2,341 groups is in the held-out set.
+
+- Held-out general text: perplexity 25.26 before tuning and 25.45 after (+0.007 nats per token),
+  against +0.074 at 1e-5 without replay and +0.156 at 3e-5. The measured increase is 90 %
+  smaller than without replay.
+- Response fit on the reused validation set: body loss 2.902 at the selected epoch (epoch 3),
+  0.004 lower than without replay; the end-marker loss is 0.013 higher. The descriptive paired
+  interval against the untuned model is [-0.221, -0.183].
+- Cost: about 29 % more training time (33 minutes instead of 25), the same memory.
+
+**What it means for you.** Mixing a little of the original text into tuning keeps the model's
+general text ability almost intact while it learns the answer format. The limits: one run with
+one setting; the held-out view is text of the same kind that was replayed, so this shows
+retention of that kind of text, not of everything the model knew; the validation set was used
+for selection; and lower losses do not yet show better written answers.
+
+**What is next.** Answers from the replay model to the same twenty validation prompts, to see
+whether the writing itself changes; it waits for maintainer B's review budget, which resets on
+November 2. No reserved final test has been selected.
+
+**Where the details are.** Exports instruction-preflight-replay-ee68f18 and
+instruction-trial-replay-ee68f18, each with SHA256SUMS, and maintainer B's reviews replay-a771dee,
+replayfix-01e2b3f, replaysnapshot-ee68f18, replay-preflight-1bb38a8 and replay-trial-b2fc2f8.
+
 ## 2026-10-26, 15:56Z: instruction tuning improves answer form, with a forgetting cost
 
 **What changed.** The days run's final model (step 427,000) completed one instruction-tuning

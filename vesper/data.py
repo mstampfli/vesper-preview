@@ -36,12 +36,16 @@ class Document:
 
     ``source`` is the mixer's component name (empty for documents built without one, as in
     tests); the stream carries it into every chunk's ``spans`` so consumed tokens are counted
-    per source as the streams emit them, not as the mixer hands documents out.
+    per source as the streams emit them, not as the mixer hands documents out. ``group_key`` is
+    the split group that decided the document's side (``is_held_out``), as the corpus readers
+    give it; empty where no reader built the document (tests, a restored stream's queue), so a
+    check of consumed groups must refuse an empty key rather than pass it.
     """
 
     doc_id: str
     tokens: Tensor
     source: str = ""
+    group_key: str = ""
 
 
 @dataclass(frozen=True)

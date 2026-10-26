@@ -15,11 +15,13 @@ from conftest import small_raw
 from vesper.column import set_scan
 from vesper.config import InstructConfig, parse, parse_instruct_bytes
 from vesper.decode import CapturedDecoder
-from vesper.graphs import WARM_STEPS, GraphFamily
+from vesper.graphs import WARM_STEPS, GraphFamily, deterministic_algorithms
 from vesper.instruct import (
     HALTING_PREFIX,
     ExampleLosses,
     Recipe,
+    _batch_values,  # pyright: ignore[reportPrivateUsage]
+    _device_step,  # pyright: ignore[reportPrivateUsage]
     _on,  # pyright: ignore[reportPrivateUsage]
     evaluate_examples,
     final,
@@ -29,11 +31,13 @@ from vesper.instruct import (
     train_step,
     tuning_optimizer,
 )
-from vesper.instruct_data import Example, Record, batches, collate, prompt_text, serialize
+from vesper.instruct_data import Batch, Example, Record, batches, collate, prompt_text, serialize
 from vesper.instruct_panel import answer_of, load_panel, score_answer
+from vesper.instruct_replay import ReplayRows
 from vesper.loop import DenseRule
 from vesper.model import Vesper
 from vesper.tokenizer import Tokenizer, train_from_texts
+from vesper.train import set_learning_rate
 
 VOCAB = 320
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
@@ -161,6 +165,123 @@ def test_no_state_crosses_from_one_update_to_the_next(tok: Tokenizer) -> None:
     assert after.pass_loss == alone.pass_loss
     fresh_grads = grads(fresh)
     assert all(torch.equal(after_grads[n], fresh_grads[n]) for n in fresh_grads)
+
+
+def replay_rows(seed: int = 5) -> ReplayRows:
+    """Two cold rows of training-like text: a document boundary (unscored) and end padding."""
+    g = torch.Generator().manual_seed(seed)
+    tokens = torch.randint(3, VOCAB, (2, 32), generator=g)
+    targets = torch.roll(tokens, -1, dims=1)
+    valid = torch.ones(2, 32, dtype=torch.bool)
+    valid[1, 28:] = False
+    mask = valid.clone()
+    mask[0, 12] = False  # the target that opens the row's second document
+    mask[:, -1] = False
+    pos = torch.arange(1000, 1032).expand(2, 32).clone()
+    return ReplayRows(tokens, targets, valid, pos, mask, [])
+
+
+def test_a_replay_update_is_one_clipped_step_on_the_weighted_sum_of_both_losses(
+    tok: Tokenizer,
+) -> None:
+    # Maintainer B 758b4fd: zero once, both backwards at the same weights, clip the combined
+    # gradient once, ONE AdamW step; each loss its own mean over its scored targets and the dense
+    # passes
+    weight, lr = 0.7, 1e-3
+    batch = collate([example(tok, 0, "answer 0"), example(tok, 1, "answer 1 answer 1")], 32, 2)
+    rows = replay_rows()
+    base = dataclasses.replace(recipe(), grad_clip=1e-3)  # small enough that the clip acts
+    with_replay = dataclasses.replace(base, replay_weight=weight)
+    model = tiny()
+    rec = train_step(
+        model,
+        tuning_optimizer(model, with_replay, capturable=False),
+        batch,
+        lr,
+        with_replay,
+        None,
+        replay=rows,
+    )
+    # the reference, built from parts: each loss's gradient alone (rate 0 leaves the weights),
+    # the weighted sum clipped by hand, then one step of a fresh optimizer from the same start
+    probe = tiny()
+    instruction = train_step(probe, frozen_opt(probe), batch, 0.0, recipe(), None)
+    g_instruction = grads(probe)
+    probe = tiny()
+    as_batch = Batch(  # the replay rows' five tensors as an instruction batch's
+        rows.tokens,
+        rows.targets,
+        rows.valid,
+        rows.pos,
+        rows.loss_mask,
+        torch.zeros_like(rows.loss_mask),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+    )
+    replayed = train_step(probe, frozen_opt(probe), as_batch, 0.0, recipe(), None)
+    g_replay = grads(probe)
+    total = {n: g_instruction[n] + weight * g_replay[n] for n in g_instruction}
+    norm = math.sqrt(sum(float((g.double() ** 2).sum()) for g in total.values()))
+    assert norm > 10 * base.grad_clip  # the clip is active, so clipping twice would show
+    scale = base.grad_clip / (norm + 1e-6)
+    reference = tiny()
+    opt = tuning_optimizer(reference, base, capturable=False)
+    set_learning_rate(opt, lr)
+    for n, p in reference.named_parameters():
+        if n in total:
+            p.grad = total[n] * scale
+    _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
+    want = dict(reference.named_parameters())
+    for n, p in model.named_parameters():
+        assert torch.allclose(p, want[n], rtol=1e-5, atol=1e-7), n
+    assert rec.loss == pytest.approx(instruction.loss, rel=1e-6)
+    assert rec.replay_loss == pytest.approx(replayed.loss, rel=1e-6)
+    assert rec.objective == pytest.approx(instruction.loss + weight * replayed.loss, rel=1e-6)
+    assert rec.grad_norm == pytest.approx(norm, rel=1e-4)
+    assert rec.labels == instruction.labels
+    assert rec.replay_labels == int(rows.loss_mask.sum()) == replayed.labels
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+def test_a_captured_replay_update_equals_the_eager_one_update_for_update(tok: Tokenizer) -> None:
+    # the combined update (two backwards, one clip, one step) captured per length: through the
+    # eager warm-ups, the capture and the replays, every record and every parameter equal
+    cuda = torch.device("cuda")
+    batch = collate([example(tok, 0, "answer 0"), example(tok, 1, "answer 1 answer 1")], 32, 2)
+    rows = replay_rows()
+    setting = dataclasses.replace(recipe(), replay_weight=0.7, grad_clip=1e-3)
+    eager, captured = _on(tiny().to(cuda), cuda), _on(tiny().to(cuda), cuda)
+    opt_eager = tuning_optimizer(eager, setting, capturable=True)
+    opt_captured = tuning_optimizer(captured, setting, capturable=True)
+    graphs = GraphFamily()
+    with deterministic_algorithms():
+        for step in range(WARM_STEPS + 3):
+            lr = 1e-3 * (step + 1)
+            set_learning_rate(opt_eager, lr)
+            values = _batch_values(batch, cuda) + _batch_values(rows, cuda)
+            out = _device_step(eager, opt_eager, setting, values)
+            rec = train_step(captured, opt_captured, batch, lr, setting, graphs, replay=rows)
+            assert rec.loss == float(out[0].double()), step
+            assert rec.replay_loss == float(out[1].double()), step
+            assert rec.grad_norm == float(out[2].double()), step
+            for (name, a), b in zip(eager.named_parameters(), captured.parameters(), strict=True):
+                assert torch.equal(a, b), (step, name)
+    # 3 eager warm-ups, then the capture (its first execution is a replay) and 2 more replays
+    assert graphs.counts() == {str(("train", 32)): [1, 3]}
+
+
+def test_weight_zero_reads_no_replay_and_a_mismatch_is_refused(tok: Tokenizer) -> None:
+    batch = collate([example(tok, 0, "answer 0")], 32, 1)
+    model = tiny()
+    plain = train_step(model, frozen_opt(model), batch, 0.0, recipe(), None)
+    assert plain.replay_loss is None
+    assert plain.replay_labels == 0
+    assert plain.objective == plain.loss
+    weighted = dataclasses.replace(recipe(), replay_weight=1.0)
+    with pytest.raises(ValueError, match="replay rows"):
+        _ = train_step(model, frozen_opt(model), batch, 0.0, weighted, None)
+    with pytest.raises(ValueError, match="weight 0"):
+        _ = train_step(model, frozen_opt(model), batch, 0.0, recipe(), None, replay=replay_rows())
 
 
 def isolated(model: Vesper, e: Example, depth: int) -> tuple[float, int, float, int]:

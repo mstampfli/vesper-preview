@@ -155,7 +155,8 @@ class InstructConfig:
     limit, the length buckets, positions per batch), ``schedule`` (rate, warm-up, final fraction,
     epochs, order seed), ``evaluation`` (fixed depth, group resamples, generated ids at most) and
     ``forgetting`` (the days run's held-out view: its width, the accepted test pin's hash and the
-    view's own digest, both checked before any model reads it).
+    view's own digest, both checked before any model reads it), and the optional ``replay``
+    (``ReplayConfig``; absent: no replay).
     """
 
     dataset_name: str
@@ -178,6 +179,35 @@ class InstructConfig:
     days_micro: int
     pin_sha256: str
     days_view_sha256: str
+    replay: "ReplayConfig | None" = None
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    """General text from the source run's TRAINING side beside every tuning update.
+
+    Maintainer B's design, 758b4fd.
+
+    Each update adds ``weight`` times the mean loss of ``rows`` rows of ``length`` positions from
+    a stream of that side, seeded by ``seed`` (independent of the example order), to the
+    instruction loss; weight 0 is the update without replay, and no row is read.
+    """
+
+    weight: float
+    rows: int
+    length: int
+    seed: int
+
+
+def _replay(s: "_Section") -> ReplayConfig:
+    cfg = ReplayConfig(
+        weight=s.get_float("weight"),
+        rows=s.get_int("rows"),
+        length=s.get_int("length"),
+        seed=s.get_int("seed"),
+    )
+    s.done()
+    return cfg  # its relations are validate_instruct's, for a typed config as for a parsed one
 
 
 def _instruct(root: "_Section") -> InstructConfig:
@@ -205,6 +235,7 @@ def _instruct(root: "_Section") -> InstructConfig:
         days_micro=forgetting.get_int("micro"),
         pin_sha256=forgetting.get_str("pin_sha256"),
         days_view_sha256=forgetting.get_str("view_sha256"),
+        replay=_replay(root.get_section("replay")) if root.has("replay") else None,
     )
     for section in (dataset, split, examples, schedule, evaluation, forgetting, root):
         section.done()
@@ -231,6 +262,11 @@ def validate_instruct(cfg: InstructConfig) -> None:
     _require(cfg.eval_depth >= 1, "evaluation.depth: at least 1")
     _require(cfg.resamples >= 1 and cfg.max_new_tokens >= 1, "evaluation: counts at least 1")
     _require(cfg.days_micro >= 1, "forgetting.micro: at least 1")
+    if (r := cfg.replay) is not None:
+        _require(math.isfinite(r.weight) and r.weight >= 0, "replay.weight: finite, at least 0")
+        _require(r.rows >= 1, "replay.rows: at least 1")
+        _require(r.length >= 2, "replay.length: at least 2")  # noqa: PLR2004  # input and target
+        _require(r.seed >= 0, "replay.seed: at least 0")
     for name, digest in (
         ("dataset.sha256", cfg.dataset_sha256),
         ("forgetting.pin_sha256", cfg.pin_sha256),
@@ -329,6 +365,10 @@ class _Section:
     def get_section(self, key: str) -> "_Section":
         """Descend into a nested mapping."""
         return _Section(self._take(key), f"{self._where}.{key}")
+
+    def has(self, key: str) -> bool:
+        """Whether ``key`` is still unread here: for an optional section whose absence means off."""
+        return key in self._items
 
     def done(self) -> None:
         """Fail if any key was never read: a typo must not pass silently."""

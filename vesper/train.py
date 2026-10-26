@@ -1212,13 +1212,39 @@ def resumed_components(data: Path, resume: Path) -> list[Component]:
     the component's files are the generation's inputs in manifest order.
 
     Raises:
-        ValueError: when the checkpoint's record is missing, tampered or inconsistent (a pin
-            whose kind is not its component's, counts that differ), a component carries no pin
+        ValueError: when the checkpoint's record is missing, tampered or inconsistent (a recipe
+            that does not hash to its identity's ``recipe_sha256``, the digest ``identity_of``
+            computes; a pin whose kind is not its component's, counts that differ), a component
+            carries no pin
             (a legacy-layout run resumes under ``--legacy-layout --web --mix``), a pin is
             malformed, or a pinned generation is missing, changed or re-hashed.
     """
-    record = checked_record(resume).record
+    return components_of_record(data, checked_record(resume), resume)
+
+
+def components_of_record(data: Path, checked: CheckedRecord, resume: Path) -> list[Component]:
+    """``resumed_components`` for a record snapshot the caller already read and checked.
+
+    For a caller that must bind the components to what it loaded: it reads ``checked_record``
+    once, compares that snapshot's identity with its loaded one, and resolves from the same
+    snapshot, so no later read of the files can change what is resolved (maintainer B's review of
+    01e2b3f: a replacement inside the resolver, restored before the caller's next check,
+    resolved other shares). ``resume`` names the checkpoint in messages; it is not read.
+
+    Raises:
+        ValueError: as ``resumed_components``.
+    """
+    record = checked.record
     recipe = cast("dict[str, object]", record["recipe"])  # a mapping: checked_record said so
+    # the recipe consumed here is the one the record's identity names (maintainer B's review of
+    # a771dee: other shares with an updated manifest passed every check beside it)
+    raw_identity = record.get("identity")
+    identity = cast("dict[str, object]", raw_identity) if isinstance(raw_identity, dict) else {}
+    canonical = json.dumps(recipe, sort_keys=True, separators=(",", ":"))
+    actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if identity.get("recipe_sha256") != actual:
+        msg = f"{resume}: the recipe does not hash to its identity's recipe_sha256 ({actual})"
+        raise ValueError(msg)
     components = recipe.get("components")
     pins = recipe.get("generations")
     if not isinstance(components, list) or not isinstance(pins, list):

@@ -1,0 +1,37 @@
+# The instruction-tuning test with replay (maintainer B's design, 758b4fd): instruct-dolly.yaml at the
+# lower peak rate of the 2026-10-26 comparison (1e-5), plus rows of the source run's own training
+# text in every update. Read by vesper.config.parse_instruct_bytes; its bytes' sha256 is bound
+# into every run and its final.
+dataset:
+  name: databricks/databricks-dolly-15k
+  revision: "bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a"  # pragma: allowlist secret
+  sha256: "2df9083338b4abd6bceb5635764dab5d833b393b55759dffb0959b6fcbf794ec"  # pragma: allowlist secret
+split:
+  key: dolly-split-v1  # blake2b-64 of the group id keyed by this, as a fraction
+  train_below: 0.90
+  validation_below: 0.95
+examples:
+  max_inputs: 1024  # longer examples are dropped and counted, never truncated
+  buckets: [128, 256, 512, 1024]
+  batch_tokens: 8192  # positions per batch: rows = batch_tokens // bucket
+schedule:
+  peak_lr: 1.0e-5
+  warmup_steps: 100
+  final_lr_fraction: 0.1
+  epochs: 3
+  seed: 0  # the keyed example and batch order
+evaluation:
+  depth: 5
+  resamples: 2000
+  max_new_tokens: 160
+forgetting:
+  micro: 8
+  pin_sha256: "7a39ce6f576921829b356695745b794b6c07da7b854b65e4115820e68f1fe7ce"  # pragma: allowlist secret
+  # `python -m vesper.instruct view` on step-427000 (2026-10-25): 16 chunks, 140 documents,
+  # 130940 labels, the count of the days run's own held-out evaluations
+  view_sha256: "7296447bb505adddc5b57473730f1b8ab2d9d3ce7566fe6cdadbd93fe1f976a6"  # pragma: allowlist secret
+replay:
+  weight: 1.0  # loss = instruction mean + weight * replay mean
+  rows: 2  # logical rows per update
+  length: 1024  # positions per row, the source run's chunk
+  seed: 1  # the replay stream's own order, independent of schedule.seed

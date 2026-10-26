@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import shutil
 import weakref
 from collections.abc import Sequence
@@ -15,8 +16,8 @@ from torch import Tensor
 
 from test_halting_text import PhaseOne, _phase_one  # pyright: ignore[reportPrivateUsage]
 from test_train import Builder
-from vesper.config import VesperConfig, parse_instruct_bytes
-from vesper.corpus import Component
+from vesper.config import ReplayConfig, VesperConfig, parse_instruct_bytes
+from vesper.corpus import Component, Split, iter_mixed_documents, load_finalization
 from vesper.decode import CapturedDecoder
 from vesper.graphs import WARM_STEPS, GraphFamily
 from vesper.halting_text import load_text_source
@@ -31,8 +32,10 @@ from vesper.instruct import (
     tuning_optimizer,
 )
 from vesper.instruct_data import Batch
+from vesper.instruct_replay import ReplaySource
 from vesper.model import Vesper
 from vesper.tokenizer import Tokenizer
+from vesper.train import CheckedRecord
 
 CATEGORIES = ("open_qa", "closed_qa", "classification", "brainstorming")
 
@@ -118,11 +121,11 @@ def test_tune_then_final_reads_the_reserved_split_once_and_only_with_the_bound_i
 ) -> None:
     p1 = _phase_one(tmp_path, book_builder)
 
-    def pinned(data: Path, resume: Path) -> Sequence[Component]:
-        del data, resume
+    def pinned(data: Path, checked: CheckedRecord, resume: Path) -> Sequence[Component]:
+        del data, checked, resume
         return p1.parts  # the owned fixture is a legacy-layout run: no generation pins
 
-    monkeypatch.setattr("vesper.instruct.resumed_components", pinned)
+    monkeypatch.setattr("vesper.instruct.components_of_record", pinned)
     source = p1.files["checkpoint"]
     days = [
         "--data", str(tmp_path), "--finalization", str(p1.files["receipt"]),
@@ -379,15 +382,127 @@ def test_final_on_cuda_answers_the_panel_with_one_captured_decoder_per_model(
     assert cuda["illustrations"] == cpu["illustrations"]
 
 
+def _with_replay(
+    args: list[str], parts: Sequence[Component], replay: dict[str, object] | None
+) -> dict[str, str]:
+    """Give the fixture's pin every held-out document's group and set the config's ``replay``.
+
+    The accepted pin carries ``held_out_group_of``; the owned fixture's pin had only its read
+    set. Returns the held-out map written.
+    """
+    value = {args[i]: args[i + 1] for i in range(0, len(args), 2)}
+    pin, instruct = Path(value["--pin"]), Path(value["--instruct"])
+    source, config = Path(value["--source"]), Path(value["--config"])
+    loaded = load_text_source(source, config)
+    tok = Tokenizer.load(Path(value["--tokenizer"]))
+    fin = load_finalization(Path(value["--finalization"]))
+    held = Split(fin, loaded.cfg.training.held_out_fraction, held_out=True)
+    held_map = {d.doc_id: d.group_key for d in iter_mixed_documents(parts, 0, tok, held)}
+    record = cast("dict[str, object]", json.loads(pin.read_text()))
+    record["held_out_group_of"] = held_map
+    _ = pin.write_text(json.dumps(record))
+    raw = cast("dict[str, dict[str, object]]", yaml.safe_load(instruct.read_text()))
+    raw["forgetting"]["pin_sha256"] = hashlib.sha256(pin.read_bytes()).hexdigest()
+    if replay is not None:
+        raw["replay"] = replay
+    _ = instruct.write_text(yaml.safe_dump(raw))
+    return held_map
+
+
+def test_tune_with_replay_trains_on_both_and_records_every_row(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, parts = _tune_inputs(tmp_path, book_builder, monkeypatch)
+    plain = tmp_path / "plain"
+    held_map = _with_replay(args, parts, None)
+    assert held_map
+    assert main(["tune", *args, "--limit-examples", "6", "--out", str(plain)]) == 0
+    # weight 0: the update without replay, no row read (the source is never built)
+    built: list[object] = []
+    real_source = ReplaySource
+
+    def counted(
+        parts: Sequence[Component],
+        tokenizer: Tokenizer,
+        train: Split,
+        replay: ReplayConfig,
+        pin: bytes,
+    ) -> ReplaySource:
+        made = real_source(parts, tokenizer, train, replay, pin)
+        built.append(made)
+        return made
+
+    monkeypatch.setattr("vesper.instruct.ReplaySource", counted)
+    _ = _with_replay(args, parts, {"weight": 0, "rows": 2, "length": 16, "seed": 3})
+    zero = tmp_path / "zero"
+    assert main(["tune", *args, "--limit-examples", "6", "--out", str(zero)]) == 0
+    assert built == []
+
+    def lines(d: Path) -> list[dict[str, object]]:
+        text = (d / "train.jsonl").read_text().splitlines()
+        return [cast("dict[str, object]", json.loads(line)) for line in text]
+
+    keep = ("step", "lr", "length", "loss", "grad_norm", "pass_loss", "labels", "objective")
+    assert [{k: s[k] for k in keep} for s in lines(zero)] == [
+        {k: s[k] for k in keep} for s in lines(plain)
+    ]
+    assert all(s["replay_loss"] is None and "replay_rows" not in s for s in lines(zero))
+    zero_result = cast("dict[str, object]", json.loads((zero / "result.json").read_text()))
+    assert cast("dict[str, object]", zero_result["replay"])["rows_read"] is False
+    # weight 1, two rows of 16: every update both losses, one record per row
+    _ = _with_replay(args, parts, {"weight": 1.0, "rows": 2, "length": 16, "seed": 3})
+    out = tmp_path / "replay"
+    assert main(["tune", *args, "--limit-examples", "6", "--out", str(out)]) == 0
+    assert len(built) == 1
+    steps = lines(out)
+    assert [s["length"] for s in steps] == [s["length"] for s in lines(plain)]  # same order
+    documents: set[str] = set()
+    for s in steps:
+        rows = cast("list[dict[str, object]]", s["replay_rows"])
+        assert len(rows) == 2
+        replay_loss = cast("float", s["replay_loss"])
+        assert math.isfinite(replay_loss)
+        assert s["objective"] == pytest.approx(cast("float", s["loss"]) + replay_loss)
+        assert s["replay_labels"] == sum(cast("int", r["labels"]) for r in rows) > 0
+        for r in rows:
+            documents.update(cast("list[str]", r["documents"]))
+    assert documents
+    assert documents.isdisjoint(held_map)
+    result = cast("dict[str, object]", json.loads((out / "result.json").read_text()))
+    record = cast("dict[str, object]", result["replay"])
+    assert record["rows_read"] is True
+    assert record["side"] == "training"
+    consumed = cast("dict[str, object]", record["consumed"])
+    assert consumed["batches"] == len(steps) == result["steps"]
+    assert consumed["held_out_overlap"] == {"documents": 0, "groups": 0}
+    assert consumed["documents"] == len(documents)
+    # the replay changed the training: the weights differ from the run without it
+    assert any(
+        not torch.equal(a, b)
+        for a, b in zip(
+            weights(out / "weights" / "epoch-1.pt").values(),
+            weights(plain / "weights" / "epoch-1.pt").values(),
+            strict=True,
+        )
+    )
+
+
 def _tune_args(tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """``tune``'s arguments for the owned fixture, every input bound (all but ``--out``)."""
+    return _tune_inputs(tmp_path, book_builder, monkeypatch)[0]
+
+
+def _tune_inputs(
+    tmp_path: Path, book_builder: Builder, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[str], Sequence[Component]]:
+    """``_tune_args`` and the fixture's components, the ones ``tune`` reads (patched in)."""
     p1 = _phase_one(tmp_path, book_builder)
 
-    def pinned(data: Path, resume: Path) -> Sequence[Component]:
-        del data, resume
+    def pinned(data: Path, checked: CheckedRecord, resume: Path) -> Sequence[Component]:
+        del data, checked, resume
         return p1.parts
 
-    monkeypatch.setattr("vesper.instruct.resumed_components", pinned)
+    monkeypatch.setattr("vesper.instruct.components_of_record", pinned)
     source = p1.files["checkpoint"]
     dolly, panel, instruct = tmp_path / "dolly.jsonl", tmp_path / "panel.json", tmp_path / "i.yaml"
     sha = write_dolly(dolly)
@@ -410,7 +525,7 @@ def _tune_args(tmp_path: Path, book_builder: Builder, monkeypatch: pytest.Monkey
         "--panel", str(panel), "--instruct", str(instruct),
         "--data", str(tmp_path), "--finalization", str(p1.files["receipt"]),
         "--pin", str(p1.files["pin"]),
-    ]  # fmt: skip
+    ], p1.parts  # fmt: skip
 
 
 @pytest.mark.parametrize(

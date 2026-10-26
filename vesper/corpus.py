@@ -562,7 +562,9 @@ def iter_documents(
     The two sides are disjoint and together cover the finalized corpus (``select_documents``).
     """
     for raw in select_documents(iter_raw_documents(paths, seed), split):
-        yield Document(doc_id=raw.doc_id, tokens=tokenizer.encode(raw.text))
+        yield Document(
+            doc_id=raw.doc_id, tokens=tokenizer.encode(raw.text), group_key=raw.group_key
+        )
 
 
 def _check_shares(components: Sequence[Component]) -> None:
@@ -903,7 +905,12 @@ class Mixer:
             self.yielded[index] += 1
             self.pulled += 1
             self._digest.add(raw.doc_id.encode("utf-8"))
-            return Document(doc_id=raw.doc_id, tokens=tokens, source=self.components[index].name)
+            return Document(
+                doc_id=raw.doc_id,
+                tokens=tokens,
+                source=self.components[index].name,
+                group_key=raw.group_key,
+            )
         return None
 
     def _next_pass(self, index: int) -> None:

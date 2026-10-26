@@ -1416,10 +1416,31 @@ def test_a_resume_resolves_its_checkpoints_pins_not_todays_selection(  # noqa: P
     recipe = cast("dict[str, object]", record["recipe"])
     pins = cast("list[str | None]", recipe["generations"])
 
-    def crafted(name: str, generations: list[str | None], *, tamper: bool = False) -> Path:
+    record_identity = cast("dict[str, object]", record["identity"])
+    declared = record_identity["recipe_sha256"]
+
+    def digest_of(r: dict[str, object]) -> str:
+        canonical = json.dumps(r, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    assert digest_of(recipe) == declared  # the saved recipe is the one its identity names
+
+    def crafted(
+        name: str,
+        generations: list[str | None],
+        *,
+        tamper: bool = False,
+        resign: bool = True,
+        shares: list[list[object]] | None = None,
+    ) -> Path:
+        # resign: a record made consistent with its edit (the recipe's digest in its identity),
+        # so the checks after the binding are reached; without it, the identity is the original
         directory = tmp_path / name
         directory.mkdir()
         recipe["generations"] = generations
+        if shares is not None:
+            recipe["components"] = shares
+        record_identity["recipe_sha256"] = digest_of(recipe) if resign else declared
         text = json.dumps(record)
         _ = (directory / "train.json").write_text(text, encoding="utf-8")
         digest = file_sha256(directory / "train.json")
@@ -1439,6 +1460,31 @@ def test_a_resume_resolves_its_checkpoints_pins_not_todays_selection(  # noqa: P
         _ = resumed_components(data, crafted("tampered", pins, tamper=True))
     with pytest.raises(ValueError, match="not a checkpoint"):
         _ = resumed_components(data, tmp_path / "absent")
+    # the recipe consumed is bound to the identity beside it (maintainer B's review of a771dee):
+    # other shares under the original identity, the manifest updated, are refused; the same shares
+    # with a matching identity resolve (they are another run's record, not a tampered one)
+    saved_shares = cast("list[list[object]]", recipe["components"])
+    other = [
+        [saved_shares[0][0], 0.97],
+        *([s[0], 0.03 / (len(saved_shares) - 1)] for s in saved_shares[1:]),
+    ]
+    with pytest.raises(ValueError, match="recipe"):
+        _ = resumed_components(data, crafted("reshared", pins, resign=False, shares=other))
+    resolved = resumed_components(data, crafted("reshared-signed", pins, shares=other))
+    assert [c.share for c in resolved] == [cast("float", s[1]) for s in other]
+
+
+def _signed(record: dict[str, object]) -> dict[str, object]:
+    """``record`` with an identity naming its recipe's digest, as ``identity_of`` writes it.
+
+    For hand-made records, so each case reaches the check it is about; the binding itself is
+    tested with the pinned resume. A record that has an identity, or no recipe mapping, is kept.
+    """
+    recipe = record.get("recipe")
+    if not isinstance(recipe, dict) or "identity" in record:
+        return record
+    canonical = json.dumps(recipe, sort_keys=True, separators=(",", ":"))
+    return {**record, "identity": {"recipe_sha256": hashlib.sha256(canonical.encode()).hexdigest()}}
 
 
 def test_the_resolver_parses_exactly_the_bytes_it_hashed_and_checks_the_schema_first(  # noqa: PLR0915
@@ -1470,7 +1516,7 @@ def test_the_resolver_parses_exactly_the_bytes_it_hashed_and_checks_the_schema_f
     def checkpoint(name: str, record: dict[str, object]) -> tuple[Path, Path, bytes]:
         directory = tmp_path / name
         directory.mkdir()
-        original = json.dumps(record).encode("utf-8")
+        original = json.dumps(_signed(record)).encode("utf-8")
         meta = directory / "train.json"
         _ = meta.write_bytes(original)
         digest = hashlib.sha256(original).hexdigest()

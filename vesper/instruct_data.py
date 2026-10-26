@@ -165,6 +165,18 @@ class SplitRule:
         return SPLITS[2]
 
 
+def int64_bytes(t: Tensor) -> bytes:
+    """PRIMITIVE the bytes a digest of a data tensor hashes: its values as int64, little-endian.
+
+    The values' native bytes as numpy's ``tobytes`` would give them, whatever the tensor's own
+    integer or bool dtype, so one digest rule covers tokens, targets, masks and positions (the
+    days view's digest, the replay rows' digests). Not for floating tensors: they would be
+    truncated to integers.
+    """
+    flat = t.to(torch.int64).contiguous().view(torch.uint8).flatten()
+    return bytes(cast("list[int]", flat.tolist()))  # pyright: ignore[reportUnknownMemberType]
+
+
 def prompt_text(instruction: str, context: str) -> str:
     """The prompt prefix: the instruction, the context when there is one, the response header."""
     shown = f"Context:\n{context}\n\n" if context else ""

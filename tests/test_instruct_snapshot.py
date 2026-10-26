@@ -27,6 +27,7 @@ from vesper.data import Chunk
 from vesper.halting_text import TextSource, load_text_source
 from vesper.instruct import days_view, main
 from vesper.tokenizer import Tokenizer
+from vesper.train import CheckedRecord
 
 
 def copy_flat(src: Path, dst: Path) -> None:
@@ -104,11 +105,11 @@ def test_files_replaced_after_their_first_load_change_nothing(
 ) -> None:
     p1 = _phase_one(tmp_path, book_builder)
 
-    def pinned(data: Path, resume: Path) -> Sequence[Component]:
-        del data, resume
+    def pinned(data: Path, checked: CheckedRecord, resume: Path) -> Sequence[Component]:
+        del data, checked, resume
         return p1.parts  # the owned fixture is a legacy-layout run: no generation pins
 
-    monkeypatch.setattr("vesper.instruct.resumed_components", pinned)
+    monkeypatch.setattr("vesper.instruct.components_of_record", pinned)
     bound, days = setup(tmp_path, p1)
     source, config = p1.files["checkpoint"], p1.files["config"]
     kept_source, kept_config = tmp_path / "kept-source", tmp_path / "kept-config.yaml"

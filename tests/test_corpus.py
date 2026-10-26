@@ -453,6 +453,31 @@ def test_mixed_documents_track_token_shares_and_resume_by_skipping(
     assert {d.doc_id for d in held}.isdisjoint({d.doc_id for d in train})
 
 
+def test_every_document_carries_the_group_key_that_decided_its_side(
+    tmp_path: Path, tok: Tokenizer
+) -> None:
+    # as the raw reader gives it (the instruction replay checks consumed groups against the
+    # held-out pin with it)
+    parts, training = mixed_components(tmp_path)
+    halves = Split(training.finalization, 0.5)
+    held = list(iter_mixed_documents(parts, 0, tok, Split(halves.finalization, 0.5, held_out=True)))
+    train = list(iter_mixed_documents(parts, 0, tok, halves))
+    assert held
+    assert train
+    raw_groups = {
+        raw.doc_id: raw.group_key
+        for part in parts
+        for raw in iter_raw_documents(list(part.paths), 0)
+    }
+    assert all(d.group_key == raw_groups[d.doc_id] for d in held + train)
+    assert all(d.group_key for d in held + train)
+    assert all(is_held_out(d.group_key, 0.5) for d in held)
+    assert not any(is_held_out(d.group_key, 0.5) for d in train)
+    singles = list(iter_documents(list(parts[0].paths), 0, tok, halves))
+    assert singles
+    assert all(d.group_key == raw_groups[d.doc_id] for d in singles)
+
+
 def ids_of(mixer: Mixer, count: int) -> list[str]:
     out: list[str] = []
     for _ in range(count):

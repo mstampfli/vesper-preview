@@ -25,6 +25,14 @@ after every epoch are kept. Each epoch, the unchanged checkpoint included as epo
 the validation split at a fixed depth (``evaluate_examples``); the epoch with the lowest pooled
 validation body NLL among 1.. is selected, ties to the earlier.
 
+Replay (optional, the config's ``replay`` section; maintainer B's design, 758b4fd): every update
+also scores rows of the source run's own TRAINING text (``instruct_replay.ReplaySource``: the
+checkpoint's pinned components and finalization, the training side, the replay's own seed,
+every row checked against the accepted pin's held-out documents and groups and recorded in
+``train.jsonl``) and adds ``weight`` times their mean loss to the instruction loss; the
+gradients of both accumulate at the same weights, are clipped once and make ONE optimizer step
+(``_device_step``). Weight 0, or no section, is the update without replay and reads no row.
+
 Forgetting: the days run's own held-out view (``days_view``: the checkpoint's PINNED components,
 its finalization checked against its identity, the first chunks of the held-out stream, every
 document inside the accepted test pin, the view's digest equal to the config's) is checked
@@ -63,7 +71,7 @@ from torch import Tensor, nn
 
 from vesper.column import ColumnState, set_scan, state_tensors
 from vesper.config import InstructConfig, VesperConfig, parse_instruct_bytes
-from vesper.corpus import Split, load_finalization
+from vesper.corpus import Component, Finalization, Split, load_finalization
 from vesper.data import Chunk
 from vesper.decode import CapturedDecoder
 from vesper.evals import EvalGraphs, run_chunks, static_profile
@@ -82,18 +90,20 @@ from vesper.instruct_data import (
     Prepared,
     SplitRule,
     batches,
+    int64_bytes,
     load_records,
     prepare,
     prompt_text,
 )
 from vesper.instruct_panel import SCORING, Panel, answer_of, load_panel, score_answer
+from vesper.instruct_replay import ReplayRows, ReplaySource
 from vesper.keys import SequenceDigest, hashed_bytes, verified_bytes
 from vesper.learning import warmup_cosine
 from vesper.loop import DenseRule
 from vesper.model import Vesper
 from vesper.provenance import environment
 from vesper.tokenizer import Tokenizer
-from vesper.train import checked_record, decays, resumed_components, set_learning_rate
+from vesper.train import checked_record, components_of_record, decays, set_learning_rate
 
 ATTRIBUTION = (
     "databricks-dolly-15k, CC BY-SA 3.0: Databricks, Inc. and the Wikipedia contributors whose"
@@ -125,6 +135,7 @@ class Recipe:
     max_new_tokens: int
     recompute: bool
     slices: int
+    replay_weight: float = 0.0  # the replay loss's coefficient; 0: no replay (config.ReplayConfig)
 
 
 def recipe_for(
@@ -161,6 +172,7 @@ def recipe_for(
         max_new_tokens=icfg.max_new_tokens,
         recompute=recompute,
         slices=slices,
+        replay_weight=0.0 if icfg.replay is None else icfg.replay.weight,
     )
 
 
@@ -190,16 +202,24 @@ def tuning_optimizer(model: Vesper, recipe: Recipe, *, capturable: bool) -> torc
 
 @dataclass(frozen=True)
 class StepRecord:
-    """One update: the objective, the clipped gradient's norm, each pass's loss, the labels."""
+    """One update: its losses, the gradient's norm before the clip and the labels.
+
+    ``loss`` and ``pass_loss`` are the instruction batch's; with replay, ``replay_loss`` and
+    ``replay_labels`` are the replay rows', and ``objective`` is loss + weight * replay_loss
+    (the instruction loss itself without replay).
+    """
 
     loss: float
     grad_norm: float
     pass_loss: list[float]
     labels: int
     seconds: float
+    objective: float
+    replay_loss: float | None
+    replay_labels: int
 
 
-def _batch_values(batch: Batch, device: torch.device) -> list[Tensor]:
+def _batch_values(batch: Batch | ReplayRows, device: torch.device) -> list[Tensor]:
     return [t.to(device) for t in (batch.tokens, batch.targets, batch.valid, batch.pos)] + [
         batch.loss_mask.to(device)
     ]
@@ -211,15 +231,13 @@ def _chunk_of(tokens: Tensor, targets: Tensor, valid: Tensor, pos: Tensor, mask:
     return Chunk(tokens, targets, valid, zeros, torch.zeros_like(pos), mask, pos, (), ())
 
 
-def _device_step(
-    model: Vesper, opt: torch.optim.AdamW, recipe: Recipe, values: Sequence[Tensor]
-) -> list[Tensor]:
-    """The whole update with no read-back: capturable. Cold states are made here, every call."""
+def _objective(
+    model: Vesper, recipe: Recipe, values: Sequence[Tensor]
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """The fixed all-pass objective of one set of rows, each row from cold states made here."""
     tokens, targets, valid, pos, mask = values
     device = tokens.device
     states = model.init_states(int(tokens.shape[0]), torch.float32, device)
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt.zero_grad(set_to_none=True)
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
@@ -231,7 +249,7 @@ def _device_step(
             recompute=recipe.recompute,
             exit_rule=DenseRule(),
         )
-        value, parts = model.all_pass_objective(
+        return model.all_pass_objective(
             _chunk_of(tokens, targets, valid, pos, mask),
             result,
             condition="fixed",
@@ -239,10 +257,32 @@ def _device_step(
             slices=recipe.slices,
             keep_logits=not recipe.recompute,
         )
+
+
+def _device_step(
+    model: Vesper, opt: torch.optim.AdamW, recipe: Recipe, values: Sequence[Tensor]
+) -> list[Tensor]:
+    """The whole update with no read-back: capturable.
+
+    ``values`` are the instruction batch's five tensors, followed by the replay rows' five when
+    ``recipe.replay_weight`` > 0. The gradients are cleared once; the instruction loss's backward
+    and then the weighted replay loss's backward accumulate at the same weights (one after the
+    other, so the two activation sets are never held together); the combined gradient is
+    clipped once and ONE optimizer step is taken (maintainer B 758b4fd). Without replay this is the
+    original update, operation for operation.
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt.zero_grad(set_to_none=True)
+    value, parts = _objective(model, recipe, values[:5])
     torch.autograd.backward([value])
+    out = [value.detach().float()]
+    if recipe.replay_weight > 0:
+        replayed, _ = _objective(model, recipe, values[5:])
+        torch.autograd.backward([replayed * recipe.replay_weight])
+        out.append(replayed.detach().float())
     grad_norm = nn.utils.clip_grad_norm_(params, recipe.grad_clip).float()
     _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
-    return [value.detach().float(), grad_norm, parts["pass_ntp"].float()]
+    return [*out, grad_norm, parts["pass_ntp"].float()]
 
 
 def train_step(
@@ -252,38 +292,66 @@ def train_step(
     lr: float,
     recipe: Recipe,
     graphs: GraphFamily | None,
+    replay: ReplayRows | None = None,
 ) -> StepRecord:
-    """One update on ``batch``, every row a cold, independent example.
+    """One update on ``batch``, every row a cold, independent example, plus ``replay``'s rows.
 
-    The loss is pooled over the batch's real labels. On CUDA a captured graph per batch length
-    (``graphs``' member ``("train", length)``, required: each length warms eagerly
-    ``WARM_STEPS`` times, then captures and replays; the family's members share one memory
-    pool); on the CPU the same device step runs directly.
+    The loss is pooled over the batch's real labels; with ``recipe.replay_weight`` > 0 the
+    replay rows' loss, pooled over their own scored targets, is added with that weight in the
+    same update (``_device_step``). On CUDA a captured graph per batch length (``graphs``'
+    member ``("train", length)``, required: each length warms eagerly ``WARM_STEPS`` times,
+    then captures and replays; the family's members share one memory pool; the replay rows'
+    fixed shape and the weight are part of its signature); on the CPU the same device step
+    runs directly.
 
     Raises:
-        ValueError: on CUDA without ``graphs``.
+        ValueError: on CUDA without ``graphs``; replay rows without a weight, or a weight
+            without rows.
     """
     device = next(model.parameters()).device
     if device.type == "cuda" and graphs is None:
         msg = "a CUDA update runs as a captured CUDA graph: pass graphs (warm, capture, replay)"
         raise ValueError(msg)
+    replaying = recipe.replay_weight > 0
+    if replaying != (replay is not None):
+        msg = (
+            "a replay weight needs replay rows"
+            if replaying
+            else "replay rows with weight 0: weight 0 reads no replay rows"
+        )
+        raise ValueError(msg)
     started = time.monotonic()
     set_learning_rate(opt, lr)
     values = _batch_values(batch, device)
+    if replay is not None:
+        values += _batch_values(replay, device)
     if graphs is None:
         out: Sequence[Tensor] = _device_step(model, opt, recipe, values)
     else:
         length = int(batch.tokens.shape[1])
         graph = graphs(("train", length))
-        key = signature(values, "instruct", recipe.train_passes, recipe.recompute, recipe.slices)
+        key = signature(
+            values,
+            "instruct",
+            recipe.train_passes,
+            recipe.recompute,
+            recipe.slices,
+            recipe.replay_weight,
+        )
         out = graph(key, lambda v: _device_step(model, opt, recipe, v), values)
-    record = torch.cat([out[0].reshape(1), out[1].reshape(1), out[2]]).double().cpu()
+    scalars = 3 if replaying else 2
+    record = torch.cat([*(t.reshape(1) for t in out[:scalars]), out[scalars]]).double().cpu()
+    loss = float(record[0])
+    replay_loss = float(record[1]) if replaying else None
     return StepRecord(
-        loss=float(record[0]),
-        grad_norm=float(record[1]),
-        pass_loss=cast("list[float]", record[2:].tolist()),  # pyright: ignore[reportUnknownMemberType]
+        loss=loss,
+        grad_norm=float(record[scalars - 1]),
+        pass_loss=cast("list[float]", record[scalars:].tolist()),  # pyright: ignore[reportUnknownMemberType]
         labels=int(batch.loss_mask.sum()),
         seconds=time.monotonic() - started,
+        objective=loss if replay_loss is None else loss + recipe.replay_weight * replay_loss,
+        replay_loss=replay_loss,
+        replay_labels=0 if replay is None else int(replay.loss_mask.sum()),
     )
 
 
@@ -629,6 +697,34 @@ class Binding:
         return [name for name, a, b in pairs if a != b]
 
 
+def _source_corpus(
+    source: Path, loaded: TextSource, *, data: Path, finalization: Path
+) -> tuple[list[Component], Finalization]:
+    """The checkpoint's own pinned components and its finalization, checked against its identity.
+
+    ``loaded`` is the checkpoint at ``source`` as the caller loaded and checked it. The record is
+    read ONCE here; that snapshot must be the loaded checkpoint (identity and model.pt hash,
+    maintainer B's review of eb4d9f9), and the components are resolved from the same snapshot
+    (``train.components_of_record``, whose recipe must hash to that identity), so nothing read
+    later can change them (maintainer B's review of 01e2b3f).
+
+    Raises:
+        ValueError: when the checkpoint is not the loaded one, its recipe does not hash to its
+            identity, or the finalization does not hash as recorded.
+    """
+    identity = loaded.identity
+    checked = checked_record(source)
+    same = (
+        checked.record.get("identity") == identity
+        and checked.manifest.get("model.pt") == loaded.model_sha256
+    )
+    if not same:
+        msg = f"{source} is no longer the checkpoint that was loaded"
+        raise ValueError(msg)
+    parts = components_of_record(data, checked, source)
+    return parts, load_finalization(finalization, sha256=identity["finalization_sha256"])
+
+
 def days_view(  # noqa: PLR0913
     source: Path,
     loaded: TextSource,
@@ -643,9 +739,9 @@ def days_view(  # noqa: PLR0913
     """The days run's held-out view and its record, checked before any model reads it.
 
     ``loaded`` is the checkpoint at ``source`` as the caller already loaded and checked it; the
-    record read here must still be that one (its identity and model.pt hash), before and after
-    ``train.resumed_components`` reads it, so the view belongs to the model that is scored on it
-    (maintainer B's review of eb4d9f9: a later reload saw replaced files). Then the checkpoint's own
+    record read once in ``_source_corpus`` must be that one (its identity and model.pt hash) and
+    the components are resolved from that snapshot, so the view belongs to the model that is
+    scored on it (maintainer B's reviews of eb4d9f9 and 01e2b3f). Then the checkpoint's own
     pinned components (today's selection cannot change them), its finalization receipt checked
     against the identity, the first ``eval_chunks`` chunks of the seed-0 held-out stream at
     ``icfg.days_micro`` slots, every document inside the accepted test pin
@@ -657,23 +753,9 @@ def days_view(  # noqa: PLR0913
     Raises:
         ValueError: on any of those checks.
     """
-    cfg, identity = loaded.cfg, loaded.identity
-
-    def still_loaded() -> None:
-        record, manifest = checked_record(source)
-        same = record["identity"] == identity and manifest.get("model.pt") == loaded.model_sha256
-        if not same:
-            msg = f"{source} is no longer the checkpoint that was loaded"
-            raise ValueError(msg)
-
-    still_loaded()
-    parts = resumed_components(data, source)
-    still_loaded()
-    held = Split(
-        load_finalization(finalization, sha256=identity["finalization_sha256"]),
-        cfg.training.held_out_fraction,
-        held_out=True,
-    )
+    cfg = loaded.cfg
+    parts, fin = _source_corpus(source, loaded, data=data, finalization=finalization)
+    held = Split(fin, cfg.training.held_out_fraction, held_out=True)
     pinned = validation_chunks(parts, tok, held, cfg, pin, micro=icfg.days_micro)
     if pinned.pin_sha256 != icfg.pin_sha256:
         msg = f"the pin {pin} is not the config's ({pinned.pin_sha256} != {icfg.pin_sha256})"
@@ -682,7 +764,7 @@ def days_view(  # noqa: PLR0913
     documents: set[str] = set()
     for chunk in pinned.chunks:
         for t in (chunk.tokens, chunk.targets, chunk.loss_mask, chunk.pos):
-            digest.add(_tensor_bytes(t))
+            digest.add(int64_bytes(t))
         digest.add("\n".join("\t".join(slot) for slot in chunk.doc_ids).encode())
         documents.update(d for slot in chunk.doc_ids for d in slot)
     view_sha256 = digest.hexdigest()
@@ -705,12 +787,6 @@ def days_view(  # noqa: PLR0913
 
 
 # --- the commands -----------------------------------------------------------------------------
-
-
-def _tensor_bytes(t: Tensor) -> bytes:
-    # the int64 values' native little-endian bytes (as numpy's tobytes would give them)
-    flat = t.to(torch.int64).contiguous().view(torch.uint8).flatten()
-    return bytes(cast("list[int]", flat.tolist()))  # pyright: ignore[reportUnknownMemberType]
 
 
 def _snapshot(model: Vesper) -> dict[str, Tensor]:
@@ -890,6 +966,7 @@ class _Training:
     recipe: Recipe
     prepared: Prepared
     device: torch.device
+    replay: ReplaySource | None  # one row set per update when the recipe's weight is above 0
 
 
 @dataclass(frozen=True)
@@ -975,8 +1052,9 @@ def _train(run: _Training, phases: MemoryPhases) -> _Trained:  # noqa: PLR0915
                             warmup=recipe.warmup_steps,
                             final_fraction=recipe.final_lr_fraction,
                         )
-                        rec = train_step(model, opt, batch, lr, recipe, graphs)
-                        if not math.isfinite(rec.loss):
+                        rows = None if run.replay is None else run.replay.next()
+                        rec = train_step(model, opt, batch, lr, recipe, graphs, replay=rows)
+                        if not math.isfinite(rec.objective):
                             msg = f"non-finite loss at step {step}"
                             raise FloatingPointError(msg)
                         line: dict[str, object] = {
@@ -986,6 +1064,8 @@ def _train(run: _Training, phases: MemoryPhases) -> _Trained:  # noqa: PLR0915
                             "length": int(batch.tokens.shape[1]),
                             **cast("dict[str, object]", asdict(rec)),
                         }
+                        if rows is not None:
+                            line["replay_rows"] = rows.record
                         with log_path.open("a") as handle:
                             _ = handle.write(json.dumps(line) + "\n")
                         step += 1
@@ -1009,6 +1089,57 @@ def _train(run: _Training, phases: MemoryPhases) -> _Trained:  # noqa: PLR0915
         )
     finally:
         phases.graphs = None  # the records keep the counts; the family ends with this scope
+
+
+def _replay_source(
+    args: argparse.Namespace, inputs: _Inputs
+) -> tuple[ReplaySource | None, dict[str, object]]:
+    """The run's replay rows (``instruct_replay``) and their record; none without a weight.
+
+    The source's own pinned components and finalization (``_source_corpus``), its tokenizer
+    (``_inputs``), the configured held-out fraction, the training side, and the accepted pin's
+    bytes checked against the config's hash; all of it identified in the record. Weight 0, or
+    no ``replay`` section, reads nothing.
+
+    Raises:
+        ValueError: on any failed check of those inputs.
+    """
+    replay = inputs.icfg.replay
+    config = None if replay is None else cast("dict[str, object]", asdict(replay))
+    if replay is None or replay.weight == 0:
+        return None, {"config": config, "rows_read": False}
+    source = inputs.source
+    parts, fin = _source_corpus(
+        cast("Path", args.source),
+        source,
+        data=cast("Path", args.data),
+        finalization=cast("Path", args.finalization),
+    )
+    fraction = source.cfg.training.held_out_fraction
+    pin = verified_bytes(cast("Path", args.pin), inputs.icfg.pin_sha256, "the accepted test pin")
+    rows = ReplaySource(parts, inputs.tok, Split(fin, fraction), replay, pin)
+    return rows, {
+        "config": config,
+        "rows_read": True,
+        "side": "training",
+        "held_out_fraction": fraction,
+        "finalization_sha256": source.identity["finalization_sha256"],
+        "tokenizer_sha256": source.identity["tokenizer_sha256"],
+        "pin_sha256": inputs.icfg.pin_sha256,
+        "components": [
+            {
+                "name": c.name,
+                "share": c.share,
+                "generation": c.generation,
+                "paths": [str(p) for p in c.paths],
+            }
+            for c in parts
+        ],
+        "objective": (
+            "instruction mean + weight * replay mean, each over its own scored targets and the"
+            " dense passes; one clipped AdamW step per update"
+        ),
+    }
 
 
 def tune(args: argparse.Namespace) -> int:
@@ -1039,6 +1170,7 @@ def tune(args: argparse.Namespace) -> int:
         finalization=cast("Path", args.finalization),
         pin=cast("Path", args.pin),
     )
+    replay, replay_record = _replay_source(args, inputs)
     base_state = _snapshot(source.model)  # the checked source, kept: no later reload
     prepared = _limited(inputs.prepared, limit, recipe.buckets)
     out.mkdir(parents=True, exist_ok=False)
@@ -1050,8 +1182,11 @@ def tune(args: argparse.Namespace) -> int:
     phases = MemoryPhases(device, out / "memory.jsonl")
     # the training model, its optimizer and graphs end with this call; only its results remain
     trained = _train(
-        _Training(out, cfg, base_state, source.model_sha256, recipe, prepared, device), phases
+        _Training(out, cfg, base_state, source.model_sha256, recipe, prepared, device, replay),
+        phases,
     )
+    if replay is not None:
+        replay_record["consumed"] = replay.summary()
     epochs, per_epoch, unchanged = trained.epochs, trained.per_epoch, trained.halting_unchanged
     weights_dir = out / "weights"
     nlls = [cast("float", e["body_nll"]) for e in epochs[1:]]
@@ -1097,6 +1232,7 @@ def tune(args: argparse.Namespace) -> int:
         ),
         "halting_unchanged": unchanged,
         "forgetting": forgetting,
+        "replay": replay_record,
         # the training/validation family per (kind, batch length): [captures, replays]; the
         # forgetting forwards run their own graphs, not counted here
         "graphs": trained.graphs,
