@@ -7,6 +7,46 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-26, 08:38Z: the stopping rule's training repeated with two more seeds
+
+**What changed.** The small stopping head behind the 10-25 09:25Z result was trained twice more
+from the same head initialization and a fresh optimizer. Training seeds 1 and 2 changed the data order and
+action draws; the original was seed 0. Each new terminal head was evaluated with the fixed
+Bounded23 rule on the same validation text as the original. The rule and terminal-checkpoint
+choice were fixed before these repeats. Nothing was tuned between them, and they read no
+test data.
+
+- The model: the days run's final backbone (step 427,000), unchanged. Per seed, 20,000 updates
+  of the stopping head at depth price 0.672, on this box's own card.
+- Results on the validation text (loss in nats, lower is better; the benchmark is the best
+  mixture of fixed-depth runs at no greater average number of passes; the random controls sample
+  each token's stopping depth from the rule's observed depth proportions and replay the model;
+  their realized mean depths differ slightly):
+
+  | seed | passes | rule loss | benchmark | rule minus benchmark | ahead of the 4 random controls by |
+  |------|--------|-----------|-----------|----------------------|-----------------------------------|
+  | 0 (original) | 2.66 | 3.36258 | 3.36495 | -0.0024 | 0.0065 to 0.0072 |
+  | 1 | 2.65 | 3.36364 | 3.36563 | -0.0020 | 0.0061 to 0.0068 |
+  | 2 | 2.65 | 3.36417 | 3.36603 | -0.0019 | 0.0061 to 0.0068 |
+
+**What it means for you.** The small validation advantage repeated in both new training runs,
+by similar margins. The positive result is now observed in three training runs on this
+backbone, at this price, on the reused validation view. The two prospective repetitions support
+repeatability here without estimating reliability across training seeds or extending the result
+to other backbones, prices or model sizes. Only the original head had the one held-out test. The saving is still
+in passes, not in measured running time, and fixed 3 passes for every token still predicts better than the rule.
+
+**What is next.** Complete the instruction-tuning GPU lifecycle check. The CPU functional
+review is complete; the subsequent graph-pooling changes are under independent review.
+The larger preflight has not fit the 16 GB card beside the embedding service. After code
+review, the next bounded preflight will temporarily free that service's GPU memory. Any
+further memory change gets its own checks. A full tuning run and final evaluation remain
+unselected.
+
+**Where the details are.** Export phase2-final-seeds (both seeds' training logs, weights,
+evaluations, the runner and the reproduction control on seed 0) with SHA256SUMS, and maintainer B's
+review seeds-9df6de0.
+
 ## 2026-10-25, 09:25Z: adaptive stopping on text passes a held-out test
 
 **What changed.** This text pilot has its first positive held-out result for a rule that chooses

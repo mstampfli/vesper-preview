@@ -44,7 +44,8 @@ conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
 # Transitive floors the audit demands (pip-audit in gate.sh); each names its advisory.
 constraint-dependencies = [
   "certifi>=2026.10.19", # GHSA-6q48-6c7w-9gw2, remove the affected emSign trust root
-  "setuptools>=83.0.0",  # PYSEC-2026-3447, pulled in transitively
+  "filelock>=4.2.1",     # CVE-2026-112906/-112907/-112913/-112914/-112937/-112940
+  "setuptools>=84.1.0",  # GHSA-xmj3-9gf7-h52w (was >=83.0.0 for PYSEC-2026-3447)
 ]
 
 [tool.uv.sources]
