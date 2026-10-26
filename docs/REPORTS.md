@@ -7,6 +7,71 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-26, 15:56Z: instruction tuning improves answer form, with a forgetting cost
+
+**What changed.** The days run's final model (step 427,000) completed one instruction-tuning
+trial on 13,296 Dolly examples: three epochs at a peak learning rate of 3e-5, with the planned
+warmup and decay. The whole trial took about 25 minutes. After 12 eager warmup updates across four
+batch lengths, the remaining 1,278 updates used captured CUDA graphs. Epoch 1 was selected
+by the lowest pooled validation response-body loss among epochs 1, 2 and 3.
+
+The 743 validation examples were split by connected groups of matching normalized instruction
+text or nonempty context. This controls those exact-text matches, not semantic overlap. No
+reserved test examples were evaluated by a model. The validation set was used for selection.
+
+- Response-body loss in nats per token: 3.103 before tuning, 2.924 at epoch 1, 2.939 at epoch 2
+  and 2.967 at epoch 3. The selected improvement is -0.179. Its descriptive paired 95% group
+  resampling interval is [-0.205, -0.157] over 718 groups; this is not fresh confirmation after
+  selecting on the same validation set.
+- Terminator loss falls from 5.34 to 0.46 at epoch 1. On the days run's held-out general text,
+  perplexity instead rises from 25.26 to 29.53 (+0.156 nats per token). The follow-up curve
+  reproduces those values and reaches 32.55 at epoch 2 and 34.63 at epoch 3.
+- Twenty validation prompts were chosen by a fixed category rule before inspecting outputs.
+  The base model continues text or repeats headings and lists, reaching the length cap every
+  time. The selected model emits its end marker in 13 of 20 cases and produces more recognizable
+  answer forms, but often fails the request. It omits requested numbers already in the context,
+  gives countries that do not start with the requested letter, changes Indiana to Iceland and
+  repeats even in some answers that terminate. One answer matches its reference after trimming
+  whitespace, and another extracts a relevant sentence. These are illustrations, not an accuracy
+  estimate or evidence that a matching instrument-classification template establishes knowledge.
+- A captured single-token GPU decoder uses a fixed-capacity, position-masked attention cache.
+  In the selected measurement all 40 answer texts, stop reasons and generated-token counts
+  match the CPU results. The generation calls, including prompt processing and host stopping
+  checks, total 35.57 seconds versus 192.22 seconds on 12 CPU threads; model loading is excluded.
+  A separate already-captured step loop reports a 4.48 ms median over 190 retained observations.
+  Prompt processing and answer generation have not yet been timed separately. These timings
+  compare the complete measured paths, not capture alone against an otherwise identical GPU path.
+- A second bounded trial changed only the peak rate, to 1e-5, on the same code, data and
+  reused validation set. Its response-body loss is 2.914, 2.906 and 2.908 at epochs 1 to 3;
+  epoch 2 is selected (-0.196, descriptive interval [-0.220, -0.177]). Held-out general-text
+  perplexity at the selected epoch rises from 25.26 to 27.20 (+0.074 nats per token), about
+  half of the 3e-5 trial's rise. One run per rate. The 3e-5 follow-up measured all three saved
+  epochs; for 1e-5, only the selected epoch's forgetting is measured.
+- On the same twenty validation prompts, the lower-rate model stops in 15 cases versus 13 for
+  the first trial. Content remains mixed: one requested single-sentence summary improves, while
+  the previously correct instrument classification becomes wrong and several requests remain
+  unanswered; this is not an accuracy estimate.
+
+**What it means for you.** Tuning produces a visible improvement in answer format and
+stopping, while substantial task failures remain and general-text prediction worsens on the
+measured view. It does not isolate model size, data quality or forgetting as the cause. In
+these two runs the lower rate fit the reference answers slightly better and reduced the
+measured general-text loss increase by about 53%.
+
+**What is next.** A decision on whether to test a further forgetting remedy (for example
+mixing general text into tuning); no such run is selected yet. No reserved final test has been
+selected. The decoder corrections and final-command integration are reviewed. On CUDA, final
+now reuses one captured decoder per model across its panel and illustrations; an owned
+synthetic lifecycle matches the CPU answers. The 35.57-second measurement above comes from the
+separate validation-answer runner, not a measured full final-command run.
+
+**Where the details are.** Exports instruction-trial-full-e8407f9,
+instruction-forgetting-curve-e8407f9, instruction-pairs-epoch1-e8407f9,
+instruction-trial-lr1e-5-e8407f9, instruction-answers-lr1e5-epoch2-b55852c,
+review-evidence-decode-0e342c3 and review-evidence-decodefix-b55852c, each with SHA256SUMS,
+and maintainer B's reviews instruction-trial-full-008fdfc, decode-0e342c3, decodefix-b55852c,
+instruction-lr1e5-a3f71d9 and answers-lr1e5-b990094.
+
 ## 2026-10-26, 08:38Z: the stopping rule's training repeated with two more seeds
 
 **What changed.** The small stopping head behind the 10-25 09:25Z result was trained twice more

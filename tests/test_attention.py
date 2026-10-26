@@ -4,7 +4,16 @@ import pytest
 import torch
 from torch import Tensor
 
-from vesper.attention import KVCache, WindowedAttention, kv_cache_empty, kv_cache_push, rotary
+from vesper.attention import (
+    KVCache,
+    RingKVCache,
+    WindowedAttention,
+    kv_cache_empty,
+    kv_cache_push,
+    kv_ring_empty,
+    kv_ring_write,
+    rotary,
+)
 from vesper.contracts import ContractError
 
 D, H, KV_GROUPS, DK, W = 32, 4, 2, 8, 16
@@ -136,3 +145,74 @@ def test_rejects_non_consecutive_positions() -> None:
     gappy[:, 5:] += 1
     with pytest.raises(ContractError, match="consecutive"):
         _ = attn.forward(x, gappy, _empty(1))
+
+
+def test_a_ring_attends_by_position_not_by_slot_order() -> None:
+    # Maintainer B's example (b8d0a5f): slots hold positions [3, 1, 2] with values [30, 10, 20]; the
+    # new token is position 4, value 40; window 3 and equal logits. The window is positions 2..4, so
+    # the mean is 30; taking the last three array entries ([10, 20, 40]) would give 23.33.
+    attn = WindowedAttention(d=2, heads=1, kv_groups=1, head_dim=2, window=3, rotary_base=BASE)
+    attn = attn.to(F64)
+    ring = RingKVCache(
+        k=torch.zeros(1, 3, 1, 2, dtype=F64),
+        v=torch.tensor((30.0, 10.0, 20.0), dtype=F64).view(1, 3, 1, 1).expand(1, 3, 1, 2),
+        pos=torch.tensor(((3, 1, 2),)),
+        valid=torch.ones(1, 3, dtype=torch.bool),
+        window=3,
+    )
+    q = torch.zeros(1, 1, 1, 2, dtype=F64)  # equal logits for every visible key
+    k = torch.zeros(1, 1, 1, 2, dtype=F64)
+    v = torch.full((1, 1, 1, 2), 40.0, dtype=F64)
+    y, after = attn.attend_ring(q, k, v, torch.tensor(((4,),)), ring)
+    expected = attn.output(torch.full((1, 1, 1, 2), 30.0, dtype=F64))
+    torch.testing.assert_close(y, expected, rtol=0, atol=1e-12)
+    # the new token took slot 4 % 3 = 1 (position 1 left the window), and is valid
+    assert torch.equal(after.pos, torch.tensor(((3, 4, 2),)))
+    assert float(after.v[0, 1, 0, 0]) == 40.0
+    assert after.valid.all()
+
+
+def test_ring_decoding_equals_the_growing_cache_and_the_whole_chunk_past_the_window() -> None:
+    attn = _attn()
+    steps = 3 * W + 5  # past the window, the ring wraps more than once
+    x, pos = _inputs(2, steps, 7)
+    whole, _ = attn.forward(x, pos, _empty(2))
+    ring, cache = kv_ring_empty(2, HKV, DK, W, F64, CPU), _empty(2)
+    for i in range(steps):
+        q, k, v = attn.project(x[:, i : i + 1], pos[:, i : i + 1])
+        y_ring, ring = attn.attend_ring(q, k, v, pos[:, i : i + 1], ring)
+        y_grow, cache = attn.attend(q, k, v, pos[:, i : i + 1], cache)
+        torch.testing.assert_close(y_ring, y_grow, rtol=0, atol=1e-12)
+        torch.testing.assert_close(y_ring, whole[:, i : i + 1], rtol=0, atol=1e-12)
+        # the ring holds exactly the growing cache's entries, wherever they sit
+        held = ring.valid[0]
+        assert torch.equal(ring.pos[0][held].sort().values, cache.pos[0])
+    assert ring.k.shape == (2, W, HKV, DK)  # never reallocated to another shape
+
+
+def test_ring_rows_write_their_own_slots() -> None:
+    ring = kv_ring_empty(2, HKV, DK, 4, F64, CPU)
+    k = torch.ones(2, 1, HKV, DK, dtype=F64)
+    v = torch.stack([torch.full((1, HKV, DK), 1.0), torch.full((1, HKV, DK), 2.0)]).to(F64)
+    after = kv_ring_write(ring, k, v, torch.tensor(((5,), (6,))))
+    written = torch.tensor(((False, True, False, False), (False, False, True, False)))
+    assert torch.equal(after.valid, written)
+    assert after.pos[0, 1] == 5
+    assert after.pos[1, 2] == 6
+    assert float(after.v[1, 2, 0, 0]) == 2.0
+    assert float(after.v[0, 2].abs().sum()) == 0.0  # unwritten slots stay finite zeros
+    assert not ring.valid.any()  # the input ring is unchanged
+
+
+def test_a_ring_refuses_chunks_other_windows_and_negative_positions() -> None:
+    attn = _attn()
+    x, pos = _inputs(1, 2, 0)
+    q, k, v = attn.project(x, pos)
+    ring = kv_ring_empty(1, HKV, DK, W, F64, CPU)
+    with pytest.raises(ContractError):
+        _ = attn.attend_ring(q, k, v, pos, ring)  # two tokens
+    other = kv_ring_empty(1, HKV, DK, W + 1, F64, CPU)
+    with pytest.raises(ContractError):
+        _ = attn.attend_ring(q[:, :1], k[:, :1], v[:, :1], pos[:, :1], other)
+    with pytest.raises(ContractError, match="nonnegative"):
+        _ = kv_ring_write(ring, k[:, :1], v[:, :1], torch.tensor(((-1,),)))

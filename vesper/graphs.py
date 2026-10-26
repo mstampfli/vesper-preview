@@ -22,12 +22,16 @@ anything on the CPU. ``deterministic_algorithms`` makes a CUDA training loop rep
 captured or eager (measured 2026-10-19: without it two runs with equal inputs diverged).
 """
 
+import json
 import os
+import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch import Tensor
+from torch.cuda import _POOL_HANDLE  # pyright: ignore[reportPrivateUsage]  # graph_pool_handle's type
 
 from vesper.contracts import ContractError
 
@@ -45,11 +49,17 @@ def side_stream() -> Generator[None]:
 class CapturedStep:
     """A step function captured once over static inputs; ``replay`` runs it on new values."""
 
-    def __init__(self, step: Callable[[], Sequence[Tensor]], inputs: Sequence[Tensor]) -> None:
+    def __init__(
+        self,
+        step: Callable[[], Sequence[Tensor]],
+        inputs: Sequence[Tensor],
+        pool: _POOL_HANDLE | None = None,
+    ) -> None:
         """Capture ``step``, which must read its batch only from ``inputs`` (CUDA tensors).
 
         Capturing records the work without running it: the first ``replay`` is the first time
-        it runs.
+        it runs. ``pool``: capture into that shared memory pool (``GraphFamily``), else the
+        graph's own.
 
         Raises:
             ContractError: if an input is not a CUDA tensor.
@@ -60,7 +70,7 @@ class CapturedStep:
                 raise ContractError(msg)
         self.inputs: tuple[Tensor, ...] = tuple(inputs)
         self._graph: torch.cuda.CUDAGraph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph):
+        with torch.cuda.graph(self._graph, pool=pool):
             outputs = tuple(step())
         self.outputs: tuple[Tensor, ...] = outputs
 
@@ -185,13 +195,14 @@ class WarmedGraph:
     decisions change between calls without a ``reset``.
     """
 
-    def __init__(self, warm: int = WARM_STEPS) -> None:
-        """Nothing is captured yet; the first ``warm`` calls run eagerly."""
+    def __init__(self, warm: int = WARM_STEPS, pool: _POOL_HANDLE | None = None) -> None:
+        """Nothing captured yet; the first ``warm`` calls run eagerly; captures go to ``pool``."""
         self.warm: int = warm
         self.captures: int = 0
         self.replays: int = 0
         self._eager: int = 0
         self._captured: CapturedStep | None = None
+        self._pool: _POOL_HANDLE | None = pool
 
     def reset(self) -> None:
         """Drop the capture: the next ``warm`` calls are eager again, then a new capture."""
@@ -216,7 +227,7 @@ class WarmedGraph:
                 return tuple(step(values))
         if self._captured is None:
             static = [value.clone() for value in values]  # owned buffers, never the caller's
-            self._captured = CapturedStep(lambda: step(static), static)
+            self._captured = CapturedStep(lambda: step(static), static, self._pool)
             self.captures += 1
         self.replays += 1
         return self._captured.replay(values)
@@ -238,13 +249,14 @@ class SignatureGraph:
     equality test compares against, not a run mode.
     """
 
-    def __init__(self, warm: int = WARM_STEPS) -> None:
-        """Nothing captured yet."""
+    def __init__(self, warm: int = WARM_STEPS, pool: _POOL_HANDLE | None = None) -> None:
+        """Nothing captured yet; every capture goes to ``pool`` (``GraphFamily``) if given."""
         self.warm: int = warm
         self.captures: int = 0
         self.replays: int = 0
         self._key: tuple[object, ...] | None = None
         self._graph: WarmedGraph | None = None
+        self._pool: _POOL_HANDLE | None = pool
 
     def __call__(
         self,
@@ -258,13 +270,51 @@ class SignatureGraph:
             ContractError: as ``WarmedGraph``.
         """
         if key != self._key or self._graph is None:
-            self._key, self._graph = key, WarmedGraph(self.warm)
+            self._key, self._graph = key, WarmedGraph(self.warm, self._pool)
         graph = self._graph
         captures, replays = graph.captures, graph.replays
         out = graph(step, values)
         self.captures += graph.captures - captures
         self.replays += graph.replays - replays
         return out
+
+
+class GraphFamily:
+    """PRIMITIVE one ``SignatureGraph`` per key, every member captured into ONE memory pool.
+
+    Members never run at the same time (one stream, one call at a time), so their working
+    memory can be the same memory: freed working memory of one member's capture is reused by the
+    others, so the family can hold much less than the sum of separate pools; what each member
+    keeps (its outputs) and the allocator's block overhead stay, so the size is not bounded by
+    the largest member (the test measures one saving, not a bound; maintainer B, ad39b41). Measured
+    need: the instruction-tuning preflight of 709df83 ran out of
+    memory on the 16 GB card with one separate pool per batch length for training and for
+    evaluation. ``captures`` and ``replays`` per key are the members' own counters.
+
+    For: alternating kinds of GPU work with distinct shapes, e.g. one graph per batch length,
+    whose outputs the caller reads or copies before the next replay of ANY member (a later
+    member's replay may reuse that memory). Not for: outputs that must survive another member's
+    replay, members run on concurrent streams, or one shape repeated (a plain ``SignatureGraph``).
+    """
+
+    def __init__(self, warm: int = WARM_STEPS) -> None:
+        """No member and no pool yet: the pool is made at the first member, on CUDA only."""
+        self.warm: int = warm
+        self.members: dict[object, SignatureGraph] = {}
+        self._pool: _POOL_HANDLE | None = None
+
+    def __call__(self, key: object) -> SignatureGraph:
+        """The member for ``key``, made (in the family's pool) on first use."""
+        if key not in self.members:
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            self.members[key] = SignatureGraph(self.warm, self._pool)
+        return self.members[key]
+
+    def counts(self) -> dict[str, list[int]]:
+        """Each member's ``[captures, replays]``, by ``str(key)`` in key order (for a record)."""
+        named = {str(k): [g.captures, g.replays] for k, g in self.members.items()}
+        return {name: named[name] for name in sorted(named)}
 
 
 def reset_memory_peak(device: torch.device) -> None:
@@ -289,6 +339,115 @@ def memory_peak(device: torch.device) -> int:
     if device.type != "cuda":
         return 0
     return torch.cuda.max_memory_reserved(device)
+
+
+class MemoryPhases:
+    """PRIMITIVE where a GPU run's memory goes: one record per named phase of the run.
+
+    Each ``phase(name)`` synchronizes the device, reads the allocator's current allocated and
+    reserved bytes, starts a new peak window (``reset_peak_memory_stats``, which resets BOTH
+    peaks), and at its end synchronizes again and reads both current values, both peaks and the
+    given graph family's ``[captures, replays]`` (that family only: graphs the phase makes
+    elsewhere are not counted). The record is appended to ``log`` (one JSON line) as the phase
+    ends, also when it ends in an exception, which it records and re-raises; a counter read that
+    fails is recorded as unreadable, and every reading taken before it is kept (maintainer B,
+    420fffb; the phase's own exception takes precedence over the read's). Phases do
+    not nest (a nested reset would shorten the outer window) and are never entered or left while
+    the current stream captures. ``reserved_peak()`` is the maximum over the phases' reserved
+    peaks: for phases that cover a run without gaps it is the run's ``memory_peak``.
+
+    What the numbers are: allocator statistics. The allocated peak counts tensors only, and a
+    replay allocates nothing (``memory_peak``); a captured graph's private pool must keep its
+    addresses across replays, so neither peak is the smallest card the captured run fits on.
+    Nothing here empties caches or changes a graph's lifetime. On the CPU the memory fields are
+    None (no counters); names, seconds and errors are still recorded.
+
+    For: a run's per-phase memory record (the instruction tuning's ``memory.jsonl``). Not for:
+    timing kernels (it synchronizes), or code inside a captured step.
+    """
+
+    def __init__(
+        self, device: torch.device, log: Path | None = None, graphs: GraphFamily | None = None
+    ) -> None:
+        """No phase yet; ``log`` (if given) receives one JSON line per ended phase."""
+        self.device: torch.device = device
+        self.log: Path | None = log
+        self.graphs: GraphFamily | None = graphs
+        self.records: list[dict[str, object]] = []
+        self._open: str | None = None
+
+    def _readings(self) -> dict[str, int | None]:
+        if self.device.type != "cuda":
+            return {"allocated": None, "reserved": None}
+        torch.cuda.synchronize(self.device)
+        return {
+            "allocated": torch.cuda.memory_allocated(self.device),
+            "reserved": torch.cuda.memory_reserved(self.device),
+        }
+
+    def _peaks(self) -> dict[str, int | None]:
+        if self.device.type != "cuda":
+            return {"allocated_peak": None, "reserved_peak": None}
+        return {
+            "allocated_peak": torch.cuda.max_memory_allocated(self.device),
+            "reserved_peak": torch.cuda.max_memory_reserved(self.device),
+        }
+
+    @staticmethod
+    def _not_capturing(name: str) -> None:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            msg = f"memory phase {name!r} at a boundary inside a CUDA graph capture"
+            raise RuntimeError(msg)
+
+    @contextmanager
+    def phase(self, name: str) -> Generator[None]:
+        """Measure the enclosed work as phase ``name`` (see the class docstring)."""
+        if self._open is not None:
+            msg = f"memory phase {name!r} inside phase {self._open!r}: phases do not nest"
+            raise RuntimeError(msg)
+        self._not_capturing(name)
+        entry = self._readings()
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self._open = name
+        started = time.monotonic()
+        error: str | None = None
+        try:
+            yield
+        except BaseException as exc:
+            error = repr(exc)
+            raise
+        finally:
+            self._open = None
+            # every reading is kept as soon as it is taken: a later failed read loses nothing
+            record: dict[str, object] = {
+                "phase": name,
+                "error": error,
+                "allocated_entry": entry["allocated"],
+                "reserved_entry": entry["reserved"],
+            }
+            failed_read: Exception | None = None
+            try:
+                self._not_capturing(name)
+                exit_ = self._readings()
+                record |= {"allocated_exit": exit_["allocated"], "reserved_exit": exit_["reserved"]}
+                record |= self._peaks()
+            except Exception as read_exc:  # noqa: BLE001  # recorded; raised below if nothing else is
+                record["unreadable"] = repr(read_exc)
+                failed_read = read_exc
+            record["graphs"] = None if self.graphs is None else self.graphs.counts()
+            record["seconds"] = time.monotonic() - started
+            self.records.append(record)
+            if self.log is not None:
+                with self.log.open("a") as handle:
+                    _ = handle.write(json.dumps(record) + "\n")
+            if failed_read is not None and error is None:
+                raise failed_read  # the phase's own exception, if any, propagates instead
+
+    def reserved_peak(self) -> int:
+        """The largest reserved peak over the recorded phases (0 with none, or on the CPU)."""
+        peaks = [r.get("reserved_peak") for r in self.records]
+        return max((p for p in peaks if isinstance(p, int)), default=0)
 
 
 def signature(values: Sequence[Tensor], *switches: object) -> tuple[object, ...]:

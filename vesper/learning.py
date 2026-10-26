@@ -14,6 +14,7 @@ its surprise as the loss of predicting token ``t``; the alignment of that loss t
 token is the caller's contract and is spelled out on ``ntp_loss``.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -38,6 +39,25 @@ class LossWeights:
 
     lambda_h: float | Tensor
     lambda_g: float
+
+
+def warmup_cosine(
+    step: int, steps: int, *, peak: float, warmup: int, final_fraction: float
+) -> float:
+    """PRIMITIVE the learning rate at ``step`` (from 0) of a run of ``steps``.
+
+    Linear warm-up to ``peak`` over ``warmup`` steps (step ``i`` gets ``peak * (i + 1) /
+    warmup``), then one cosine from ``peak`` to ``peak * final_fraction`` that the last step
+    (index ``steps - 1``) reaches exactly, and holds there beyond it. For: every schedule of a
+    training run (``vesper.train.phase_schedule``, ``vesper.instruct``). Not for: a schedule with
+    restarts or a step below 0.
+    """
+    if step < warmup:
+        return peak * (step + 1) / warmup
+    decay_steps = max(steps - 1 - warmup, 1)
+    progress = min((step - warmup) / decay_steps, 1.0)
+    final = peak * final_fraction
+    return final + (peak - final) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def loss_weights(cfg: VesperConfig) -> LossWeights:

@@ -4,6 +4,7 @@ The eager step on the same device is the truth: a captured run must train exactl
 one does, step for step, from the first replay on (the warm steps are eager by construction).
 """
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -19,9 +20,13 @@ from vesper.contracts import ContractError
 from vesper.graphs import (
     WARM_STEPS,
     CapturedStep,
+    GraphFamily,
+    MemoryPhases,
+    SignatureGraph,
     WarmedGraph,
     memory_peak,
     reset_memory_peak,
+    signature,
 )
 from vesper.halting_common import evaluation_model
 from vesper.halting_experiment import (
@@ -201,6 +206,168 @@ def test_the_memory_peak_counts_a_replayed_graphs_pool() -> None:
     assert float(out) == floats
     assert memory_peak(CUDA) - base >= size  # yet the pool is held, and counted
     assert memory_peak(torch.device("cpu")) == 0
+
+
+@needs_fused
+def test_a_graph_family_holds_one_pool_and_its_alternating_members_stay_correct() -> None:
+    # The instruction preflight of 709df83 ran out of memory with one pool per batch length.
+    floats = 64 * 2**20  # each member frees a 256 MiB intermediate before returning
+
+    def step(values: Sequence[Tensor]) -> list[Tensor]:
+        flat = values[0].flatten()  # one element whatever the shape: equal working memory
+        return [flat.repeat(floats).sum().reshape(1) * values[1] * values[0].numel()]
+
+    def inputs(shape: tuple[int, ...], scale: float) -> list[Tensor]:
+        return [torch.ones(shape, device=CUDA), torch.full((1,), scale, device=CUDA)]
+
+    shapes = ((1,), (1, 1))  # two signatures, two members
+
+    def held(a: SignatureGraph, b: SignatureGraph) -> int:
+        torch.cuda.empty_cache()
+        base = torch.cuda.memory_reserved(CUDA)
+        for graph, shape in ((a, shapes[0]), (b, shapes[1])) * 2:  # eager, then capture
+            (out,) = graph(signature(inputs(shape, 1.0)), step, inputs(shape, 1.0))
+            assert float(out) == floats
+        return torch.cuda.memory_reserved(CUDA) - base
+
+    separate = held(SignatureGraph(1), SignatureGraph(1))
+    torch.cuda.empty_cache()
+    family = GraphFamily(warm=1)
+    shared = held(family("a"), family("b"))
+    assert separate - shared >= 4 * floats  # the second member's pool is not held again
+    for i in range(6):  # alternating replays, each output read before the other runs
+        shape = shapes[i % 2]
+        member = family("ab"[i % 2])
+        (out,) = member(signature(inputs(shape, 1.0)), step, inputs(shape, float(i)))
+        assert float(out) == floats * i, i
+    assert family.counts() == {"a": [1, 4], "b": [1, 4]}
+
+
+def _phase_lines(path: Path) -> list[dict[str, object]]:
+    return [cast("dict[str, object]", json.loads(line)) for line in path.read_text().splitlines()]
+
+
+def test_memory_phases_write_each_record_as_its_phase_ends_and_keep_a_failed_one(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "memory.jsonl"
+    phases = MemoryPhases(torch.device("cpu"), log)
+    with phases.phase("first"):
+        pass
+    assert [r["phase"] for r in _phase_lines(log)] == ["first"]  # written before the next one
+
+    def fail() -> None:
+        msg = "injected"
+        raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="injected"), phases.phase("second"):
+        fail()
+    lines = _phase_lines(log)
+    assert [r["phase"] for r in lines] == ["first", "second"]
+    assert lines[0]["error"] is None
+    assert "injected" in cast("str", lines[1]["error"])
+    assert lines == phases.records
+    assert lines[0]["allocated_peak"] is None  # no counters on the CPU
+    assert phases.reserved_peak() == 0
+    # the run's peak is the largest phase peak, whichever phase holds it (not the last one)
+    peaks = MemoryPhases(torch.device("cpu"))
+    peaks.records = [{"reserved_peak": 5}, {"reserved_peak": 9}, {"reserved_peak": 7}, {}]
+    assert peaks.reserved_peak() == 9
+    with (
+        phases.phase("outer"),
+        pytest.raises(RuntimeError, match="do not nest"),
+        phases.phase("inner"),
+    ):
+        pass
+    assert [r["phase"] for r in phases.records] == ["first", "second", "outer"]
+
+
+@pytest.mark.parametrize("failing", ["exit", "exit-after-a-body-error", "peaks"])
+def test_memory_phases_keep_the_readings_taken_before_a_failed_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    # a counter read that fails late must not lose the ones already taken (maintainer B, 420fffb)
+    def no_reset(device: torch.device | None = None) -> None:
+        del device
+
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", no_reset)
+    log = tmp_path / "memory.jsonl"
+    phases = MemoryPhases(torch.device("cuda"), log)  # its counters below are owned doubles
+    reads = iter([{"allocated": 101, "reserved": 202}, {"allocated": 303, "reserved": 404}])
+    counter = RuntimeError("counter failure")
+
+    def readings() -> dict[str, int | None]:
+        value = next(reads)
+        if failing != "peaks" and value["allocated"] == 303:
+            raise counter
+        return dict(value)
+
+    def peaks() -> dict[str, int | None]:
+        if failing == "peaks":
+            raise counter
+        return {"allocated_peak": 350, "reserved_peak": 450}
+
+    monkeypatch.setattr(phases, "_readings", readings)
+    monkeypatch.setattr(phases, "_peaks", peaks)
+    body = ValueError("body failure")
+
+    def work() -> None:
+        if failing == "exit-after-a-body-error":
+            raise body
+
+    with pytest.raises((RuntimeError, ValueError)) as raised, phases.phase(failing):
+        work()
+    assert raised.value is (body if failing == "exit-after-a-body-error" else counter)
+    (record,) = phases.records
+    assert _phase_lines(log) == [record]
+    assert (record["allocated_entry"], record["reserved_entry"]) == (101, 202)
+    assert "counter failure" in cast("str", record["unreadable"])
+    if failing == "peaks":
+        assert (record["allocated_exit"], record["reserved_exit"]) == (303, 404)
+        assert "allocated_peak" not in record
+    else:
+        assert "allocated_exit" not in record
+
+
+def test_memory_phases_refuse_a_boundary_inside_a_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    phases = MemoryPhases(torch.device("cpu"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="capture"), phases.phase("entered"):
+        pass
+    assert phases.records == []  # refused before the window opened
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(RuntimeError, match="capture"), phases.phase("left"):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert "capture" in cast("str", phases.records[0]["unreadable"])  # recorded, then raised
+
+
+@needs_fused
+def test_memory_phases_measure_each_phase_in_its_own_window_and_keep_the_run_peak(
+    tmp_path: Path,
+) -> None:
+    mib = 2**20
+    family = GraphFamily(warm=1)
+    phases = MemoryPhases(CUDA, tmp_path / "memory.jsonl", family)
+    with phases.phase("kept"):
+        kept = torch.ones(64 * mib // 4, device=CUDA)
+    with phases.phase("transient"):
+        transient = torch.ones(256 * mib // 4, device=CUDA)
+        del transient
+    with phases.phase("quiet"):
+        _ = kept.sum()
+    kept_r, transient_r, quiet_r = phases.records
+    allocated = {r["phase"]: cast("int", r["allocated_peak"]) for r in phases.records}
+    assert (
+        cast("int", kept_r["allocated_exit"]) - cast("int", kept_r["allocated_entry"]) >= 64 * mib
+    )
+    assert allocated["transient"] - cast("int", transient_r["allocated_entry"]) >= 256 * mib
+    # a new window per phase: the quiet phase does not inherit the transient one's peak
+    assert allocated["quiet"] < allocated["transient"] - 128 * mib
+    reserved = [cast("int", r["reserved_peak"]) for r in phases.records]
+    assert phases.reserved_peak() == max(reserved) >= allocated["transient"]
+    assert quiet_r["graphs"] == {}  # the family's counts at the phase's end (no member yet)
+    assert _phase_lines(tmp_path / "memory.jsonl") == phases.records
 
 
 @needs_fused

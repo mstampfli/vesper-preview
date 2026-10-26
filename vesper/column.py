@@ -22,7 +22,13 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from vesper.attention import KVCache, WindowedAttention, kv_cache_empty
+from vesper.attention import (
+    KVCache,
+    RingKVCache,
+    WindowedAttention,
+    kv_cache_empty,
+    kv_ring_empty,
+)
 from vesper.config import VesperConfig
 from vesper.contracts import ContractError, Dims, check_shape
 from vesper.ffn import FFN
@@ -439,27 +445,35 @@ def scan_of(model: nn.Module) -> ScanImpl:
 class ColumnState:
     """Per-pass state of one column: recurrent states, attention windows and key histories.
 
-    ``h[t]`` is ``[b, heads, dk, dk]``, ``kv[t]`` one window, ``key_history[t]`` the last ``K-1``
-    projected key inputs ``[b, K-1, d]`` (oldest first, the key filter's carry; ``[b, 0, d]``
-    without a filter). All three tuples have ``T_max`` entries. ``map_state`` is the one place
-    that walks the fields; ``check_column_state`` validates a restored one. The retrieved entries
-    per token come with retrieval; the carried projections of halted tokens live in the loop,
-    which owns halting.
+    ``h[t]`` is ``[b, heads, dk, dk]``, ``kv[t]`` one window (a chronological ``KVCache``, or a
+    ``RingKVCache`` for one-token decoding, whose shapes never change), ``key_history[t]`` the
+    last ``K-1`` projected key inputs ``[b, K-1, d]`` (oldest first, the key filter's carry;
+    ``[b, 0, d]`` without a filter). All three tuples have ``T_max`` entries. ``map_state`` is the
+    one place that walks the fields; ``check_column_state`` validates a restored one. The
+    retrieved entries per token come with retrieval; the carried projections of halted tokens
+    live in the loop, which owns halting.
     """
 
     h: tuple[Tensor, ...]
-    kv: tuple[KVCache, ...]
+    kv: tuple[KVCache | RingKVCache, ...]
     key_history: tuple[Tensor, ...]
 
 
 def init_column_state(
-    shape: ColumnShape, b: int, t_max: int, dtype: torch.dtype, device: torch.device
+    shape: ColumnShape,
+    b: int,
+    t_max: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    ring: bool = False,
 ) -> ColumnState:
     """Cold state: ``t_max`` zero recurrent states, empty windows and zero key histories.
 
     ``dtype`` is the activation dtype; the KV windows take it, the recurrent states and key
     histories take ``promote_types(dtype, float32)`` because the scan and the key filter never run
-    below float32 (``RecurrentSublayer.scan``, ``RecurrentSublayer.keys``).
+    below float32 (``RecurrentSublayer.scan``, ``RecurrentSublayer.keys``). ``ring`` gives every
+    pass an unwritten ``RingKVCache`` instead of an empty ``KVCache`` (one-token decoding).
 
     Raises:
         ValueError: if ``t_max`` is below 1 (``kv_cache_empty`` rejects a bad ``window``).
@@ -469,14 +483,13 @@ def init_column_state(
         raise ValueError(msg)
     dk = shape.head_dim
     state_dtype = torch.promote_types(dtype, torch.float32)
+    empty = kv_ring_empty if ring else kv_cache_empty
     return ColumnState(
         h=tuple(
             torch.zeros(b, shape.heads, dk, dk, dtype=state_dtype, device=device)
             for _ in range(t_max)
         ),
-        kv=tuple(
-            kv_cache_empty(b, shape.kv_heads, dk, shape.window, dtype, device) for _ in range(t_max)
-        ),
+        kv=tuple(empty(b, shape.kv_heads, dk, shape.window, dtype, device) for _ in range(t_max)),
         key_history=tuple(
             torch.zeros(b, shape.key_history, shape.d, dtype=state_dtype, device=device)
             for _ in range(t_max)
@@ -491,9 +504,15 @@ def map_state(state: ColumnState, f: Callable[[Tensor], Tensor]) -> ColumnState:
     copy); a new field is added here once. Not for: validation (``check_column_state``) or a
     serialized record (the trainer's, which keeps plain containers for ``weights_only`` loads).
     """
+
+    def window(c: KVCache | RingKVCache) -> KVCache | RingKVCache:
+        if isinstance(c, RingKVCache):
+            return RingKVCache(k=f(c.k), v=f(c.v), pos=f(c.pos), valid=f(c.valid), window=c.window)
+        return KVCache(k=f(c.k), v=f(c.v), pos=f(c.pos), window=c.window)
+
     return ColumnState(
         h=tuple(f(h) for h in state.h),
-        kv=tuple(KVCache(k=f(c.k), v=f(c.v), pos=f(c.pos), window=c.window) for c in state.kv),
+        kv=tuple(window(c) for c in state.kv),
         key_history=tuple(f(z) for z in state.key_history),
     )
 
@@ -598,12 +617,7 @@ def check_column_state(state: ColumnState, shape: ColumnShape, t_max: int) -> No
         h, cache, history = state.h[t], state.kv[t], state.key_history[t]
         check_shape(f"h[{t}]", h, ("b", "h", "dk", "dk"), dims)
         check_shape(f"key_history[{t}]", history, ("b", "w", "d"), dims)
-        check_shape(f"kv[{t}].k", cache.k, ("b", f"m{t}", "hkv", "dk"), dims)
-        check_shape(f"kv[{t}].v", cache.v, ("b", f"m{t}", "hkv", "dk"), dims)
-        check_shape(f"kv[{t}].pos", cache.pos, ("b", f"m{t}"), dims, dtype=torch.long)
-        if cache.window != shape.window:
-            msg = f"kv[{t}] has window {cache.window}, the column has {shape.window}"
-            raise ValueError(msg)
+        _check_window(t, cache, shape, dims, state.h[0].device)
         for name, tensor in ((f"h[{t}]", h), (f"key_history[{t}]", history)):
             # promote_types alone admits complex64 (maintainer B): a real floating dtype is required
             # first
@@ -612,21 +626,38 @@ def check_column_state(state: ColumnState, shape: ColumnShape, t_max: int) -> No
             ):
                 msg = f"{name} is {tensor.dtype}; carried states are real float32 or wider"
                 raise ValueError(msg)
-        for name, tensor in ((f"kv[{t}].k", cache.k), (f"kv[{t}].v", cache.v)):
-            if not tensor.dtype.is_floating_point:
-                msg = f"{name} is {tensor.dtype}; attention windows are real floating point"
-                raise ValueError(msg)
-        named = (
-            (f"h[{t}]", h),
-            (f"key_history[{t}]", history),
-            (f"kv[{t}].k", cache.k),
-            (f"kv[{t}].v", cache.v),
-            (f"kv[{t}].pos", cache.pos),
-        )
-        for name, tensor in named:
             if tensor.device != state.h[0].device:
                 msg = f"{name} is on {tensor.device}, h[0] on {state.h[0].device}; one device"
                 raise ValueError(msg)
+
+
+def _check_window(
+    t: int, cache: KVCache | RingKVCache, shape: ColumnShape, dims: Dims, device: torch.device
+) -> None:
+    """``check_column_state``'s part for pass ``t``'s window (either kind), same errors."""
+    named: list[tuple[str, Tensor]] = [
+        (f"kv[{t}].k", cache.k),
+        (f"kv[{t}].v", cache.v),
+        (f"kv[{t}].pos", cache.pos),
+    ]
+    if isinstance(cache, RingKVCache):
+        dims[f"m{t}"] = shape.window  # a ring always holds exactly window slots
+        check_shape(f"kv[{t}].valid", cache.valid, ("b", f"m{t}"), dims, dtype=torch.bool)
+        named.append((f"kv[{t}].valid", cache.valid))
+    check_shape(f"kv[{t}].k", cache.k, ("b", f"m{t}", "hkv", "dk"), dims)
+    check_shape(f"kv[{t}].v", cache.v, ("b", f"m{t}", "hkv", "dk"), dims)
+    check_shape(f"kv[{t}].pos", cache.pos, ("b", f"m{t}"), dims, dtype=torch.long)
+    if cache.window != shape.window:
+        msg = f"kv[{t}] has window {cache.window}, the column has {shape.window}"
+        raise ValueError(msg)
+    for name, tensor in named[:2]:
+        if not tensor.dtype.is_floating_point:
+            msg = f"{name} is {tensor.dtype}; attention windows are real floating point"
+            raise ValueError(msg)
+    for name, tensor in named:
+        if tensor.device != device:
+            msg = f"{name} is on {tensor.device}, h[0] on {device}; one device"
+            raise ValueError(msg)
 
 
 class Column(nn.Module):
@@ -745,7 +776,12 @@ class Column(nn.Module):
         if carry is not None:
             ak = _carry(carry.active, ak, carry.projections.attn_k)
             av = _carry(carry.active, av, carry.projections.attn_v)
-        a, kv_new = self.attn.attend(aq, ak, av, pos, state.kv[pass_index])
+        window = state.kv[pass_index]
+        kv_new: KVCache | RingKVCache
+        if isinstance(window, RingKVCache):
+            a, kv_new = self.attn.attend_ring(aq, ak, av, pos, window)
+        else:
+            a, kv_new = self.attn.attend(aq, ak, av, pos, window)
         x = x + a
 
         x = x + self.ffn.forward(self.norm_ffn.forward(x))

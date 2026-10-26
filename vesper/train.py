@@ -34,7 +34,7 @@ from typing import NamedTuple, cast
 import torch
 from torch import Tensor, nn
 
-from vesper.attention import KVCache
+from vesper.attention import KVCache, RingKVCache
 from vesper.column import (
     SCAN_IMPLS,
     ColumnState,
@@ -72,7 +72,7 @@ from vesper.graphs import (
     signature,
 )
 from vesper.keys import file_sha256, hashed_bytes, verified_bytes
-from vesper.learning import LossWeights, check_mode
+from vesper.learning import LossWeights, check_mode, warmup_cosine
 from vesper.loop import DenseRule, HaltingHead
 from vesper.model import Vesper
 from vesper.provenance import environment, write_json
@@ -319,15 +319,13 @@ def phase_schedule(tokens_seen: int, step: int, cfg: VesperConfig) -> Phase:
         t_max = m.t_max
         ramp = min((fraction - t.phase_warm_end) / (t.phase_loop_end - t.phase_warm_end), 1.0)
         lambda_h = cfg.learning.lambda_h * ramp
-    steps = total_steps(cfg)
-    if step < o.warmup_steps:
-        lr = o.peak_lr * (step + 1) / o.warmup_steps
-    else:
-        # the last step of the run (index steps - 1) reaches the final fraction exactly
-        decay_steps = max(steps - 1 - o.warmup_steps, 1)
-        progress_lr = min((step - o.warmup_steps) / decay_steps, 1.0)
-        final = o.peak_lr * o.final_lr_fraction
-        lr = final + (o.peak_lr - final) * 0.5 * (1.0 + math.cos(math.pi * progress_lr))
+    lr = warmup_cosine(
+        step,
+        total_steps(cfg),
+        peak=o.peak_lr,
+        warmup=o.warmup_steps,
+        final_fraction=o.final_lr_fraction,
+    )
     return Phase(
         name=name,
         t_max=max(t_max, 1),
@@ -906,6 +904,14 @@ def _check_transition(*, cycle: bool, from_finite: bool, resume: Path | None) ->
 
 
 def _state_record(states: Sequence[ColumnState]) -> list[dict[str, object]]:
+    """The carried states as plain containers for ``weights_only`` loads.
+
+    Raises:
+        ValueError: on a ``RingKVCache`` (a decoding window, never a trainer's state).
+    """
+    if any(isinstance(c, RingKVCache) for state in states for c in state.kv):
+        msg = "a decoding ring window is not a trainer state and is never saved"
+        raise ValueError(msg)
     return [
         {
             "h": list(state.h),

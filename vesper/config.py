@@ -10,6 +10,7 @@ PRIMITIVE ``_Section``: typed extraction from parsed YAML. Each getter consumes 
 Use it for: configs/*.yaml. Not for: tensors, checkpoints or anything that is already typed.
 """
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -144,6 +145,115 @@ class VesperConfig:
     dusk: DuskConfig
 
 
+@dataclass(frozen=True, slots=True)
+class InstructConfig:
+    """The instruction-tuning test's one setting (docs/reviews/2026-10-25-instruction-tuning.md).
+
+    Its own file (configs/instruct-*.yaml), beside the source run's VesperConfig, which keeps the
+    model and the optimizer's betas, decay and clip. Sections: ``dataset`` (the pinned source
+    file), ``split`` (the keyed group split's key and cumulative bounds), ``examples`` (the input
+    limit, the length buckets, positions per batch), ``schedule`` (rate, warm-up, final fraction,
+    epochs, order seed), ``evaluation`` (fixed depth, group resamples, generated ids at most) and
+    ``forgetting`` (the days run's held-out view: its width, the accepted test pin's hash and the
+    view's own digest, both checked before any model reads it).
+    """
+
+    dataset_name: str
+    dataset_revision: str
+    dataset_sha256: str
+    split_key: str
+    train_below: float
+    validation_below: float
+    max_inputs: int
+    buckets: tuple[int, ...]
+    batch_tokens: int
+    peak_lr: float
+    warmup_steps: int
+    final_lr_fraction: float
+    epochs: int
+    seed: int
+    eval_depth: int
+    resamples: int
+    max_new_tokens: int
+    days_micro: int
+    pin_sha256: str
+    days_view_sha256: str
+
+
+def _instruct(root: "_Section") -> InstructConfig:
+    dataset, split = root.get_section("dataset"), root.get_section("split")
+    examples, schedule = root.get_section("examples"), root.get_section("schedule")
+    evaluation, forgetting = root.get_section("evaluation"), root.get_section("forgetting")
+    cfg = InstructConfig(
+        dataset_name=dataset.get_str("name"),
+        dataset_revision=dataset.get_str("revision"),
+        dataset_sha256=dataset.get_str("sha256"),
+        split_key=split.get_str("key"),
+        train_below=split.get_float("train_below"),
+        validation_below=split.get_float("validation_below"),
+        max_inputs=examples.get_int("max_inputs"),
+        buckets=examples.get_int_list("buckets"),
+        batch_tokens=examples.get_int("batch_tokens"),
+        peak_lr=schedule.get_float("peak_lr"),
+        warmup_steps=schedule.get_int("warmup_steps"),
+        final_lr_fraction=schedule.get_float("final_lr_fraction"),
+        epochs=schedule.get_int("epochs"),
+        seed=schedule.get_int("seed"),
+        eval_depth=evaluation.get_int("depth"),
+        resamples=evaluation.get_int("resamples"),
+        max_new_tokens=evaluation.get_int("max_new_tokens"),
+        days_micro=forgetting.get_int("micro"),
+        pin_sha256=forgetting.get_str("pin_sha256"),
+        days_view_sha256=forgetting.get_str("view_sha256"),
+    )
+    for section in (dataset, split, examples, schedule, evaluation, forgetting, root):
+        section.done()
+    return cfg
+
+
+def validate_instruct(cfg: InstructConfig) -> None:
+    """The relations an InstructConfig must hold; ``ConfigError`` names the first one broken."""
+    _require(
+        0.0 < cfg.train_below < cfg.validation_below < 1.0, "split: 0 < train < validation < 1"
+    )
+    _require(
+        len(cfg.buckets) > 0
+        and all(b > 0 for b in cfg.buckets)
+        and list(cfg.buckets) == sorted(set(cfg.buckets)),
+        "examples.buckets: positive and strictly increasing",
+    )
+    last = max(cfg.buckets, default=0)
+    _require(cfg.max_inputs <= last, "examples: max_inputs must fit the last bucket")
+    _require(cfg.batch_tokens >= last, "examples: batch_tokens holds a last-bucket row")
+    _require(math.isfinite(cfg.peak_lr) and cfg.peak_lr > 0, "schedule.peak_lr: positive")
+    _require(cfg.warmup_steps >= 1 and cfg.epochs >= 1, "schedule: warm-up and epochs at least 1")
+    _require(0.0 <= cfg.final_lr_fraction <= 1.0, "schedule.final_lr_fraction: in [0, 1]")
+    _require(cfg.eval_depth >= 1, "evaluation.depth: at least 1")
+    _require(cfg.resamples >= 1 and cfg.max_new_tokens >= 1, "evaluation: counts at least 1")
+    _require(cfg.days_micro >= 1, "forgetting.micro: at least 1")
+    for name, digest in (
+        ("dataset.sha256", cfg.dataset_sha256),
+        ("forgetting.pin_sha256", cfg.pin_sha256),
+        ("forgetting.view_sha256", cfg.days_view_sha256),
+    ):
+        _require(
+            len(digest) == 64 and all(c in "0123456789abcdef" for c in digest),  # noqa: PLR2004
+            f"{name}: a lowercase sha256",
+        )
+
+
+def parse_instruct_bytes(data: bytes, where: str) -> InstructConfig:
+    """Parse and validate an instruction-tuning config's bytes, already read (and hashed).
+
+    Raises:
+        ConfigError: on any missing, unknown, mistyped or inconsistent value.
+        UnicodeDecodeError: if ``data`` is not UTF-8.
+    """
+    cfg = _instruct(_Section(cast("object", yaml.safe_load(data.decode("utf-8"))), where))
+    validate_instruct(cfg)
+    return cfg
+
+
 def _mapping(raw: object, where: str) -> dict[str, object]:
     """Narrow a parsed YAML node to a mapping with string keys, or fail."""
     if not isinstance(raw, dict):
@@ -202,6 +312,19 @@ class _Section:
             msg = f"{self._where}.{key}: expected a string, got {value!r}"
             raise ConfigError(msg)
         return value
+
+    def get_int_list(self, key: str) -> tuple[int, ...]:
+        """Read a list of integers (no bools, no floats)."""
+        value = self._take(key)
+        if not isinstance(value, list):
+            msg = f"{self._where}.{key}: expected a list of integers, got {value!r}"
+            raise ConfigError(msg)
+        items = cast("list[object]", value)
+        ints = [v for v in items if isinstance(v, int) and not isinstance(v, bool)]
+        if len(ints) != len(items):
+            msg = f"{self._where}.{key}: expected a list of integers, got {value!r}"
+            raise ConfigError(msg)
+        return tuple(ints)
 
     def get_section(self, key: str) -> "_Section":
         """Descend into a nested mapping."""

@@ -4,7 +4,7 @@ from typing import cast
 import pytest
 import yaml
 
-from vesper.config import ConfigError, load, parse
+from vesper.config import ConfigError, InstructConfig, load, parse, parse_instruct_bytes
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
@@ -115,3 +115,66 @@ def test_checkpoint_and_evaluation_counts_are_read_and_bounded() -> None:
         raw["training"][key] = 0
         with pytest.raises(ConfigError, match=key):
             _ = parse(raw, "test")
+
+
+def _instruct_raw() -> dict[str, dict[str, object]]:
+    with (CONFIGS / "instruct-dolly.yaml").open(encoding="utf-8") as fh:
+        return cast("dict[str, dict[str, object]]", yaml.safe_load(fh))
+
+
+def _instruct(raw: object) -> InstructConfig:
+    return parse_instruct_bytes(yaml.safe_dump(raw).encode(), "test")
+
+
+def test_the_shipped_instruct_config_is_the_contracts_setting() -> None:
+    cfg = parse_instruct_bytes((CONFIGS / "instruct-dolly.yaml").read_bytes(), "shipped")
+    revision = "bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a"  # pragma: allowlist secret
+    assert cfg.dataset_revision == revision
+    assert (cfg.train_below, cfg.validation_below, cfg.split_key) == (0.9, 0.95, "dolly-split-v1")
+    assert (cfg.max_inputs, cfg.buckets, cfg.batch_tokens) == (1024, (128, 256, 512, 1024), 8192)
+    assert (cfg.peak_lr, cfg.warmup_steps, cfg.final_lr_fraction, cfg.epochs) == (3e-5, 100, 0.1, 3)
+    assert (cfg.eval_depth, cfg.days_micro) == (5, 8)
+    assert cfg.pin_sha256.startswith("7a39ce6f")
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("split", "train_below", 0.96, "train < validation"),
+        ("split", "validation_below", 1.0, "train < validation"),
+        ("examples", "buckets", [256, 128], "strictly increasing"),
+        ("examples", "buckets", [128, 128], "strictly increasing"),
+        ("examples", "buckets", [128, True], "list of integers"),
+        ("examples", "buckets", [], "strictly increasing"),
+        ("examples", "max_inputs", 2048, "fit the last bucket"),
+        ("examples", "batch_tokens", 512, "last-bucket row"),
+        ("schedule", "peak_lr", 0.0, "positive"),
+        ("schedule", "epochs", 0, "at least 1"),
+        ("schedule", "final_lr_fraction", 1.5, r"\[0, 1\]"),
+        ("evaluation", "depth", 0, "at least 1"),
+        ("forgetting", "pin_sha256", "7A39", "lowercase sha256"),
+        ("dataset", "sha256", 5, "expected a string"),
+    ],
+)
+def test_an_inconsistent_instruct_config_is_refused(
+    section: str, key: str, value: object, message: str
+) -> None:
+    raw = _instruct_raw()
+    raw[section][key] = value
+    with pytest.raises(ConfigError, match=message):
+        _ = _instruct(raw)
+
+
+def test_a_missing_or_unknown_instruct_key_is_refused() -> None:
+    raw = _instruct_raw()
+    del raw["schedule"]["seed"]
+    with pytest.raises(ConfigError, match="missing key 'seed'"):
+        _ = _instruct(raw)
+    raw = _instruct_raw()
+    raw["schedule"]["sead"] = 0
+    with pytest.raises(ConfigError, match="unknown keys: sead"):
+        _ = _instruct(raw)
+    raw = _instruct_raw()
+    raw["extra"] = {}
+    with pytest.raises(ConfigError, match="unknown keys: extra"):
+        _ = _instruct(raw)

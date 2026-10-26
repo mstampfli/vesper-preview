@@ -59,6 +59,86 @@ def kv_cache_empty(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RingKVCache:
+    """PRIMITIVE a fixed-capacity attention window for one-token decoding, its shapes never change.
+
+    ``k`` and ``v`` are ``[b, window, hkv, dk]`` (keys already rotated), ``pos`` is ``[b, window]``
+    int64 and ``valid`` ``[b, window]`` bool. A token at position ``p`` lives in slot
+    ``p % window``; slots are NOT in age order, and an unwritten slot holds finite zeros and
+    ``valid`` False. Visibility is decided by ``valid`` and the positions under the usual mask
+    ``p_i - w < p_j <= p_i``, never by slot order (maintainer B's review of 49e7b88: the CUDA window
+    kernel counts indices, so a ring must not reach it).
+
+    For: decoding one token per step with a captured step, whose state shapes must not change.
+    Not for: training or chunked evaluation (``KVCache`` keeps the chronological contract there).
+    """
+
+    k: Tensor
+    v: Tensor
+    pos: Tensor
+    valid: Tensor
+    window: int
+
+
+def kv_ring_empty(
+    b: int, hkv: int, dk: int, window: int, dtype: torch.dtype, device: torch.device
+) -> RingKVCache:
+    """A ring with every slot unwritten: finite zero keys and values, positions 0, valid False.
+
+    Raises:
+        ValueError: if ``window`` is below 1.
+    """
+    if window < 1:
+        msg = f"window must be at least 1, got {window}"
+        raise ValueError(msg)
+    return RingKVCache(
+        k=torch.zeros(b, window, hkv, dk, dtype=dtype, device=device),
+        v=torch.zeros(b, window, hkv, dk, dtype=dtype, device=device),
+        pos=torch.zeros(b, window, dtype=torch.long, device=device),
+        valid=torch.zeros(b, window, dtype=torch.bool, device=device),
+        window=window,
+    )
+
+
+def kv_ring_write(cache: RingKVCache, k: Tensor, v: Tensor, pos: Tensor) -> RingKVCache:
+    """One new token per row written into its slot ``pos % window``; a new ring, same shapes.
+
+    Each row writes its own slot (rows may sit at different positions). The token that held the
+    slot before, ``window`` positions older, is outside every later query's window anyway.
+
+    Args:
+        cache: the ring so far.
+        k: ``[b, 1, hkv, dk]`` rotated keys.
+        v: ``[b, 1, hkv, dk]`` values.
+        pos: ``[b, 1]`` int64 positions, nonnegative.
+
+    Raises:
+        ContractError: on another shape, or (eagerly or as a device assert while capturing) a
+            negative position.
+    """
+    dims: Dims = {"w": cache.window}
+    check_shape("cache.k", cache.k, ("b", "w", "hkv", "dk"), dims)
+    check_shape("cache.v", cache.v, ("b", "w", "hkv", "dk"), dims)
+    check_shape("cache.pos", cache.pos, ("b", "w"), dims, dtype=torch.long)
+    check_shape("cache.valid", cache.valid, ("b", "w"), dims, dtype=torch.bool)
+    dims["one"] = 1
+    check_shape("k", k, ("b", "one", "hkv", "dk"), dims)
+    check_shape("v", v, ("b", "one", "hkv", "dk"), dims)
+    check_shape("pos", pos, ("b", "one"), dims, dtype=torch.long)
+    require((pos >= 0).all().reshape(1), "kv_ring_write: positions must be nonnegative")
+    slot = pos % cache.window  # [b, 1]
+    b, hkv, dk = dims["b"], dims["hkv"], dims["dk"]
+    at = slot[:, :, None, None].expand(b, 1, hkv, dk)
+    return RingKVCache(
+        k=cache.k.scatter(1, at, k.to(cache.k.dtype)),
+        v=cache.v.scatter(1, at, v.to(cache.v.dtype)),
+        pos=cache.pos.scatter(1, slot, pos),
+        valid=cache.valid.scatter(1, slot, torch.ones_like(slot, dtype=torch.bool)),
+        window=cache.window,
+    )
+
+
 def kv_cache_push(cache: KVCache, k: Tensor, v: Tensor, pos: Tensor) -> KVCache:
     """Append a chunk's rotated keys, values and positions and keep the last ``window`` entries.
 
@@ -214,6 +294,48 @@ class WindowedAttention(nn.Module):
     def output(self, o: Tensor) -> Tensor:
         """Merge heads and apply the output projection: ``[b, n, h, dk] -> [b, n, d]``."""
         return F.linear(o.flatten(2), self.w_o)
+
+    def attend_ring(
+        self, q: Tensor, k: Tensor, v: Tensor, pos: Tensor, cache: RingKVCache
+    ) -> tuple[Tensor, RingKVCache]:
+        """One decoding token per row over a ring and itself; the ring with the token written.
+
+        The keys are the ring's slots and the new token's key, which is attended exactly once
+        (from its own argument, before it is written); visibility is ``valid`` and the window
+        mask on positions, so slot order never matters. Always the masked
+        ``scaled_dot_product_attention`` in ``q``'s dtype, never the index-counting window
+        kernel.
+
+        Raises:
+            ContractError: on another shape (``n`` must be 1) or a window that is not the layer's.
+        """
+        dims: Dims = {"hkv": self.kv_heads, "dk": self.head_dim, "h": self.heads, "one": 1}
+        dims["w"] = self.window
+        check_shape("q", q, ("b", "one", "h", "dk"), dims)
+        check_shape("k", k, ("b", "one", "hkv", "dk"), dims)
+        check_shape("v", v, ("b", "one", "hkv", "dk"), dims)
+        check_shape("pos", pos, ("b", "one"), dims, dtype=torch.long)
+        check_shape("cache.k", cache.k, ("b", "w", "hkv", "dk"), dims)
+        check_shape("cache.v", cache.v, ("b", "w", "hkv", "dk"), dims)
+        check_shape("cache.pos", cache.pos, ("b", "w"), dims, dtype=torch.long)
+        check_shape("cache.valid", cache.valid, ("b", "w"), dims, dtype=torch.bool)
+        if cache.window != self.window:
+            msg = f"ring window {cache.window} does not match the layer's {self.window}"
+            raise ContractError(msg)
+        keys = torch.cat([cache.k.to(q.dtype), k.to(q.dtype)], dim=1)
+        vals = torch.cat([cache.v.to(q.dtype), v.to(q.dtype)], dim=1)
+        kpos = torch.cat([cache.pos, pos], dim=1)
+        valid = torch.cat([cache.valid, torch.ones_like(cache.valid[:, :1])], dim=1)
+        allowed = valid & (kpos <= pos) & (kpos > pos - self.window)  # [b, w + 1]
+        block = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            keys.transpose(1, 2),
+            vals.transpose(1, 2),
+            attn_mask=allowed[:, None, None, :],
+            enable_gqa=True,
+        )
+        y = self.output(block.transpose(1, 2))
+        return y, kv_ring_write(cache, k, v, pos)
 
     def attend(
         self, q: Tensor, k: Tensor, v: Tensor, pos: Tensor, cache: KVCache

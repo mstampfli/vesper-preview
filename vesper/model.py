@@ -59,10 +59,13 @@ class Vesper(nn.Module):
         self.columns: int = m.columns
         self.t_max: int = m.t_max
 
-    def init_states(self, b: int, dtype: torch.dtype, device: torch.device) -> list[ColumnState]:
-        """Cold per-pass states for every column, for ``b`` streams."""
+    def init_states(
+        self, b: int, dtype: torch.dtype, device: torch.device, *, ring: bool = False
+    ) -> list[ColumnState]:
+        """Cold per-pass states for every column, for ``b`` streams (``ring``: decoding windows)."""
         return [
-            init_column_state(self.shape, b, self.t_max, dtype, device) for _ in range(self.columns)
+            init_column_state(self.shape, b, self.t_max, dtype, device, ring=ring)
+            for _ in range(self.columns)
         ]
 
     @override
