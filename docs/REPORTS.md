@@ -114,98 +114,108 @@ cap-measure-02980db, recall-result-2224d82 and replay-answers-984c5d4.
 
 ## 2026-10-28, 12:48Z: the days model next to published Pythia models, in bits per byte
 
-This entry's wording is not yet reviewed by maintainer B; the comparison itself waits in their queue.
+Reviewed October 30; the joint-training follow-up has since finished (see the October 30 entry).
 
-**What changed.** For the first time Vesper was measured against models from outside the
-project. The project owner approved it on 10-27. The final days model (64 million parameters, 7.0 billion
-training tokens) and published Pythia checkpoints (EleutherAI, trained on the Pile) each scored
-the same 398 held-out documents, every document from a cold start, in bits per byte (the
-models use different tokenizers, so loss per byte is the fair unit). Nothing was trained.
+**What changed.** The final days model (64 million parameters, about 7.0 billion training
+tokens) and published Pythia checkpoints scored 398 common documents from Vesper's existing
+validation read set. Each document starts cold; Vesper carries state between its chunks.
+Bits per byte makes the losses more comparable across tokenizers, though each model excludes
+its own first token: 46 documents have slightly different scored byte counts. Nothing trained.
 
-| model | training tokens | bits per byte |
-|---|---|---|
-| Vesper, fixed depth 1 / 2 / 3 / 5 / 8 passes | 7.0B | 1.2010 / 1.1176 / 1.0982 / 1.0946 / 1.0974 |
+| Model | Training tokens | Bits per byte |
+| --- | --- | --- |
+| Vesper, fixed depth 1 / 2 / 3 / 5 / 8 | 7.0B | 1.2010 / 1.1176 / 1.0982 / 1.0946 / 1.0974 |
 | Pythia-70M at 3000 / 4000 steps / final | ~6.3B / ~8.4B / ~300B | 1.1705 / 1.1431 / 1.0849 |
 | Pythia-160M at 3000 / 4000 steps / final | ~6.3B / ~8.4B / ~300B | 1.0880 / 1.0553 / 0.9596 |
 
-- Against Pythia-70M at similar training tokens, Vesper at 5 passes is clearly better (by
-  0.05 to 0.08 bits per byte, intervals well away from zero).
-- Against Pythia-160M at ~6.3B tokens the difference is +0.0067 with an interval of
-  [-0.0166, +0.0240]: this test cannot tell the two apart, which is not the same as showing
-  them equal. At ~8.4B tokens Pythia-160M is better.
+On these documents, Vesper at depth 5 has lower loss than the two early Pythia-70M checkpoints
+by 0.0759 and 0.0485 bits per byte. Pythia-160M at about 6.3B tokens has a 0.0067 lower point
+estimate; the descriptive paired interval for Vesper minus Pythia is [-0.0166, +0.0240].
+That does not establish equal quality. The later 160M checkpoints have lower losses too.
 
-**What it means for you.** By a rough estimate that counts only the matrix multiplications
-(attention and the recurrent scan left out), Vesper at 5 passes spends about four times
-Pythia-70M's compute per token and about 1.5 times Pythia-160M's. So this does not show an
-advantage at equal compute. The text is also Vesper's own kind of data, which Pythia never
-trained on, so it favours Vesper. The comparison is an indicator, not a verdict. Fixed-depth
-numbers are no ceiling for adaptive stopping: a model that learns when to stop, and keeps
-training while it learns, can end up anywhere, and that is what the next run measures.
+Depth 5 was selected on this reused view. The intervals resample documents, while the 398
+documents include 396 known groups; they are descriptive, not established population coverage.
+The data comes from Vesper's training distribution. No Pile overlap audit establishes that
+Pythia never saw the same content or determines the advantage due to distribution alone.
 
-**What is next.** The joint stopping run on text (the whole model trains together with the
-stopping head), agreed with maintainer B on 10-28. Two code changes it needs are in maintainer B's review
-(377d195, 7e092cd); a 40-update trial with them completed, and the full run's size is decided
-with that review. Then the same comparison for whatever it produces.
+**What it means for you.** This is a useful external comparison, not an efficiency win.
+The original rough matrix-multiplication estimates omit attention and recurrence and count
+different tokenizer-token units. Logical stopping depth also did not remove unused passes
+from the then-current implementation. Neither equal executed compute nor runtime was compared.
 
-**Where the details are.** Export pythia-compare-20261027 (NOTE.md, full.json, the scripts,
-the Pythia snapshot ids, SHA256SUMS).
+**What is next.** J1/J2 and the capped stopping measurement are now complete and reported above;
+those lines are paused. No additional external-model comparison is selected here.
 
-## 2026-10-28, 12:48Z: the original days run ran out of three data sources, not one
+**Where the details are.** Export pythia-compare-20261027; independent review
+pythia-results-20261029, including the paired reductions and comparison limits.
 
-This entry's wording is not yet reviewed by maintainer B.
+## 2026-10-28, 12:48Z: the original days run exhausted three data sources
 
-**What changed.** We knew the original days run ran out of code at step ~226,650 and was
-then repaired. Counting every source's usable training tokens (10-27) showed more: in the
-original trajectory books ran out at step 252,712 and Wikipedia at 254,656, so from there it
-trained on web text alone. The counts match the run's own log exactly: code 557,016,987,
-books 42,210,207 and wiki 170,150,758 tokens. The repaired run (the one every later result
-uses) branched at step 225,362, before any of the three, and cycles its sources, so it is
-not affected. Since 38d08d8 the trainer writes one log line whenever a source leaves a
-finite mix, so this cannot go unnoticed again.
+Reviewed October 30 at the selected-count and log-excerpt scope below.
 
-**What it means for you.** No published result changes. The supply count also answers how
-much training text we have with this mix: about 10.4 billion tokens (9.6 billion of it web).
+**What changed.** The October 27 counting run reports the finite training-side token supply
+after filtering and splitting: code 557,016,987, books 42,210,207, Wikipedia 170,150,758 and
+web 9,636,707,260, totaling 10,406,085,212 tokens. The three non-web totals equal the original
+run's handed-out and consumed counters in its selected final log excerpt. Only web consumption
+increases across those shown steps. The export also records a finite books Mixer reaching the
+same total; web has no corresponding exhaustion check. This is a selected execution record,
+not an independent rescan of the full corpus.
 
-**What is next.** A supply-against-budget check before long runs (draft for maintainer B,
-design-supply-budget-20261027).
+The supplied trace reports the last hand-out increases at steps 226,651, 252,712 and 254,656
+for code, books and Wikipedia. These are not established last-training steps: buffered tokens
+can still reach the model afterward, and the boundary rows are not in this export. The final
+days model used by later experiments comes from the repaired cycling branch at step 225,362,
+before these reported departures. The correction does not change its accepted results.
 
-**Where the details are.** Export design-supply-budget-20261027 (DRAFT.md, counts, scripts);
-review-evidence-compout-38d08d8.
+**What it means for you.** Total supply alone does not tell whether a finite mixture can keep
+its requested shares for a budget. The original trajectory eventually consumed web alone.
+Code 38d08d8 makes departure from the handed-out mix visible in a log event; it cannot ensure
+someone notices it, and it does not mark the last buffered token trained. Empty or wholly
+excluded components can also leave a cycling mix. The small prose/regression follow-up remains
+separate from the accepted reporting behavior.
 
-## 2026-10-26, 21:03Z: replaying general text during instruction tuning removes most of the forgetting
+**What is next.** The proposed supply-against-budget checker remains a design draft. Its
+cached counts need checked input identities and an explicit policy for intentional finite
+exhaustion and cycling before implementation; no checker or new run is selected by this entry.
 
-This entry's wording is not yet reviewed by maintainer B (their weekly review budget is nearly used up);
-the numbers in it are the ones maintainer B reproduced independently when accepting the trial.
+**Where the details are.** Export design-supply-budget-20261027; the earlier selected
+original-run-tail-and-tree.txt; independent component review compout-38d08d8.
 
-**What changed.** Instruction tuning made the model worse at ordinary text: on the days run's
-held-out view, perplexity rose from 25.26 to 29.53 at a peak rate of 3e-5 and to 27.20 at 1e-5.
-A third trial repeated the 1e-5 run exactly (same model, examples, order, schedule and selection
-rule) but added, to every update, two rows of 1,024 positions of the source run's own training
-text. The two losses are added with equal weight and make one optimizer step together. Every
-replayed row is recorded and checked to come from the training side: none of its 2,378
-documents or 2,341 groups is in the held-out set.
+## 2026-10-26, 21:03Z: replaying general text during instruction tuning reduces the measured forgetting
 
-- Held-out general text: perplexity 25.26 before tuning and 25.45 after (+0.007 nats per token),
-  against +0.074 at 1e-5 without replay and +0.156 at 3e-5. The measured increase is 90 %
-  smaller than without replay.
-- Response fit on the reused validation set: body loss 2.902 at the selected epoch (epoch 3),
-  0.004 lower than without replay; the end-marker loss is 0.013 higher. The descriptive paired
+Reviewed October 30; the planned twenty-answer comparison has since finished and is reported above.
+
+**What changed.** Instruction tuning worsened general-text loss on the days run's held-out
+view: perplexity rose from 25.26 to 29.53 at peak rate 3e-5 and to 27.20 at 1e-5. A third
+trial kept the latter's starting model, instruction examples, order, rate schedule and
+selection rule, adding two rows of 1,024 positions of general training text to each update.
+Each loss is separately averaged, then added with equal weight for one optimizer step.
+Exported membership records place all 2,378 replay documents and 2,341 groups on the training
+side of the accepted split, with no overlap with the named held-out set. That does not
+establish decontamination against the separate instruction corpus.
+
+- General-text perplexity ends at 25.45, with a loss increase of 0.00737 nats per token
+  versus 0.07395 without replay at 1e-5 and 0.15608 at 3e-5. The increase is about 90% smaller
+  than the no-replay 1e-5 increase.
+- Response-body loss on reused validation is 2.902 at selected epoch 3, 0.004 below the
+  no-replay model's selected epoch 2; terminator loss is 0.013 higher. The descriptive paired
   interval against the untuned model is [-0.221, -0.183].
-- Cost: about 29 % more training time (33 minutes instead of 25), the same memory.
+- The recorded internal tune elapsed time is about 33 versus 25 minutes, roughly 29% higher.
+  Peak PyTorch reservation is 15,592 versus 15,566 MiB. These are elapsed-runtime and allocator
+  measurements, not a compute-matched comparison or a guarantee of spare GPU memory.
 
-**What it means for you.** Mixing a little of the original text into tuning keeps the model's
-general text ability almost intact while it learns the answer format. The limits: one run with
-one setting; the held-out view is text of the same kind that was replayed, so this shows
-retention of that kind of text, not of everything the model knew; the validation set was used
-for selection; and lower losses do not yet show better written answers.
+**What it means for you.** Replay preserves much more of the measured general-text behavior
+while improving reference-answer fit. This is one setting on the named text distribution,
+with validation used for epoch selection; it does not measure all retained knowledge or prove
+better generated answers. Both the positive retention result and those limits remain.
 
-**What is next.** Answers from the replay model to the same twenty validation prompts, to see
-whether the writing itself changes; it waits for maintainer B's review budget, which resets on
-November 2. No reserved final test has been selected.
+**What is next.** The same twenty validation prompts were evaluated on October 29. The mixed
+answer outcome is in the October 30 entry. No reserved final evaluation or further trial is
+selected here.
 
 **Where the details are.** Exports instruction-preflight-replay-ee68f18 and
-instruction-trial-replay-ee68f18, each with SHA256SUMS, and maintainer B's reviews replay-a771dee,
-replayfix-01e2b3f, replaysnapshot-ee68f18, replay-preflight-1bb38a8 and replay-trial-b2fc2f8.
+instruction-trial-replay-ee68f18; independent reviews replay-trial-b2fc2f8 and
+replay-answers-984c5d4. Earlier source reviews remain in their existing evidence packages.
 
 ## 2026-10-26, 15:56Z: instruction tuning improves answer form, with a forgetting cost
 
