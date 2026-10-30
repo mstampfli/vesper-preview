@@ -17,6 +17,7 @@ from torch import Tensor
 from vesper.column import scan_of, set_scan
 from vesper.config import VesperConfig, load, parse
 from vesper.contracts import ContractError
+from vesper.evals import EvalGraphs
 from vesper.graphs import (
     WARM_STEPS,
     CapturedStep,
@@ -177,14 +178,67 @@ def test_a_warmed_graph_runs_eagerly_then_captures_once_and_replays_on_its_own_b
     for i, pair in enumerate(inputs):
         (out,) = graph(step, pair)
         assert torch.equal(out, torch.full((3,), 2.0 * i + 1.0, device=CUDA)), i
-    assert (graph.captures, graph.replays, len(calls)) == (1, 3, 3)  # 2 eager + 1 capture
+    assert (graph.eager, graph.captures, graph.replays, len(calls)) == (2, 1, 3, 3)
     for pair, copy in zip(inputs, kept, strict=True):  # no caller's tensor became a buffer
         assert all(torch.equal(a, b) for a, b in zip(pair, copy, strict=True))
     graph.reset()
     _ = graph(step, inputs[0])
-    assert (graph.captures, len(calls)) == (1, 4)  # eager again after a reset
+    # eager again after a reset, and counted over the object's life
+    assert (graph.eager, graph.captures, len(calls)) == (3, 1, 4)
     with pytest.raises(ContractError, match="value 0 is on cpu"):
         _ = graph(step, [torch.zeros(3), torch.ones(3, device=CUDA)])
+
+
+def test_the_evaluation_graph_counts_name_every_graph_unrun() -> None:
+    # the record lists every field (a new graph cannot go unrecorded), [0, 0, 0] before any call
+    counts = EvalGraphs().counts()
+    assert list(counts) == list(EvalGraphs.__match_args__)  # the dataclass's field names
+    assert all(c == [0, 0, 0] for c in counts.values())
+
+
+@needs_fused
+def test_a_signature_graph_counts_eager_calls_across_signatures() -> None:
+    # a record of [eager, captures, replays] tells "ran without a graph" from "never ran":
+    # [0, 0, 0] is only a graph never called (2026-10-29: two counters could not tell)
+    def step(values: Sequence[Tensor]) -> list[Tensor]:
+        return [values[0] + 1.0]
+
+    graph = SignatureGraph(warm=2)
+    assert (graph.eager, graph.captures, graph.replays) == (0, 0, 0)
+    one, two = torch.zeros(3, device=CUDA), torch.zeros(4, device=CUDA)
+    for _ in range(4):
+        _ = graph(("a",), step, [one])
+    assert (graph.eager, graph.captures, graph.replays) == (2, 1, 2)
+    _ = graph(("b",), step, [two])  # a new signature warms again, and the count keeps going
+    assert (graph.eager, graph.captures, graph.replays) == (3, 1, 2)
+
+
+@needs_fused
+def test_a_signature_graph_keeps_the_count_of_a_call_that_raised() -> None:
+    # an eager call that ran and raised still ran: the public count keeps it, and the error is
+    # the step's own (maintainer B 5c472b2: the delta was dropped on the exception, so the public
+    # count said 0 while the inner graph said 1)
+    def failing(_values: Sequence[Tensor]) -> list[Tensor]:
+        msg = "the step failed"
+        raise RuntimeError(msg)
+
+    def step(values: Sequence[Tensor]) -> list[Tensor]:
+        return [values[0] + 1.0]
+
+    graph = SignatureGraph(warm=2)
+    x = torch.zeros(3, device=CUDA)
+    with pytest.raises(RuntimeError, match="the step failed"):
+        _ = graph(("a",), failing, [x])
+    assert (graph.eager, graph.captures, graph.replays) == (1, 0, 0)
+    _ = graph(("a",), step, [x])
+    assert (graph.eager, graph.captures, graph.replays) == (2, 0, 0)
+    _ = graph(("a",), step, [x])  # captured and replayed at once
+    assert (graph.eager, graph.captures, graph.replays) == (2, 1, 1)
+    # a replay refused under the same key (another shape) was attempted: it counts, and the
+    # refusal is WarmedGraph's own
+    with pytest.raises(ContractError):
+        _ = graph(("a",), step, [torch.zeros(4, device=CUDA)])
+    assert (graph.eager, graph.captures, graph.replays) == (2, 1, 2)
 
 
 @needs_fused

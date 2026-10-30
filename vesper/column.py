@@ -517,6 +517,24 @@ def map_state(state: ColumnState, f: Callable[[Tensor], Tensor]) -> ColumnState:
     )
 
 
+def first_passes(state: ColumnState, passes: int) -> ColumnState:
+    """PRIMITIVE ``state`` cut to its first ``passes`` passes, every field alike (no copy).
+
+    For: the loop's executed-pass cap (``Loop.forward(executed=...)``), whose states hold only
+    the passes it ran, so an ordinary forward refuses them by their pass count. Not for: a
+    state another forward will read deeper (the cut passes are gone, not stale).
+
+    Raises:
+        ValueError: if ``passes`` is outside ``[1, len(state.h)]``.
+    """
+    if not 1 <= passes <= len(state.h):
+        msg = f"passes must lie in [1, {len(state.h)}], got {passes}"
+        raise ValueError(msg)
+    return ColumnState(
+        h=state.h[:passes], kv=state.kv[:passes], key_history=state.key_history[:passes]
+    )
+
+
 def reset_recurrent(state: ColumnState, keep: Tensor) -> ColumnState:
     """PRIMITIVE ``state`` with the recurrent memory of the rows where ``keep`` is 0 made cold.
 

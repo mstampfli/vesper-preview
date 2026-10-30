@@ -95,7 +95,7 @@ class Vesper(nn.Module):
         result = self.run(tokens, pos, states, modulation, passes, recompute=recompute)
         return self.head(result.y), result
 
-    def run(
+    def run(  # noqa: PLR0913
         self,
         tokens: Tensor,
         pos: Tensor,
@@ -105,12 +105,14 @@ class Vesper(nn.Module):
         *,
         recompute: bool = False,
         exit_rule: ExitRule | None = None,
+        executed: int | None = None,
     ) -> LoopResult:
         """The forward without the head: ``forward`` is ``run`` followed by ``head``.
 
         The trainer's path: the objective then applies the head to the loss positions in slices
         (``objective``) instead of materializing ``[b, n, V]`` logits for every position.
-        ``exit_rule`` is the loop's halting policy (None: ACT).
+        ``exit_rule`` is the loop's halting policy (None: ACT); ``executed`` the loop's
+        executed-pass cap (``Loop.forward``).
         """
         return self.loop.forward(
             self.embedding.embed(tokens),
@@ -120,6 +122,7 @@ class Vesper(nn.Module):
             passes,
             recompute=recompute,
             exit_rule=exit_rule,
+            executed=executed,
         )
 
     def position_losses(self, y: Tensor, targets: Tensor) -> Tensor:

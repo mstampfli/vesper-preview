@@ -22,12 +22,14 @@ fixed depths, their lower frontier and depth-matched random controls.
 """
 
 import argparse
+import gc
+import hashlib
 import io
 import json
 import logging
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +48,7 @@ from vesper.column import (
 from vesper.config import VesperConfig, parse_bytes
 from vesper.corpus import (
     Component,
+    Finalization,
     Split,
     check_inputs,
     iter_mixed_documents,
@@ -90,6 +93,8 @@ from vesper.train import checked_record, held_out_chunks, resumed_components
 log = logging.getLogger(__name__)
 Q = 0.5  # the deployed policy's exit quantile, as in the synthetic calibration
 RANDOM_SEEDS = (0, 1, 2, 3)
+VALIDATION_SEED = 0  # the held-out stream's seed and slots (validation_chunks), recorded
+VALIDATION_MICRO = 8
 
 
 def pooled_weights(mask: Tensor) -> Tensor:
@@ -134,6 +139,17 @@ class Pinned:
     chunks: list[Chunk]
     pin_sha256: str
 
+    def digest(self) -> str:
+        """One digest over every chunk's tensors in order (``chunk_tensors``).
+
+        A later reconstruction of the validation set is the same set, in the same order, only
+        if it gives the same digest.
+        """
+        digest = ""
+        for chunk in self.chunks:
+            digest = chained_digest(digest, chunk_tensors(chunk))
+        return digest
+
 
 def validation_chunks(
     parts: Sequence[Component],
@@ -142,8 +158,8 @@ def validation_chunks(
     cfg: VesperConfig,
     pin: Path,
     *,
-    seed: int = 0,
-    micro: int = 8,
+    seed: int = VALIDATION_SEED,
+    micro: int = VALIDATION_MICRO,
 ) -> Pinned:
     """Phase 2's validation set, BOUND to the accepted test pin (maintainer B e97d5ca).
 
@@ -181,6 +197,43 @@ class TextSource:
     objective: str
     step: int
     identity: dict[str, str]  # the run's tokenizer, config, finalization and recipe sha256
+    recipe: dict[str, object]  # the run's recipe, from the same record snapshot as the rest
+
+    def bind(
+        self, parts: Sequence[Component], finalization: Path, tokenizer_path: Path, label: Path
+    ) -> tuple[Finalization, Tokenizer]:
+        """The finalization and tokenizer this source trained with, and ``parts`` checked.
+
+        Each identity file parsed from the bytes whose hash was checked, never read again;
+        ``parts`` are the files the finalization was taken over (``check_inputs``: files, order,
+        pins, but not shares) AND, names and shares in order, this source's recipe's
+        components (``main`` resolves them through ``train.resumed_components``, a separate
+        read of the record). One binding for training (``run``) and for the evaluation of its
+        saved weights (``halting_text_eval``). ``label`` names the source in a refusal.
+
+        Raises:
+            ValueError: on another finalization or tokenizer than the source's, or components
+                the finalization was not taken over or other than the recipe's.
+        """
+        fin = load_finalization(finalization, sha256=self.identity["finalization_sha256"])
+        tokenizer = Tokenizer.parse(
+            verified_bytes(
+                tokenizer_path,
+                self.identity["tokenizer_sha256"],
+                "the tokenizer the source trained with",
+            )
+        )
+        check_inputs(fin, parts)
+        recorded = self.recipe.get("components")
+        given = [[c.name, c.share] for c in parts]
+        if given != recorded:
+            msg = (
+                f"{label}: the components are not the loaded source's recipe (given {given},"
+                f" recorded {recorded}); resolve them from this checkpoint"
+                " (train.resumed_components)"
+            )
+            raise ValueError(msg)
+        return fin, tokenizer
 
 
 def load_text_source(checkpoint: Path, config_path: Path) -> TextSource:
@@ -223,6 +276,7 @@ def load_text_source(checkpoint: Path, config_path: Path) -> TextSource:
         objective=cast("str", recipe["objective"]),
         step=cast("int", progress["step"]),
         identity=dict(identity),
+        recipe=dict(recipe),
     )
 
 
@@ -350,9 +404,12 @@ def evaluate_text(
     mode today; ``recurrence.state_read_noise`` is declared but not applied), the caller's mode
     restored after: as ``vesper.train`` evaluates (decision 2026-10-16), not the synthetic
     drivers' CPU reference copy (``halting_common.evaluating``), which a text model's
-    evaluation set would make hours long. Every pass is a captured CUDA graph on CUDA
-    (``graphs`` required there; the project owner 2026-10-21), the random controls' depths its
-    values.
+    evaluation set would make hours long. On CUDA every kind of pass goes through its graph in
+    ``graphs`` (required there; the project owner 2026-10-21), the random controls' depths its
+    values: each graph runs its first three calls per signature eagerly as warm-up, then captures
+    once and replays, so a graph receiving at most three calls under a fresh signature remains eager
+    (graphs are reused across passes: the four random controls share ``trace``, twelve calls
+    for three chunks); ``EvalGraphs.counts()`` records which.
     """
     was_training = model.training
     _ = model.eval()
@@ -476,6 +533,12 @@ def train_text_update(  # noqa: PLR0913
 
 
 BACKBONE_MODES = ("joint", "frozen")
+# "at_saves": evaluate_text runs at every save, beside the live training state; "after_training":
+# the saves write weights only, and when training ends the run releases its training state and
+# evaluates every saved file (the joint update's graphs and the evaluation's did not fit
+# together on a 16 GB card at a trained save: the J1 lifecycle runs of 2026-10-28; maintainer B
+# 7e78192)
+EVALUATION_MODES = ("at_saves", "after_training")
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,7 +548,10 @@ class Plan:
     ``backbone`` is ``"joint"`` (the backbone trains with the head) or ``"frozen"`` (head only,
     the backbone stays the source's: maintainer B 32e7587, the diagnostic that separates the head's
     allocation from the backbone's drift; its dense weight is 0, the dense term trains only
-    the backbone).
+    the backbone). ``backbone_lr_scale`` multiplies a joint backbone's peak rate
+    (``BACKBONE_LR``); maintainer B 32e7587's deferred remedy, "lower backbone rate alone first". A
+    frozen backbone has no rate, so its scale must stay 1. ``evaluation`` is one of
+    ``EVALUATION_MODES``.
     """
 
     seed: int
@@ -499,6 +565,8 @@ class Plan:
     device: str
     preflight: bool
     backbone: str
+    backbone_lr_scale: float
+    evaluation: str
 
     def record(self) -> dict[str, object]:
         """Every field, for the result."""
@@ -514,7 +582,65 @@ class Plan:
             "device": self.device,
             "preflight": self.preflight,
             "backbone": self.backbone,
+            "backbone_lr_scale": self.backbone_lr_scale,
+            "evaluation": self.evaluation,
         }
+
+
+def _evaluate_saves(
+    out: Path,
+    saves: Sequence[dict[str, object]],
+    model: Vesper,
+    evaluate: Callable[[int], None],
+    evaluations: dict[str, TextEvaluation],
+) -> None:
+    """``run``'s evaluation after training, one save at a time in save order.
+
+    Each save is loaded into ``model`` from the bytes checked against the digest recorded when
+    it was written, then ``evaluate`` runs. On any failure (a replaced or missing file, an
+    evaluation error) ``evaluation_failed.json`` names the save, the error and the saves
+    already evaluated, and the error is raised: the saves stand, finished evaluations are in
+    ``eval.jsonl``, and no ``result.json`` is written, so the run is never read as complete.
+    """
+    for entry in saves:
+        after = cast("int", entry["after"])
+        try:
+            data = verified_bytes(
+                out / cast("str", entry["weights"]),
+                cast("str", entry["sha256"]),
+                "a saved weights file, against the digest recorded when it was written",
+            )
+            state = cast(
+                "dict[str, Tensor]",
+                torch.load(io.BytesIO(data), weights_only=True, map_location="cpu"),
+            )
+            _ = cast("object", model.load_state_dict(state))
+            evaluate(after)
+        except Exception as error:
+            write_json(
+                out / "evaluation_failed.json",
+                {"after": after, "error": repr(error), "evaluated": sorted(evaluations)},
+            )
+            raise
+
+
+def _check_modes(plan: Plan) -> None:
+    """``check_plan``'s refusals of the modes and of combinations that would change nothing."""
+    if plan.backbone not in BACKBONE_MODES:
+        msg = f"backbone must be one of {BACKBONE_MODES}, got {plan.backbone!r}"
+        raise ValueError(msg)
+    if plan.evaluation not in EVALUATION_MODES:
+        msg = f"evaluation must be one of {EVALUATION_MODES}, got {plan.evaluation!r}"
+        raise ValueError(msg)
+    if plan.evaluation == "after_training" and plan.preflight:
+        msg = "a preflight saves nothing, so it has nothing to evaluate after training"
+        raise ValueError(msg)
+    if plan.backbone == "frozen" and plan.dense_weight > 0.0:
+        msg = f"a frozen backbone takes no dense term: dense weight 0, not {plan.dense_weight}"
+        raise ValueError(msg)
+    if plan.backbone == "frozen" and plan.backbone_lr_scale != 1.0:
+        msg = f"a frozen backbone has no rate to scale: scale 1, not {plan.backbone_lr_scale}"
+        raise ValueError(msg)
 
 
 def check_plan(plan: Plan) -> torch.device:
@@ -523,20 +649,21 @@ def check_plan(plan: Plan) -> torch.device:
     Raises:
         ValueError: on a depth cost or dense weight that is not finite and at least 0, updates
             or rows below 1, a save point outside ``0..updates``, slices below 1, an unknown
-            device or a scan it cannot run, an unknown backbone mode, or a frozen backbone
-            with a dense weight above 0 (a term that would train nothing).
+            device or a scan it cannot run, an unknown backbone mode, a backbone rate scale
+            that is not finite and above 0, or a frozen backbone with a dense weight above 0
+            or a rate scale other than 1 (settings that would change nothing), an unknown
+            evaluation mode, or an evaluation after training for a preflight (it saves
+            nothing).
     """
-    if plan.backbone not in BACKBONE_MODES:
-        msg = f"backbone must be one of {BACKBONE_MODES}, got {plan.backbone!r}"
-        raise ValueError(msg)
+    _check_modes(plan)
     if not (math.isfinite(plan.depth_cost) and plan.depth_cost >= 0.0):
         msg = f"the depth cost must be finite and at least 0, not {plan.depth_cost}"
         raise ValueError(msg)
     if not (math.isfinite(plan.dense_weight) and plan.dense_weight >= 0.0):
         msg = f"the dense weight must be finite and at least 0, not {plan.dense_weight}"
         raise ValueError(msg)
-    if plan.backbone == "frozen" and plan.dense_weight > 0.0:
-        msg = f"a frozen backbone takes no dense term: dense weight 0, not {plan.dense_weight}"
+    if not (math.isfinite(plan.backbone_lr_scale) and plan.backbone_lr_scale > 0.0):
+        msg = f"the backbone rate scale must be finite and above 0, not {plan.backbone_lr_scale}"
         raise ValueError(msg)
     if plan.updates < 1 or plan.rows < 1 or plan.slices < 1:
         msg = (
@@ -569,59 +696,90 @@ def run(  # noqa: PLR0913, PLR0915
     """One phase-2 run: the phase-1 checkpoint ``source`` trained jointly on text; its result.
 
     Reads the source (``load_text_source``) and checks that ``finalization`` and
-    ``tokenizer_path`` are the files its run trained with (identity hashes) and that ``parts``
-    are the files the finalization was taken over (``corpus.check_inputs``; ``main`` resolves
-    them from the source's own pins, ``train.resumed_components``); the validation chunks are
+    ``tokenizer_path`` are the files its run trained with (identity hashes), that ``parts`` are
+    the files the finalization was taken over (``corpus.check_inputs``, which does not bind
+    shares) and that they are its recipe's components (names and shares in order, from the
+    record snapshot it loaded: ``main`` resolves them from the source's own pins through
+    ``train.resumed_components``, a separate read); the validation chunks are
     bound to the test ``pin`` (``validation_chunks``). The head starts at ``start_head``; a
     ``"joint"`` plan releases the backbone (``joint_update``'s optimizer, rates and clipping),
     a ``"frozen"`` one keeps it the source's (no backbone group, nothing else trains); each
     update reads the next chunk of the training stream (``plan.rows`` independent rows) and runs
     ``train_text_update``; the run stops early, recorded in ``stopped``, when the stream ends
     or a chunk has a row without a label (a trajectory needs one: its NLL and depth are means
-    over its own labels and real tokens). At every save point the whole weights are saved and
-    ``evaluate_text`` runs on the validation chunks; ``plan.preflight`` runs the updates with
-    neither. On CUDA the update is captured (``WarmedGraph``) inside
+    over its own labels and real tokens). Before training, ``inputs.json`` records everything an
+    evaluation must reproduce (the source, config, tokenizer, finalization and recipe
+    identities, the components, the pin and the validation chunks' seed, slots, count and
+    digest, the scan, the control seeds, the plan). At every save point the whole weights are
+    saved, ``saves.jsonl`` binding each file to the sha256 of the bytes written; with
+    ``plan.evaluation`` ``"at_saves"`` ``evaluate_text`` runs then on the validation chunks,
+    with ``"after_training"`` once training ends: the update graph, the optimizer, the
+    parameter lists and every gradient are released first, then each save is loaded from its
+    checked bytes and evaluated in save order (a failure writes ``evaluation_failed.json`` and
+    raises, so no ``result.json`` claims a complete run). ``plan.preflight`` runs the updates
+    with neither saves nor evaluations. On CUDA the update is captured (``WarmedGraph``) inside
     ``deterministic_algorithms``.
 
     Raises:
         ValueError: as ``check_plan``, on another finalization or tokenizer than the source's,
-            components the finalization was not taken over, or a validation document outside
-            the pin; all before ``out`` exists.
+            components the finalization was not taken over or other than the source's recipe's,
+            or a validation document outside the pin; all before ``out`` exists.
         FileExistsError: if ``out`` exists.
         FloatingPointError: on a non-finite update (the updates before it logged).
     """
     target = check_plan(plan)
     src = load_text_source(source, config)
-    # each identity file parsed from the bytes whose hash was checked, never read again
-    fin = load_finalization(finalization, sha256=src.identity["finalization_sha256"])
-    tokenizer = Tokenizer.parse(
-        verified_bytes(
-            tokenizer_path,
-            src.identity["tokenizer_sha256"],
-            "the tokenizer the source trained with",
-        )
-    )
+    fin, tokenizer = src.bind(parts, finalization, tokenizer_path, source)
     cfg, model = src.cfg, src.model
-    check_inputs(fin, parts)
     fraction = cfg.training.held_out_fraction
     pinned = validation_chunks(parts, tokenizer, Split(fin, fraction, held_out=True), cfg, pin)
     stream = training_stream(
         parts, plan.seed, tokenizer, Split(fin, fraction), plan.rows, cfg.training.chunk_tokens
     )
     out.mkdir(parents=True, exist_ok=False)
+    # everything a separate evaluation must reproduce, recorded before training (maintainer B
+    # 37b40b4)
+    write_json(
+        out / "inputs.json",
+        {
+            "evaluation": plan.evaluation,
+            "source": str(source),
+            "source_model_sha256": src.model_sha256,
+            "source_config_sha256": src.config_sha256,
+            "identity": src.identity,
+            "components": [[c.name, c.share] for c in parts],
+            "pin": str(pin),
+            "pin_sha256": pinned.pin_sha256,
+            "validation": {
+                "seed": VALIDATION_SEED,
+                "micro": VALIDATION_MICRO,
+                "chunks": len(pinned.chunks),
+                "digest": pinned.digest(),
+            },
+            "device": plan.device,
+            "scan": TRAIN_SCAN[plan.device],
+            "random_seeds": list(RANDOM_SEEDS),
+            "q": Q,
+            "plan": plan.record(),
+        },
+    )
     head = start_head(model)
     backbone = release_backbone(model) if plan.backbone == "joint" else []
     cuda = target.type == "cuda"
     precision = training_precision(cuda=cuda)
     model = model.to(target)
     _ = set_scan(model, TRAIN_SCAN[plan.device])
-    opt = optimizer(head, backbone, capturable=cuda)
+    backbone_lr = BACKBONE_LR * plan.backbone_lr_scale
+    opt = optimizer(head, backbone, capturable=cuda, backbone_lr=backbone_lr)
     graph = WarmedGraph() if cuda else None
     params = head + backbone
     action = generator_for(ACTION_SPLIT, plan.seed)
     t_max = model.loop.t_max
     consumed, draws, training = "", "", 0.0
     evaluations: dict[str, TextEvaluation] = {}
+    # each save's evaluation graphs' [captures, replays] by graph (None on the CPU)
+    evaluation_graphs: dict[str, dict[str, list[int]] | None] = {}
+    saves: list[dict[str, object]] = []
     stopped: str | None = None
     reset_memory_peak(target)
     started = time.monotonic()
@@ -629,24 +787,44 @@ def run(  # noqa: PLR0913, PLR0915
         deterministic_algorithms() if cuda else nullcontext(None) as determinism,
         (out / "train.jsonl").open("w", encoding="utf-8") as log,
         (out / "eval.jsonl").open("w", encoding="utf-8") as evals,
+        (out / "saves.jsonl").open("w", encoding="utf-8") as saved,
     ):
 
         def checkpoint(after: int) -> None:
             if plan.preflight or after not in plan.save_at:
                 return
             (out / "weights").mkdir(exist_ok=True)
+            buffer = io.BytesIO()
             torch.save(
                 {
                     name: t.detach().to("cpu").clone()
                     for name, t in cast("dict[str, Tensor]", model.state_dict()).items()
                 },
-                out / "weights" / f"after-{after:06d}.pt",
+                buffer,
             )
+            # the digest is of the bytes written: an evaluation after training loads them by it
+            data = buffer.getvalue()
+            name = f"weights/after-{after:06d}.pt"
+            _ = (out / name).write_bytes(data)
+            entry: dict[str, object] = {
+                "after": after,
+                "weights": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            saves.append(entry)
+            _ = saved.write(json.dumps(entry) + "\n")
+            saved.flush()
+            if plan.evaluation == "at_saves":
+                evaluate(after)
+
+        def evaluate(after: int) -> None:
             # captured on CUDA; built per save point so their memory is not held while training
             eval_graphs = EvalGraphs() if cuda else None
             evaluation = evaluate_text(model, pinned.chunks, graphs=eval_graphs)
             evaluations[str(after)] = evaluation
-            line: dict[str, object] = {"after": after, **evaluation}
+            counts = None if eval_graphs is None else eval_graphs.counts()
+            evaluation_graphs[str(after)] = counts
+            line: dict[str, object] = {"after": after, **evaluation, "graphs": counts}
             _ = evals.write(json.dumps(line) + "\n")
             evals.flush()
 
@@ -674,6 +852,26 @@ def run(  # noqa: PLR0913, PLR0915
             )
             log.flush()
             checkpoint(update + 1)
+        update_graph = (
+            None
+            if graph is None
+            else {"warm": graph.warm, "captures": graph.captures, "replays": graph.replays}
+        )
+        trained_backbone = bool(backbone)
+        deferred_seconds: float | None = None
+        if plan.evaluation == "after_training":
+            # every training reference released before the first evaluation (maintainer B 7e78192):
+            # the update graph and its pool, the optimizer and its moments, the parameter
+            # lists and every gradient; the model itself (src.model is the same object) is
+            # what the saved weights are loaded into
+            del opt, graph, params, head, backbone
+            model.zero_grad(set_to_none=True)
+            _ = gc.collect()
+            if cuda:
+                torch.cuda.empty_cache()
+            tick = time.monotonic()
+            _evaluate_saves(out, saves, model, evaluate, evaluations)
+            deferred_seconds = time.monotonic() - tick
     done = len(evaluations) and max(int(k) for k in evaluations)
     result: dict[str, object] = {
         "design": "docs/reviews/2026-10-20-real-data-halting-pilot.md (phase 2, exploratory)",
@@ -689,7 +887,7 @@ def run(  # noqa: PLR0913, PLR0915
         "head_start": {"direction": 0.0, "gain": 1.0, "bias": HEAD_BIAS},
         "optimizer": {
             "peak_lr": PEAK_LR,
-            "backbone_peak_lr": BACKBONE_LR if backbone else None,
+            "backbone_peak_lr": backbone_lr if trained_backbone else None,
             "warmup": WARMUP,
             "betas": list(BETAS),
             "eps": ADAM_EPS,
@@ -703,12 +901,12 @@ def run(  # noqa: PLR0913, PLR0915
         "last_evaluation": done or None,
         "train_seconds": training,
         "wall_seconds": time.monotonic() - started,
+        "deferred_evaluation_seconds": deferred_seconds,
         "peak_reserved_bytes": memory_peak(target) if cuda else None,
         # the training update's own graph (evaluation graphs are separate): eager warm-up
         # calls, then one capture per signature and replays (maintainer B's review of 8415310)
-        "update_graph": None
-        if graph is None
-        else {"warm": graph.warm, "captures": graph.captures, "replays": graph.replays},
+        "update_graph": update_graph,
+        "evaluation_graphs": evaluation_graphs,
         "determinism": determinism,
         "device_name": torch.cuda.get_device_name(target) if cuda else None,
         "scan": scan_of(model),
@@ -719,6 +917,8 @@ def run(  # noqa: PLR0913, PLR0915
             "fla-core": version_or_none("fla-core"),
         },
         "environment": environment(),
+        "evaluation": plan.evaluation,
+        "saves": saves,
         "evaluations": evaluations,
     }
     write_json(out / "result.json", result)
@@ -739,6 +939,15 @@ def _parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--backbone", choices=BACKBONE_MODES, default="joint")
     _ = parser.add_argument(
         "--dense-weight", type=float, default=None, help="default 0.1 joint, 0 frozen"
+    )
+    _ = parser.add_argument(
+        "--backbone-lr-scale", type=float, default=1.0, help="joint backbone rate x this"
+    )
+    _ = parser.add_argument(
+        "--evaluation",
+        choices=EVALUATION_MODES,
+        default="at_saves",
+        help="after_training: save weights only, evaluate every save when training ends",
     )
     _ = parser.add_argument("--updates", type=int, required=True)
     _ = parser.add_argument("--rows", type=int, default=4, help="unique rows per update (E)")
@@ -769,6 +978,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=cast("str", args.device),
         preflight=cast("bool", args.preflight),
         backbone=backbone,
+        backbone_lr_scale=cast("float", args.backbone_lr_scale),
+        evaluation=cast("str", args.evaluation),
     )
     source = cast("Path", args.source)
     try:

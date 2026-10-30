@@ -872,11 +872,13 @@ def run_fixture(
     checkpoints: int,
     *,
     long_document: bool = False,
+    eval_chunks: int = 1,
 ) -> tuple[VesperConfig, Path, Sequence[Component], Path, Path]:
     """The small corpus, config file, finalization and tokenizer a run needs.
 
     With ``long_document`` one web document of the training side is many chunks long, so the
-    slot that receives it runs on after every other stream is dry.
+    slot that receives it runs on after every other stream is dry. ``eval_chunks`` is the
+    config's held-out chunk count.
     """
     from test_sample import write_mix  # noqa: PLC0415
 
@@ -894,7 +896,7 @@ def run_fixture(
         {
             "total_tokens": total_tokens,
             "checkpoints_per_run": checkpoints,
-            "eval_chunks": 1,
+            "eval_chunks": eval_chunks,
             "held_out_fraction": 0.2,
         }
     )
@@ -2011,6 +2013,53 @@ def test_a_cycling_run_trains_past_every_run_out_and_resumes_on_both_sides_of_on
         )
         for name, tensor in a.items():
             torch.testing.assert_close(tensor, b[name], rtol=1e-5, atol=1e-6)
+
+
+def _last_change(steps: list[dict[str, object]], name: str) -> int:
+    """The step at which a component's handed-out tokens last grew (0 if never)."""
+    last, before = 0, 0
+    for line in steps:
+        value = cast("dict[str, int]", line["shares"]).get(name, 0)
+        if value != before:
+            last, before = cast("int", line["step"]), value
+    return last
+
+
+def test_a_component_leaving_a_finite_mix_is_logged_once_with_its_tokens(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # the original days run lost code, books and wiki one after another and no line said so:
+    # `exhausted` fires only when a whole group is dry (2026-10-27 supply count)
+    train, exhausted = cycling_runs(tmp_path, book_builder)
+    finite = read_log(tmp_path / "finite" / "log.jsonl")
+    steps = steps_of(finite)
+    final = cast("dict[str, int]", steps[-1]["shares"])
+    out_lines = [line for line in finite if line["kind"] == "component_out"]
+    names = [cast("str", line["component"]) for line in out_lines]
+    # every component, once, each with a trained step: the run ended exhausted, and here the
+    # last component leaves while the groups still train its queued tokens
+    assert sorted(names) == sorted(final)
+    out_steps = [cast("int", line["step"]) for line in out_lines]
+    assert out_steps == sorted(out_steps)
+    for line in out_lines:
+        name = cast("str", line["component"])
+        assert line["tokens_handed_out"] == final[name]
+        assert cast("int", line["step"]) >= _last_change(steps, name)
+    first = cast("int", out_lines[0]["step"])
+    assert first < exhausted  # a component left while both groups still trained
+    # a resume after the first run-out does not report it again
+    out = tmp_path / "cut"
+    _ = train(out, first + 1)
+    resumed = train(out, None, resume=out / f"step-{first + 1}")
+
+    def fields(lines: list[dict[str, object]]) -> list[tuple[object, object, object]]:
+        return [(x["component"], x["step"], x["tokens_handed_out"]) for x in lines]
+
+    again = [line for line in resumed if line["kind"] == "component_out"]  # both runs' lines
+    assert fields(again) == fields(out_lines)  # the same run-outs, none reported twice
+    # a cycling run never takes a component out of its mix
+    cycling = train(tmp_path / "cycling", exhausted + 8, cycle=True)
+    assert [line for line in cycling if line["kind"] == "component_out"] == []
 
 
 def test_a_finite_checkpoint_enters_cycling_only_through_the_recorded_transition(

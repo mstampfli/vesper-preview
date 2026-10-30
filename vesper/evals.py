@@ -55,15 +55,42 @@ class EvalGraphs:
 
     One ``SignatureGraph`` per kind of pass (the policy forward of ``evaluate``, the dense
     traversal of ``depth_losses``), so alternating the two never re-warms; the weights are
-    updated in place between checkpoints, so a captured pass stays valid for the run. The project
-    owner 2026-10-21: CUDA graphs for ANYTHING on the GPU, so a CUDA evaluation without them is
-    refused.
+    updated in place between checkpoints, so a captured pass stays valid for the run. A carried
+    pass's FIRST chunk starts from cold states whose attention windows are empty, a signature
+    of its own, so each carried kind has a second graph for it (``policy_first``,
+    ``dense_first``): short streams, one or two chunks per call (a document at a time), would
+    otherwise switch the one graph's key on every call and never capture (2026-10-28: the
+    per-document policy evaluation ran eager). The project owner 2026-10-21: CUDA graphs for
+    ANYTHING on the GPU, so a CUDA evaluation without them is refused.
     """
 
     policy: SignatureGraph = field(default_factory=SignatureGraph)
-    dense: SignatureGraph = field(default_factory=SignatureGraph)
+    policy_first: SignatureGraph = field(default_factory=SignatureGraph)
+    dense: SignatureGraph = field(default_factory=SignatureGraph)  # depth_losses
+    dense_first: SignatureGraph = field(default_factory=SignatureGraph)
+    static: SignatureGraph = field(default_factory=SignatureGraph)  # static_profile's sums
+    static_first: SignatureGraph = field(default_factory=SignatureGraph)
     rule: SignatureGraph = field(default_factory=SignatureGraph)  # a deployed exit rule, cold
     trace: SignatureGraph = field(default_factory=SignatureGraph)  # replayed depths, cold
+
+    def counts(self) -> dict[str, list[int]]:
+        """Each graph's ``[eager, captures, replays]`` by field name (for a record).
+
+        Whether a CUDA evaluation ran captured is measured here, never assumed (2026-10-29: a
+        run's deferred evaluations recorded no counts, so their capture was unknown). The eager
+        count tells a pass that ran without a graph (warm-up only) from one never run.
+        """
+        graphs = {  # every field, by its name (a test checks the two lists agree)
+            "policy": self.policy,
+            "policy_first": self.policy_first,
+            "dense": self.dense,
+            "dense_first": self.dense_first,
+            "static": self.static,
+            "static_first": self.static_first,
+            "rule": self.rule,
+            "trace": self.trace,
+        }
+        return {name: [g.eager, g.captures, g.replays] for name, g in graphs.items()}
 
 
 PassFn = Callable[[Sequence[Tensor], list[ColumnState]], list[Tensor]]
@@ -80,6 +107,7 @@ def run_chunks(  # noqa: PLR0913
     switches: tuple[object, ...] = (),
     extras: Sequence[Sequence[Tensor]] | None = None,
     running: Sequence[Tensor] | None = None,
+    first: SignatureGraph | None = None,
 ) -> list[list[Tensor]]:
     """PRIMITIVE a no-gradient pass over every chunk, captured on CUDA; each chunk's results.
 
@@ -87,9 +115,14 @@ def run_chunks(  # noqa: PLR0913
     gives each chunk's extra tensors, e.g. a trace of depths: values, never constants frozen
     into the graph) and returns its ``outputs`` result tensors, then the new state tensors
     (``column.state_tensors``). ``carried``: the states run from chunk to chunk (cold at the
-    first); else every chunk starts cold (independent contexts). No gradient, float32 (autocast
-    off). ``switches`` name the pass's kind in the capture signature. The results are copied out
-    of the graph's buffers and stay on the device until the caller reads them once.
+    first); else every chunk starts cold (independent contexts). A carried pass's first chunk
+    runs under ``first`` (required with ``graph`` on CUDA): its cold states have empty attention
+    windows, another signature than the carried chunks', and one graph for both would re-warm
+    at every switch and, for short streams, never capture. No gradient, float32 (autocast off).
+    ``switches`` name the pass's kind in the capture signature. The results are copied out of
+    the graph's buffers and stay on the device until the caller reads them once; the carried
+    states are the graph's outputs, read as the next chunk's inputs (copied in) before that
+    graph replays again.
 
     ``running``: an aggregate streamed through the chunks (e.g. zero sums). The pass then also
     gets the running values after its other inputs and returns their updated values as its
@@ -102,20 +135,108 @@ def run_chunks(  # noqa: PLR0913
     GPU). Not for: training (``vesper.train.step``, ``joint_update``), which owns its graphs.
 
     Raises:
-        ValueError: on CUDA without ``graph`` (no eager GPU evaluation); when ``running`` has
-            another count than ``outputs`` or a pass changes a running value's shape or dtype.
+        ValueError: on CUDA without ``graph``, or carried without ``first`` (no GPU evaluation
+            outside a graph, which still warms up eagerly before it captures); when
+            ``running`` has another count than ``outputs`` or a pass changes
+            a running value's shape or dtype.
+    """
+    results, _ = _chunk_loop(
+        model,
+        chunks,
+        graph,
+        outputs,
+        pass_fn,
+        carried=carried,
+        switches=switches,
+        extras=extras,
+        running=running,
+        first=first,
+        initial=None,
+    )
+    return results
+
+
+def run_carried(  # noqa: PLR0913
+    model: Vesper,
+    chunks: Sequence[Chunk],
+    graph: SignatureGraph | None,
+    outputs: int,
+    pass_fn: PassFn,
+    *,
+    first: SignatureGraph | None,
+    initial: Sequence[ColumnState] | None = None,
+    switches: tuple[object, ...] = (),
+) -> tuple[list[list[Tensor]], list[ColumnState]]:
+    """PRIMITIVE ``run_chunks`` carried, from given states, returning its final states too.
+
+    The same chunk loop as ``run_chunks(..., carried=True)`` (one implementation), with two
+    differences: ``initial`` (states after an earlier call) replaces the cold start, its first
+    chunk then running under ``graph`` like every carried chunk (``first`` is only for a cold
+    start, required on CUDA then); and the states after the last chunk come back as CLONES,
+    owned by the caller, so several continuations can start from the same states without one
+    inheriting another's (each passes them as values, which a graph copies into its inputs).
+
+    For: branching a carried stream, e.g. scoring several continuations of one saved prefix
+    state (``vesper.recall``). Not for: running aggregates (``run_chunks``' ``running``).
+
+    Raises:
+        ValueError: as ``run_chunks``; on no chunks.
+    """
+    if not chunks:
+        msg = "run_carried needs at least one chunk"
+        raise ValueError(msg)
+    results, carry = _chunk_loop(
+        model,
+        chunks,
+        graph,
+        outputs,
+        pass_fn,
+        carried=True,
+        switches=switches,
+        extras=None,
+        running=None,
+        first=first,
+        initial=initial,
+    )
+    if carry is None:  # carried with at least one chunk always sets it
+        msg = "run_carried: the chunk loop returned no states"
+        raise RuntimeError(msg)
+    owned = [t.clone() for t in state_tensors(carry)]  # the graph overwrites its outputs
+    return results, with_state_tensors(carry, owned)
+
+
+def _chunk_loop(  # noqa: PLR0913
+    model: Vesper,
+    chunks: Sequence[Chunk],
+    graph: SignatureGraph | None,
+    outputs: int,
+    pass_fn: PassFn,
+    *,
+    carried: bool,
+    switches: tuple[object, ...],
+    extras: Sequence[Sequence[Tensor]] | None,
+    running: Sequence[Tensor] | None,
+    first: SignatureGraph | None,
+    initial: Sequence[ColumnState] | None,
+) -> tuple[list[list[Tensor]], list[ColumnState] | None]:
+    """The chunk loop of ``run_chunks`` and ``run_carried``: results, and the last carry.
+
+    The carry refers to the last graph's output buffers (``run_carried`` clones it).
     """
     device = next(model.parameters()).device
     cuda = device.type == "cuda"
-    if cuda and graph is None:
-        msg = "a CUDA evaluation runs as captured CUDA graphs: pass EvalGraphs (no eager GPU work)"
+    if cuda and (graph is None or (carried and first is None and initial is None)):
+        msg = (
+            "a CUDA evaluation runs as captured CUDA graphs: pass EvalGraphs, and a carried pass"
+            " a graph for its cold first chunk (eager warm-up, then capture and replays)"
+        )
         raise ValueError(msg)
     if cuda and scan_of(model) == "reference":
         msg = "the reference scan cannot run as a captured CUDA graph; set a fused scan"
         raise ValueError(msg)
     current = None if running is None else _running_layout(running, outputs, device)
     results: list[list[Tensor]] = []
-    carry: list[ColumnState] | None = None
+    carry: list[ColumnState] | None = None if initial is None else list(initial)
     for index, chunk in enumerate(chunks):
         b = int(chunk.tokens.shape[0])
         cold = model.init_states(b, torch.float32, device)
@@ -134,8 +255,11 @@ def run_chunks(  # noqa: PLR0913
             with torch.no_grad(), torch.autocast(device.type, enabled=False):
                 return pass_fn(v[:n], with_state_tensors(templates, v[n:]))
 
+        chunk_graph = first if carried and index == 0 and initial is None else graph
         out: Sequence[Tensor] = (
-            run(values) if graph is None else graph(signature(values, *switches), run, values)
+            run(values)
+            if chunk_graph is None
+            else chunk_graph(signature(values, *switches), run, values)
         )
         kept = [t.clone() for t in out[:outputs]]  # graph buffers are overwritten
         if current is None:
@@ -144,7 +268,7 @@ def run_chunks(  # noqa: PLR0913
             current = _running_layout(kept, outputs, device, like=current)
         if carried:
             carry = with_state_tensors(templates, list(out[outputs:]))
-    return results if current is None else [current]
+    return (results if current is None else [current]), carry
 
 
 def _running_layout(
@@ -205,7 +329,6 @@ def evaluate(
             *state_tensors(result.states),
         ]
 
-    graph = None if graphs is None else graphs.policy
     masks = [[chunk.loss_mask] for chunk in chunks]
     zeros = [
         torch.zeros((), dtype=torch.float64),
@@ -215,13 +338,14 @@ def evaluate(
     ((total, count, depths),) = run_chunks(
         model,
         chunks,
-        graph,
+        None if graphs is None else graphs.policy,
         3,
         policy,
         carried=True,
         switches=("policy", passes),
         extras=masks,
         running=zeros,
+        first=None if graphs is None else graphs.policy_first,
     )
     return Evaluation(float(total), int(count), _pass_totals(depths.cpu()))
 
@@ -254,8 +378,11 @@ def depth_losses(
         return [losses, *state_tensors(result.states)]
 
     graph = None if graphs is None else graphs.dense
+    first = None if graphs is None or not carried else graphs.dense_first
     switches = ("dense", carried, t_max)
-    out = run_chunks(model, chunks, graph, 1, dense, carried=carried, switches=switches)
+    out = run_chunks(
+        model, chunks, graph, 1, dense, carried=carried, switches=switches, first=first
+    )
     columns = [
         losses.cpu()[:, chunk.loss_mask].double()
         for (losses,), chunk in zip(out, chunks, strict=True)
@@ -307,18 +434,18 @@ def static_profile(
         chunk_sums = torch.where(mask, losses, torch.zeros_like(losses)).sum(dim=(1, 2))
         return [sums + chunk_sums, *state_tensors(result.states)]
 
-    graph = None if graphs is None else graphs.dense
     masks = [[chunk.loss_mask] for chunk in chunks]
     ((sums,),) = run_chunks(
         model,
         chunks,
-        graph,
+        None if graphs is None else graphs.static,
         1,
         dense_sums,
         carried=True,
         switches=("static", t_max),
         extras=masks,
         running=[torch.zeros(t_max, dtype=torch.float64)],
+        first=None if graphs is None else graphs.static_first,
     )
     count = sum(int(chunk.loss_mask.sum()) for chunk in chunks)
     return StaticProfile(tuple(float(s) for s in sums.cpu().unbind()), count)

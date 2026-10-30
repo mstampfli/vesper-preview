@@ -45,11 +45,16 @@ def learning_rate(update: int, peak: float = PEAK_LR) -> float:
 
 
 def optimizer(
-    head: list[nn.Parameter], backbone: list[nn.Parameter], *, capturable: bool = False
+    head: list[nn.Parameter],
+    backbone: list[nn.Parameter],
+    *,
+    capturable: bool = False,
+    backbone_lr: float = BACKBONE_LR,
 ) -> torch.optim.AdamW:
     """AdamW with one group per trainable set, each with its ``"peak"`` rate.
 
-    The head at ``PEAK_LR``, a trainable backbone (joint runs) at ``BACKBONE_LR``; no weight
+    The head at ``PEAK_LR``, a trainable backbone (joint runs) at ``backbone_lr`` (the
+    caller's validated rate; ``BACKBONE_LR`` unless a run scales it); no weight
     decay in either, so the update descends the trajectory cost itself. ``capturable`` (CUDA,
     a captured update) keeps the step counts on the device and gives every group its own rate
     as a device tensor, filled in place by ``set_learning_rates`` (a float would be frozen into
@@ -62,7 +67,7 @@ def optimizer(
 
     groups: list[dict[str, object]] = [{"params": head, "peak": PEAK_LR, "lr": rate(PEAK_LR)}]
     if backbone:
-        groups.append({"params": backbone, "peak": BACKBONE_LR, "lr": rate(BACKBONE_LR)})
+        groups.append({"params": backbone, "peak": backbone_lr, "lr": rate(backbone_lr)})
     return torch.optim.AdamW(
         groups, betas=BETAS, eps=ADAM_EPS, weight_decay=0.0, capturable=capturable
     )

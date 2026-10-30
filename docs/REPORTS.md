@@ -7,6 +7,171 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-30, 08:33Z: capped stopping is faster but fixed three still wins; distant facts leave a weak trace
+
+These are exploratory comparisons on reused validation. J1 and J2 each use one training
+seed; their 4,000 updates differ from the earlier frozen rule's 20,000. The earlier held-out
+stopping result remains separate.
+
+**What changed.** On 10-28/29 the whole model trained together with the small part that
+decides "stop or take another pass", starting from the final days model (J1: 4,000 updates,
+about 4.3 hours on the development card). An earlier joint text run from checkpoint 189778
+had already regressed. These new runs ask whether joint training works better from the final
+checkpoint, and whether a lower backbone learning rate helps.
+
+- Using the same two-or-three-pass rule for terminal evaluation, J1 stops after 2.8 passes
+  on average, out of 8. It beats a mixture of fixed depths of its own adapted model at no
+  greater mean logical-pass budget by 0.0143 nats, and all four random-stopping controls by
+  0.013 to 0.015. This is a larger advantage over its own benchmark than the earlier frozen
+  rule's roughly 0.002; it does not make the model better than that frozen candidate.
+- At every fixed depth, J1's loss is 0.83 to 1.37 nats higher than the source model's
+  (best loss: 4.16 against 3.33). The frozen-model stopping rule from 10-25 has both lower
+  loss and fewer logical passes. The small stopping advantage does not offset this regression.
+
+**J2, the lower-rate version (finished 13:51Z).** Reducing the main model's learning rate
+tenfold while keeping the stopping head's rate reduced the final regression to about a sixth:
+0.13 to 0.23 nats, instead of 0.83 to 1.37. The regression grew between the measured saves:
+0.04-0.06 at 1,000 updates, 0.08-0.13 at 2,000, then 0.13-0.23 at 4,000. The terminal rule
+averages 2.24 passes and beats its adapted fixed-depth mixture by 0.0022 nats and all four
+random controls by about 0.0045.
+
+The decisive comparison is with the original model: at fixed depth 2 it has 0.12 nats lower
+loss than J2's stopping rule while using fewer logical passes (2 against 2.24). The earlier
+frozen rule also has lower loss than J2, but uses more passes, so neither dominates the other.
+We paused joint training at these settings. These loss/pass comparisons do not measure runtime.
+
+**Two corrections to the Pythia entry below (10-28).** "Pythia never trained on it" is
+unsupported: no Pile overlap audit was done. The stopping rule's roughly 0.23 GFLOP/token
+estimate near 2.7 passes, beside Pythia-160M's roughly 0.25, counted ideal active-pass matrix
+multiplications, not executed work. That implementation ran all eight passes and masked
+inactive outputs; its logical stopping depth did not remove those computations. Different
+tokenizers also make per-token costs different units. The comparison establishes no advantage
+at equal executed compute or measured runtime.
+
+**Making the frozen rule actually skip work: a three-pass cap.** The frozen rule exits at
+pass 2 or 3. Code 105d7f4 can stop execution after pass 3 while keeping the rule's original
+eight-pass probability calculation. It retains only the first three passes' state and refuses
+deeper continuation. The CPU checks, including carried continuations, and the GPU cold-chunk
+measurement preserve NLL, exits and those retained states bit for bit within each backend.
+
+On the development card, five timed rounds after warm-up/capture give median GPU-event times
+of 4.28 seconds for the cap versus 9.42 seconds for ordinary eight-pass execution, over the
+same 16 cold validation chunks. Fixed depth 3 takes 4.16 seconds and has lower loss (3.344
+against 3.363). Thus fixed three dominates this capped implementation on both measured axes.
+Skipping pass 3 for tokens that already stopped at 2 would need further implementation work.
+We have paused that work for this rule/model; a concrete cheaper design or a larger quality
+margin could reopen it. This is a practical decision, not proof that packing cannot win.
+
+**Can the model recall a planted fact?** Each test inserts a synthetic access-code fact,
+then ordinary text from the existing held-out read set, then a matching completion prompt.
+It scores ten candidate codes, rather than generating an unrestricted answer. Each pair
+differs only in which code was planted. There are 200 pairs per gap, using the final days
+model at fixed depth 5 and code 55b830e. Gap means tokens from the fact's end to the query's
+start; the last planted-value token to the first scored logit is gap + 14.
+
+| Gap in tokens | 128 | 448 | 1,000 | 4,000 | 16,000 |
+| --- | --- | --- | --- | --- | --- |
+| Correct top choice, episodes out of 400 | 399 | 367 | 74 | 51 | 37 |
+| Both versions correct, pairs out of 200 | 199 | 174 | 7 | 0 | 0 |
+| Fact swap changes top choice, pairs out of 200 | 200 | 190 | 41 | 8 | 1 |
+| Positive paired log-odds contrast, pairs out of 200 | 200 | 200 | 200 | 200 | 200 |
+| Mean paired log-odds contrast, nats | 15.8 | 9.9 | 1.3 | 0.32 | 0.03 |
+
+Recall is strong at the two short tested gaps. It falls to 18.5% correct at 1,000 tokens,
+12.75% at 4,000 and 9.25% at 16,000. The latter rates are descriptively near the 10% reference
+for uniform random choice, not established statistically equivalent to it. Swapping the fact still
+shifts relative candidate preference toward the planted value in every pair, even at 16,000,
+but changes the top answer in only one pair there. A faint fact-dependent score effect
+survives much farther than reliable retrieval in this format. Reused, overlapping filler and
+one model do not establish a general memory horizon or identify which component carries it;
+512 tokens is one attention window, not the whole model's proven reach.
+
+**Instruction tuning with general-text replay, on the same 20 questions.** Replay reduced
+the measured increase in general-text NLL by about 90% versus the no-replay 1e-5 trial.
+That retention result has not produced a clear answer-quality gain in these selected
+validation examples. Fourteen answers stop within the limit, versus 13 and 15 in the earlier
+tuned versions; five answers exactly match the no-replay 1e-5 version. Content remains mixed:
+the punctuation example regresses, and two newly stopping answers still repeat instead of
+answering the question. These are illustrations, not a scored accuracy or equivalence test.
+
+**Also changed.** The instrumented training/evaluation graph wrappers now record eager calls,
+captures and replays. Short call sequences can stay eager, and the first captured execution
+is included in replay counts. J1's historical save evaluations lack these counts; its terminal
+evaluation and J2 record them. Later instrumentation cannot supply the missing observations.
+
+**What it means for you.** The frozen stopping rule's small advantage at a logical-pass
+budget remains real. Joint training at these two settings lost prediction quality, and the
+capped implementation still loses to fixed three on measured quality and time. Future work
+needs an advantage against the original fixed-depth baselines at the budget actually claimed.
+The recall probe gives a different useful distinction: a fact can still affect scores long
+after it usually stops determining the answer. More reliable long-distance recall remains an
+open training/design question; no new run is selected.
+
+Details: selected exports j1-4k-joint-427000, j2-4k-joint-427000,
+exec-cap-105d7f4, exec-cap-measure-105d7f4 and recall-result-55b830e; independent
+reviews joint-results-20261029, j2-results-2aacced, pythia-results-20261029,
+cap-measure-02980db, recall-result-2224d82 and replay-answers-984c5d4.
+
+## 2026-10-28, 12:48Z: the days model next to published Pythia models, in bits per byte
+
+This entry's wording is not yet reviewed by maintainer B; the comparison itself waits in their queue.
+
+**What changed.** For the first time Vesper was measured against models from outside the
+project. The project owner approved it on 10-27. The final days model (64 million parameters, 7.0 billion
+training tokens) and published Pythia checkpoints (EleutherAI, trained on the Pile) each scored
+the same 398 held-out documents, every document from a cold start, in bits per byte (the
+models use different tokenizers, so loss per byte is the fair unit). Nothing was trained.
+
+| model | training tokens | bits per byte |
+|---|---|---|
+| Vesper, fixed depth 1 / 2 / 3 / 5 / 8 passes | 7.0B | 1.2010 / 1.1176 / 1.0982 / 1.0946 / 1.0974 |
+| Pythia-70M at 3000 / 4000 steps / final | ~6.3B / ~8.4B / ~300B | 1.1705 / 1.1431 / 1.0849 |
+| Pythia-160M at 3000 / 4000 steps / final | ~6.3B / ~8.4B / ~300B | 1.0880 / 1.0553 / 0.9596 |
+
+- Against Pythia-70M at similar training tokens, Vesper at 5 passes is clearly better (by
+  0.05 to 0.08 bits per byte, intervals well away from zero).
+- Against Pythia-160M at ~6.3B tokens the difference is +0.0067 with an interval of
+  [-0.0166, +0.0240]: this test cannot tell the two apart, which is not the same as showing
+  them equal. At ~8.4B tokens Pythia-160M is better.
+
+**What it means for you.** By a rough estimate that counts only the matrix multiplications
+(attention and the recurrent scan left out), Vesper at 5 passes spends about four times
+Pythia-70M's compute per token and about 1.5 times Pythia-160M's. So this does not show an
+advantage at equal compute. The text is also Vesper's own kind of data, which Pythia never
+trained on, so it favours Vesper. The comparison is an indicator, not a verdict. Fixed-depth
+numbers are no ceiling for adaptive stopping: a model that learns when to stop, and keeps
+training while it learns, can end up anywhere, and that is what the next run measures.
+
+**What is next.** The joint stopping run on text (the whole model trains together with the
+stopping head), agreed with maintainer B on 10-28. Two code changes it needs are in maintainer B's review
+(377d195, 7e092cd); a 40-update trial with them completed, and the full run's size is decided
+with that review. Then the same comparison for whatever it produces.
+
+**Where the details are.** Export pythia-compare-20261027 (NOTE.md, full.json, the scripts,
+the Pythia snapshot ids, SHA256SUMS).
+
+## 2026-10-28, 12:48Z: the original days run ran out of three data sources, not one
+
+This entry's wording is not yet reviewed by maintainer B.
+
+**What changed.** We knew the original days run ran out of code at step ~226,650 and was
+then repaired. Counting every source's usable training tokens (10-27) showed more: in the
+original trajectory books ran out at step 252,712 and Wikipedia at 254,656, so from there it
+trained on web text alone. The counts match the run's own log exactly: code 557,016,987,
+books 42,210,207 and wiki 170,150,758 tokens. The repaired run (the one every later result
+uses) branched at step 225,362, before any of the three, and cycles its sources, so it is
+not affected. Since 38d08d8 the trainer writes one log line whenever a source leaves a
+finite mix, so this cannot go unnoticed again.
+
+**What it means for you.** No published result changes. The supply count also answers how
+much training text we have with this mix: about 10.4 billion tokens (9.6 billion of it web).
+
+**What is next.** A supply-against-budget check before long runs (draft for maintainer B,
+design-supply-budget-20261027).
+
+**Where the details are.** Export design-supply-budget-20261027 (DRAFT.md, counts, scripts);
+review-evidence-compout-38d08d8.
+
 ## 2026-10-26, 21:03Z: replaying general text during instruction tuning removes most of the forgetting
 
 This entry's wording is not yet reviewed by maintainer B (their weekly review budget is nearly used up);

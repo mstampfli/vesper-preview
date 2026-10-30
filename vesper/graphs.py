@@ -196,8 +196,13 @@ class WarmedGraph:
     """
 
     def __init__(self, warm: int = WARM_STEPS, pool: _POOL_HANDLE | None = None) -> None:
-        """Nothing captured yet; the first ``warm`` calls run eagerly; captures go to ``pool``."""
+        """Nothing captured yet; the first ``warm`` calls run eagerly; captures go to ``pool``.
+
+        ``eager`` counts every eager call over the object's life (a ``reset`` restarts the
+        warm-up, not the count), so a record tells "ran without a graph" from "never ran".
+        """
         self.warm: int = warm
+        self.eager: int = 0
         self.captures: int = 0
         self.replays: int = 0
         self._eager: int = 0
@@ -223,6 +228,7 @@ class WarmedGraph:
                 raise ContractError(msg)
         if self._eager < self.warm:
             self._eager += 1
+            self.eager += 1
             with side_stream():
                 return tuple(step(values))
         if self._captured is None:
@@ -239,7 +245,8 @@ class SignatureGraph:
     Each call names its signature ``key`` (everything the captured work depends on beyond the
     values copied in: shapes, dtypes, a phase, which inputs exist). The same key replays the
     current graph; a new key drops it and warms and captures a new one, so the memory of only
-    one graph is held. ``captures`` counts captures over the object's life, ``replays`` replays.
+    one graph is held. ``eager``, ``captures`` and ``replays`` count eager warm-up calls,
+    captures and replays over the object's life.
 
     For: work that moves forward through few signatures and repeats each many times (the
     trainer's steps across phases and the tail, the evaluations' chunks after the first one's
@@ -252,6 +259,7 @@ class SignatureGraph:
     def __init__(self, warm: int = WARM_STEPS, pool: _POOL_HANDLE | None = None) -> None:
         """Nothing captured yet; every capture goes to ``pool`` (``GraphFamily``) if given."""
         self.warm: int = warm
+        self.eager: int = 0
         self.captures: int = 0
         self.replays: int = 0
         self._key: tuple[object, ...] | None = None
@@ -272,11 +280,13 @@ class SignatureGraph:
         if key != self._key or self._graph is None:
             self._key, self._graph = key, WarmedGraph(self.warm, self._pool)
         graph = self._graph
-        captures, replays = graph.captures, graph.replays
-        out = graph(step, values)
-        self.captures += graph.captures - captures
-        self.replays += graph.replays - replays
-        return out
+        eager, captures, replays = graph.eager, graph.captures, graph.replays
+        try:
+            return graph(step, values)
+        finally:  # a call that ran and raised still counts (maintainer B 5c472b2); error kept
+            self.eager += graph.eager - eager
+            self.captures += graph.captures - captures
+            self.replays += graph.replays - replays
 
 
 class GraphFamily:

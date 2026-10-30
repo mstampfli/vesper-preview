@@ -1711,6 +1711,29 @@ def run(  # noqa: C901, PLR0913, PLR0915
         )
         saved_at = time.monotonic()  # after the evaluation: the safety interval counts training
 
+    # the components still in the mix: one leaving it (a finite run's run-out) is its own line,
+    # since `exhausted` fires only when a whole group is dry (2026-10-27: the original days run
+    # lost code, books and wiki one after another and no line said so); read from the mixer as
+    # of the chunks a step trained, so a component that leaves while groups draw ahead is
+    # reported with the step that trains its last chunk; a resume starts from its checkpoint's
+    # mixer, so nothing already out is reported again; an `exhausted` end means every
+    # component is out, whichever were reported before it
+    in_mix = set(handed_out()[0].active)
+
+    def report_run_outs(state: MixerState) -> None:
+        nonlocal in_mix
+        for index in sorted(in_mix - set(state.active)):
+            name = parts[index].name
+            emit(
+                {
+                    "kind": "component_out",
+                    "step": step_index,
+                    "component": name,
+                    "tokens_handed_out": state.emitted[name],
+                }
+            )
+        in_mix = set(state.active)
+
     def stopped() -> str | None:
         if tokens_seen >= t.total_tokens:
             return "budget"
@@ -1751,6 +1774,7 @@ def run(  # noqa: C901, PLR0913, PLR0915
                     "groups_active": active,
                 }
             )
+        report_run_outs(handed_out()[0])
         line: dict[str, object] = {"kind": "step", "step": step_index}
         line.update(_plain(result))
         # after the result, so that no field of the step's own record can shadow the run's count

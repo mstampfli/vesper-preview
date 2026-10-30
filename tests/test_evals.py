@@ -37,9 +37,11 @@ class ScriptedEvaluation(Vesper):
         *,
         recompute: bool = False,
         exit_rule: ExitRule | None = None,
+        executed: int | None = None,
     ) -> LoopResult:
         del pos, modulation, recompute
         assert exit_rule is None
+        assert executed is None
         assert not torch.is_grad_enabled()
         assert not torch.is_autocast_enabled("cpu")
         assert passes == 2

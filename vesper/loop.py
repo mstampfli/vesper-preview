@@ -25,6 +25,14 @@ tokens see it at every pass and both execution orders agree. All ``T_max`` passe
 no token is active any more: the state-only work of the inactive tokens does not disappear. This
 reference computes the inactive positions densely and ignores their outputs; a kernel skips them.
 
+The executed-pass cap (``executed``) is the one exception, for a rule whose exits never pass a
+known pass (Bounded23 exits at 2 or 3; maintainer B 7f10c8b): the loop runs only the first
+``executed`` passes and requires every token to have left by then, never forcing an exit; the rule
+still gets the forward's whole horizon, since its hazard baseline depends on it. The later passes'
+states are not written, so they are not returned either: a capped forward's states hold only the
+executed passes, and an ordinary forward refuses them by their pass count instead of reading
+passes that copy-forward never wrote.
+
 The loop takes any ``ColumnLike`` and ``HaltingLike``, so its arithmetic is tested against the
 review's hand-computed table with a scalar column before it is trusted with the real one.
 """
@@ -38,7 +46,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint  # pyright: ignore[reportUnknownVariableType]
 
-from vesper.column import Carry, ColumnState, Modulation, Projections, RMSNorm
+from vesper.column import Carry, ColumnState, Modulation, Projections, RMSNorm, first_passes
 from vesper.contracts import ContractError, Dims, check_shape, require
 from vesper.exits import (
     cdf_advance,
@@ -278,8 +286,9 @@ class LoopResult:
 
     ``y [b, n, d]`` is the halting-weighted output; ``states`` the columns' states after the
     chunk; ``n_iters int32[b, n]`` the passes used per token; ``ponder [b, n]`` the expected depth
-    ``sum_t a_t t`` under the allocation weights; ``per_pass [T_max, b, n, d]`` the pass outputs
-    of active tokens (zero once halted), kept for the local-mode targets and for inspection.
+    ``sum_t a_t t`` under the allocation weights; ``per_pass [T, b, n, d]`` the pass outputs
+    of active tokens (zero once halted), one per pass run (``T_max``, ``passes`` or
+    ``executed``), kept for the local-mode targets and for inspection.
     """
 
     y: Tensor
@@ -347,6 +356,7 @@ class Loop(nn.Module):
         *,
         recompute: bool = False,
         exit_rule: ExitRule | None = None,
+        executed: int | None = None,
     ) -> LoopResult:
         """Run one chunk through all passes, or through the first ``passes`` of them.
 
@@ -368,23 +378,28 @@ class Loop(nn.Module):
             exit_rule: the halting policy; None is ACT with the loop's own head and epsilon
                 (``ActRule``). Whatever the rule, a halted token's projections are copied forward
                 into every later pass (spec 4).
+            executed: run only the first ``executed`` of the forward's passes (the module
+                docstring's cap); the rule is still begun with the forward's pass count. Every
+                token must exit by then: a device contract, never a forced exit. The states may
+                hold ``t_max`` passes or exactly ``executed`` (a capped state continued) and come
+                back holding ``executed``.
 
         Raises:
             ValueError: if ``states`` does not match the columns, a state has the wrong number of
-                passes, or ``passes`` is outside ``[1, t_max]``.
-            ContractError: on a shape mismatch of ``x0`` or ``pos``.
+                passes, or ``passes`` is outside ``[1, t_max]`` or ``executed`` outside
+                ``[1, passes]``.
+            ContractError: on a shape mismatch of ``x0`` or ``pos``, or (eagerly; a device
+                assert under capture) a token still active after the ``executed``-th pass.
         """
         runs = self.t_max if passes is None else passes
         if not 1 <= runs <= self.t_max:
             msg = f"passes must lie in [1, {self.t_max}], got {runs}"
             raise ValueError(msg)
-        if len(states) != len(self.columns):
-            msg = f"{len(states)} states for {len(self.columns)} columns"
+        steps = runs if executed is None else executed
+        if not 1 <= steps <= runs:
+            msg = f"executed must lie in [1, {runs}], got {steps}"
             raise ValueError(msg)
-        for c, state in enumerate(states):
-            if {len(state.h), len(state.kv), len(state.key_history)} != {self.t_max}:
-                msg = f"state of column {c} has {len(state.h)} passes, the loop runs {self.t_max}"
-                raise ValueError(msg)
+        _check_passes(states, len(self.columns), self.t_max, None if executed is None else steps)
         dims: Dims = {"d": self.u.shape[1]}
         check_shape("x0", x0, ("b", "n", "d"), dims)
         check_shape("pos", pos, ("b", "n"), dims, dtype=torch.long)
@@ -401,10 +416,10 @@ class Loop(nn.Module):
         depth = torch.zeros(b, n, dtype=x0.dtype, device=device)
         n_iters = torch.zeros(b, n, dtype=torch.int32, device=device)
         carried: list[Projections | None] = [None] * len(self.columns)
-        current = list(states)
+        current = list(states) if executed is None else [first_passes(s, steps) for s in states]
         x = x0
         per_pass: list[Tensor] = []
-        for t in range(runs):
+        for t in range(steps):
             h = x + self.u[t]
             fresh: list[Projections] = []
             for c, column in enumerate(self.columns):
@@ -436,6 +451,11 @@ class Loop(nn.Module):
                     carried[c] = written if previous is None else _merge(halts, written, previous)
             x = h if dense else torch.where(active[..., None], h, x)
             active = active & ~halts
+        if steps < runs:
+            require(
+                (~active).all(),
+                f"every token must exit by executed pass {steps} of {runs}; the cap never forces",
+            )
         return LoopResult(
             y=y,
             states=tuple(current),
@@ -443,6 +463,30 @@ class Loop(nn.Module):
             ponder=depth,
             per_pass=torch.stack(per_pass),
         )
+
+
+def _check_passes(
+    states: Sequence[ColumnState], columns: int, t_max: int, executed: int | None
+) -> None:
+    """One state per column, each holding ``t_max`` passes, or ``executed`` under a cap.
+
+    A capped forward's states hold only its executed passes (the module docstring's cap); any
+    other count is refused here, before a column runs, never cut silently.
+
+    Raises:
+        ValueError: on a state count other than ``columns``, or a pass count outside the above.
+    """
+    if len(states) != columns:
+        msg = f"{len(states)} states for {columns} columns"
+        raise ValueError(msg)
+    held = {t_max} if executed is None else {t_max, executed}
+    for c, state in enumerate(states):
+        counts = {len(state.h), len(state.kv), len(state.key_history)}
+        if len(counts) != 1 or not counts <= held:
+            msg = f"state of column {c} has {sorted(counts)} passes, the loop runs {t_max}" + (
+                "" if executed is None else f" and executes {executed}"
+            )
+            raise ValueError(msg)
 
 
 def _apply(  # noqa: PLR0913

@@ -1,11 +1,13 @@
 """Tests for vesper.halting_text: the joint halting update on real text (pilot phase 2)."""
 
 import dataclasses
+import gc
 import hashlib
 import inspect
 import io
 import json
 import math
+import weakref
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -23,8 +25,10 @@ from vesper.corpus import Component, Split, load_finalization
 from vesper.data import Chunk, Document, Stream
 from vesper.evals import static_profile
 from vesper.exits import hazard_baseline
+from vesper.graphs import WarmedGraph
 from vesper.halting_calibration import static_frontier
 from vesper.halting_text import (
+    Pinned,
     Plan,
     depth_nll,
     evaluate_text,
@@ -36,10 +40,14 @@ from vesper.halting_text import (
 )
 from vesper.halting_text import run as run_text
 from vesper.joint_update import (
+    BACKBONE_LR,
     GRAD_CLIP,
+    PEAK_LR,
     ROLLOUTS,
+    WARMUP,
     optimizer,
     release_backbone,
+    set_learning_rates,
     start_head,
     update_step,
 )
@@ -61,6 +69,8 @@ PLAN = Plan(
     device="cpu",
     preflight=False,
     backbone="joint",
+    backbone_lr_scale=1.0,
+    evaluation="at_saves",
 )
 FROZEN = dataclasses.replace(PLAN, backbone="frozen", dense_weight=0.0)
 
@@ -310,10 +320,10 @@ class PhaseOne:
         )
 
 
-def _phase_one(tmp_path: Path, book_builder: Builder) -> PhaseOne:
+def _phase_one(tmp_path: Path, book_builder: Builder, *, eval_chunks: int = 1) -> PhaseOne:
     """A tiny fixed-objective vesper.train run, its last checkpoint, and a pin of its reads."""
     cfg, config_path, parts, receipt, tokenizer_path = run_fixture(
-        tmp_path, book_builder, 6 * 2 * 16, 1
+        tmp_path, book_builder, 6 * 2 * 16, 1, eval_chunks=eval_chunks
     )
     out = tmp_path / "phase1"
     _ = run(
@@ -399,6 +409,13 @@ def test_the_plan_record_names_every_field() -> None:
         (dataclasses.replace(PLAN, device="tpu"), "device"),
         (dataclasses.replace(PLAN, backbone="partial"), "backbone"),
         (dataclasses.replace(FROZEN, dense_weight=0.1), "dense"),
+        (dataclasses.replace(PLAN, backbone_lr_scale=0.0), "backbone rate scale"),
+        (dataclasses.replace(PLAN, backbone_lr_scale=-0.1), "backbone rate scale"),
+        (dataclasses.replace(PLAN, backbone_lr_scale=math.nan), "backbone rate scale"),
+        (dataclasses.replace(PLAN, backbone_lr_scale=math.inf), "backbone rate scale"),
+        (dataclasses.replace(FROZEN, backbone_lr_scale=0.1), "frozen"),
+        (dataclasses.replace(PLAN, evaluation="never"), "evaluation"),
+        (dataclasses.replace(PLAN, evaluation="after_training", preflight=True), "preflight"),
     ],
 )
 def test_a_refused_plan_writes_nothing(
@@ -408,6 +425,316 @@ def test_a_refused_plan_writes_nothing(
     with pytest.raises(ValueError, match=message):
         _ = p1.run(tmp_path / "p2", plan)
     assert not (tmp_path / "p2").exists()
+
+
+def _backbone_step(source: dict[str, Tensor], after: dict[str, Tensor]) -> float:
+    """The summed absolute change of every backbone entry over the run (float64)."""
+    keys = [k for k in source if not k.startswith("loop.halting")]
+    return sum(float((after[k].double() - source[k].double()).abs().sum()) for k in keys)
+
+
+def test_the_backbone_rate_scale_scales_the_backbone_s_first_step_and_nothing_else(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # Adam's first step is rate * g / (|g| + eps) per element: with one update the backbone's
+    # whole step scales with its rate, while the head (its own rate, the same first gradient)
+    # takes the identical step; the run records the rate it used
+    p1 = _phase_one(tmp_path, book_builder)
+    one = dataclasses.replace(PLAN, updates=1, save_at=(0, 1))
+    tenth = dataclasses.replace(one, backbone_lr_scale=0.1)
+    results = {"one": p1.run(tmp_path / "one", one), "tenth": p1.run(tmp_path / "tenth", tenth)}
+    start = weights(tmp_path / "one" / "weights" / "after-000000.pt")
+    assert all(
+        torch.equal(start[k], v)
+        for k, v in weights(tmp_path / "tenth" / "weights" / "after-000000.pt").items()
+    )
+    after = {name: weights(tmp_path / name / "weights" / "after-000001.pt") for name in results}
+    full, scaled = _backbone_step(start, after["one"]), _backbone_step(start, after["tenth"])
+    assert full > 0.0
+    assert scaled / full == pytest.approx(0.1, rel=0.02)
+    head = [k for k in start if k.startswith("loop.halting")]
+    assert all(torch.equal(after["one"][k], after["tenth"][k]) for k in head)
+    assert any(not torch.equal(start[k], after["one"][k]) for k in head)
+    peaks = {
+        name: cast("dict[str, object]", r["optimizer"])["backbone_peak_lr"]
+        for name, r in results.items()
+    }
+    assert peaks == {"one": BACKBONE_LR, "tenth": pytest.approx(BACKBONE_LR * 0.1)}
+    rates = {
+        name: cast(
+            "list[float]", cast("object", _lines(tmp_path / name / "train.jsonl")[0]["lr_groups"])
+        )
+        for name in results
+    }
+    assert rates["tenth"][0] == rates["one"][0]
+    assert rates["tenth"][1] == pytest.approx(rates["one"][1] * 0.1)
+    assert cast("dict[str, object]", results["tenth"]["plan"])["backbone_lr_scale"] == 0.1
+
+
+def test_the_optimizer_gives_the_backbone_its_own_peak_rate() -> None:
+    model = early_stopping_model()
+    head, backbone = start_head(model), release_backbone(model)
+    opt = optimizer(head, backbone, backbone_lr=2.5e-5)
+    assert _peaks(opt) == [PEAK_LR, 2.5e-5]
+    assert set_learning_rates(opt, WARMUP) == [PEAK_LR, 2.5e-5]
+    assert _peaks(optimizer(head, backbone)) == [PEAK_LR, BACKBONE_LR]
+
+
+def _peaks(opt: torch.optim.AdamW) -> list[object]:
+    return [g["peak"] for g in cast("list[dict[str, object]]", opt.param_groups)]
+
+
+def _same_run_outputs(
+    a: Path, b: Path, result_a: dict[str, object], result_b: dict[str, object]
+) -> None:
+    assert (a / "eval.jsonl").read_text() == (b / "eval.jsonl").read_text()
+    assert (a / "train.jsonl").read_text() == (b / "train.jsonl").read_text()
+    assert result_a["evaluations"] == result_b["evaluations"]
+    names = sorted(p.name for p in (a / "weights").iterdir())
+    assert names == sorted(p.name for p in (b / "weights").iterdir())
+    for name in names:
+        wa, wb = weights(a / "weights" / name), weights(b / "weights" / name)
+        assert all(torch.equal(wa[k], wb[k]) for k in wa)
+
+
+def _run_keeping_the_optimizer(
+    p1: "PhaseOne", out: Path, plan: Plan
+) -> tuple[dict[str, object], dict[str, object]]:
+    """The run's result and its optimizer's final state (a test-held reference keeps it)."""
+    kept: list[torch.optim.AdamW] = []
+
+    def keeping(*args: object, **kwargs: object) -> torch.optim.AdamW:
+        opt = optimizer(*args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        kept.append(opt)
+        return opt
+
+    with patch.object(halting_text, "optimizer", keeping):
+        result = p1.run(out, plan)
+    return result, cast("dict[str, object]", kept[0].state_dict())
+
+
+def _same_adam_state(a: dict[str, object], b: dict[str, object]) -> None:
+    sa = cast("dict[int, dict[str, Tensor]]", a["state"])
+    sb = cast("dict[int, dict[str, Tensor]]", b["state"])
+    assert sorted(sa) == sorted(sb)
+    assert sa  # the check is not vacuous
+    for k in sa:
+        assert sorted(sa[k]) == sorted(sb[k])
+        assert all(torch.equal(sa[k][n].cpu(), sb[k][n].cpu()) for n in sa[k])
+    assert a["param_groups"] == b["param_groups"]
+
+
+def test_evaluation_after_training_gives_the_evaluations_at_saves(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # moving the evaluations leaves the training trajectory alone (records with rates and
+    # consumed/action digests, every saved tensor, the final Adam state) and gives the same
+    # evaluation at save 0 AND at the trained save
+    p1 = _phase_one(tmp_path, book_builder)
+    at, adam_at = _run_keeping_the_optimizer(p1, tmp_path / "at", PLAN)
+    after, adam_after = _run_keeping_the_optimizer(
+        p1, tmp_path / "after", dataclasses.replace(PLAN, evaluation="after_training")
+    )
+    assert sorted(cast("dict[str, object]", after["evaluations"])) == ["0", "2"]
+    _same_run_outputs(tmp_path / "at", tmp_path / "after", at, after)
+    _same_adam_state(adam_at, adam_after)
+    assert cast("dict[str, object]", after["plan"])["evaluation"] == "after_training"
+    assert after["evaluation"] == "after_training"
+    assert at["evaluation"] == "at_saves"
+    assert cast("float", after["deferred_evaluation_seconds"]) > 0.0
+    assert at["deferred_evaluation_seconds"] is None
+    # nothing is captured on the CPU: the graph counts say so instead of being absent
+    assert after["evaluation_graphs"] == {"0": None, "2": None}
+    graphs = [cast("object", line["graphs"]) for line in _lines(tmp_path / "after" / "eval.jsonl")]
+    assert graphs == [None, None]
+
+
+def test_the_inputs_are_recorded_before_training_and_every_save_is_bound_to_its_bytes(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # two validation chunks, so a digest of only part of them differs from the whole set's
+    p1 = _phase_one(tmp_path, book_builder, eval_chunks=2)
+    out = tmp_path / "p2"
+    plan = dataclasses.replace(PLAN, evaluation="after_training")
+    seen: list[bool] = []
+
+    def first_update_sees_inputs(*args: object, **kwargs: object) -> dict[str, object]:
+        seen.append((out / "inputs.json").is_file())
+        return train_text_update(*args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+
+    with patch.object(halting_text, "train_text_update", first_update_sees_inputs):
+        result = p1.run(out, plan)
+    assert seen  # written before the first update
+    assert all(seen)
+    inputs = cast("dict[str, object]", json.loads((out / "inputs.json").read_text()))
+    src = load_text_source(p1.files["checkpoint"], p1.files["config"])
+    fin, tokenizer = src.bind(p1.parts, p1.files["receipt"], p1.files["tokenizer"], out)
+    pinned = validation_chunks(
+        p1.parts,
+        tokenizer,
+        Split(fin, src.cfg.training.held_out_fraction, held_out=True),
+        src.cfg,
+        p1.files["pin"],
+    )
+    validation = cast("dict[str, object]", inputs["validation"])
+    assert validation["digest"] == pinned.digest()
+    assert validation["chunks"] == len(pinned.chunks) == 2
+    assert Pinned(pinned.chunks[:1], pinned.pin_sha256).digest() != pinned.digest()
+    assert inputs["pin_sha256"] == pinned.pin_sha256
+    assert inputs["source_model_sha256"] == src.model_sha256
+    assert inputs["identity"] == src.identity
+    assert inputs["components"] == [[c.name, c.share] for c in p1.parts]
+    assert inputs["plan"] == plan.record()
+    entries = [
+        cast("dict[str, object]", json.loads(x))
+        for x in (out / "saves.jsonl").read_text().splitlines()
+    ]
+    assert entries == result["saves"]
+    assert [e["after"] for e in entries] == [0, 2]
+    for e in entries:
+        data = (out / cast("str", e["weights"])).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == e["sha256"]
+
+
+def test_a_save_replaced_before_its_evaluation_is_refused_and_recorded(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    out = tmp_path / "p2"
+    real_collect = gc.collect
+
+    def replace_the_trained_save() -> int:
+        # runs between the release and the first evaluation: the trained save now holds the
+        # starting weights, a different file under the same name
+        start = (out / "weights" / "after-000000.pt").read_bytes()
+        _ = (out / "weights" / "after-000002.pt").write_bytes(start)
+        return real_collect()
+
+    with (
+        patch.object(gc, "collect", replace_the_trained_save),
+        pytest.raises(ValueError, match="digest"),
+    ):
+        _ = p1.run(out, dataclasses.replace(PLAN, evaluation="after_training"))
+    failed = cast("dict[str, object]", json.loads((out / "evaluation_failed.json").read_text()))
+    assert failed["after"] == 2
+    assert failed["evaluated"] == ["0"]
+    assert not (out / "result.json").exists()
+    assert len((out / "eval.jsonl").read_text().splitlines()) == 1
+
+
+def test_a_failed_evaluation_after_training_leaves_the_saves_and_no_result(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    out = tmp_path / "p2"
+    calls: list[int] = []
+
+    def fails_second(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        if len(calls) == 2:
+            msg = "CUDA out of memory (simulated)"
+            raise RuntimeError(msg)
+        return evaluate_text(*args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+
+    with (
+        patch.object(halting_text, "evaluate_text", fails_second),
+        pytest.raises(RuntimeError, match="simulated"),
+    ):
+        _ = p1.run(out, dataclasses.replace(PLAN, evaluation="after_training"))
+    failed = cast("dict[str, object]", json.loads((out / "evaluation_failed.json").read_text()))
+    assert failed["after"] == 2
+    assert failed["evaluated"] == ["0"]
+    assert "simulated" in cast("str", failed["error"])
+    assert _afters(out / "saves.jsonl") == [0, 2]
+    assert _afters(out / "eval.jsonl") == [0]
+    assert not (out / "result.json").exists()
+
+
+def _afters(path: Path) -> list[int]:
+    lines = [cast("dict[str, object]", json.loads(x)) for x in path.read_text().splitlines()]
+    return [cast("int", x["after"]) for x in lines]
+
+
+def _evaluations_seen(p1: "PhaseOne", out: Path, plan: Plan) -> list[tuple[bool, bool, bool]]:
+    """Per evaluation, in order: the run's optimizer alive, its update graph alive (None on
+    the CPU counts as released), and any backbone gradient kept."""
+    made: list[weakref.ref[torch.optim.AdamW]] = []
+    graphs: list[weakref.ref[object]] = []
+    seen: list[tuple[bool, bool, bool]] = []
+
+    def tracked_optimizer(*args: object, **kwargs: object) -> torch.optim.AdamW:
+        opt = optimizer(*args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        made.append(weakref.ref(opt))
+        return opt
+
+    def tracked_graph() -> object:
+        graph = WarmedGraph()
+        graphs.append(weakref.ref(graph))
+        return graph
+
+    def watching_evaluate(model: Vesper, *args: object, **kwargs: object) -> object:
+        _ = gc.collect()
+        grads = any(p.grad is not None for p in model.parameters())
+        seen.append((made[0]() is not None, any(g() is not None for g in graphs), grads))
+        return evaluate_text(model, *args, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+
+    with (
+        patch.object(halting_text, "optimizer", tracked_optimizer),
+        patch.object(halting_text, "evaluate_text", watching_evaluate),
+        patch.object(halting_text, "WarmedGraph", tracked_graph),
+    ):
+        _ = p1.run(out, plan)
+    return seen
+
+
+def test_evaluation_after_training_runs_after_the_training_state_is_released(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    at = _evaluations_seen(p1, tmp_path / "at", PLAN)
+    # the control: today's save-0 evaluation runs beside the live optimizer, the last one
+    # beside its gradients too, so the probe can see a held training state
+    assert at[0][0]
+    assert at[-1][0]
+    assert at[-1][2]
+    after = _evaluations_seen(
+        p1, tmp_path / "after", dataclasses.replace(PLAN, evaluation="after_training")
+    )
+    assert after == [(False, False, False), (False, False, False)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_evaluation_after_training_on_cuda_matches_and_releases_the_update_graph(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # past the warm-up into captured replays (6 updates: 3 eager, 1 capture, replays)
+    p1 = _phase_one(tmp_path, book_builder)
+    plan = dataclasses.replace(PLAN, device="cuda", updates=6, save_at=(0, 6))
+    at = p1.run(tmp_path / "at", plan)
+    after_plan = dataclasses.replace(plan, evaluation="after_training")
+    after = p1.run(tmp_path / "after", after_plan)
+    _same_run_outputs(tmp_path / "at", tmp_path / "after", at, after)
+    assert after["update_graph"] == {"warm": 3, "captures": 1, "replays": 3}
+    # every save's evaluation records its graphs' [eager, captures, replays], in result.json and
+    # in eval.jsonl. This fixture's validation is ONE chunk, so its dense and rule passes run
+    # their single call as a warm-up (eager) and only the replayed controls capture: the record
+    # says so instead of leaving it unknown (measured 2026-10-29)
+    zero = [0, 0, 0]
+    per_save = {
+        "policy": zero,
+        "policy_first": zero,
+        "dense": [1, 0, 0],
+        "dense_first": zero,
+        "static": zero,
+        "static_first": zero,
+        "rule": [1, 0, 0],
+        "trace": [3, 1, 1],
+    }
+    assert after["evaluation_graphs"] == {"0": per_save, "6": per_save}
+    lines = _lines(tmp_path / "after" / "eval.jsonl")
+    assert [cast("object", line["graphs"]) for line in lines] == [per_save, per_save]
+    seen = _evaluations_seen(p1, tmp_path / "seen", after_plan)
+    assert seen == [(False, False, False), (False, False, False)]
 
 
 def test_a_run_stops_cleanly_when_the_stream_runs_dry(
@@ -650,6 +977,101 @@ def test_a_run_parses_the_finalization_and_tokenizer_it_checked(
     assert result["stopped"] is None
 
 
+def test_a_run_refuses_components_other_than_its_sources_recipe(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # the components a run trains on are the ones its source's record names, in the snapshot
+    # load_text_source read. The finalization (check_inputs) binds their files, order and
+    # generation pins but not their shares: other shares that still make a valid mix trained
+    # under the source's name. Refused before anything is written, whoever resolved them.
+    p1 = _phase_one(tmp_path, book_builder)
+    first, second, *rest = p1.parts
+    moved = first.share / 2
+    parts = [
+        dataclasses.replace(first, share=first.share - moved),
+        dataclasses.replace(second, share=second.share + moved),
+        *rest,
+    ]
+    out = tmp_path / "p2"
+    with pytest.raises(ValueError, match="not the loaded source's recipe"):
+        _ = dataclasses.replace(p1, parts=parts).run(out, FROZEN)
+    assert not out.exists()
+
+
+def _by_sha256(root: Path, sha256: str) -> Path:
+    """The one file under ``root`` with that sha256."""
+    found = [
+        p
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and hashlib.sha256(p.read_bytes()).hexdigest() == sha256
+    ]
+    assert len(found) == 1
+    return found[0]
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_the_command_line_trains_on_the_components_of_the_source_it_loads(
+    tmp_path: Path,
+    book_builder: Builder,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    swap: bool,  # noqa: FBT001
+) -> None:
+    # main resolves the source's components (resumed_components, one read of train.json) and
+    # run loads the source (a second read): a self-consistent replacement present only during
+    # the first read (maintainer B's 01e2b3f fixture) gave run other shares, it trained on them and
+    # result.json named the original source. Refused now, nothing written; without the
+    # replacement the same command runs.
+    from test_instruct_days_view import _reshared, owned  # pyright: ignore[reportPrivateUsage]  # noqa: PLC0415
+    from vesper import train  # noqa: PLC0415
+
+    o = owned(tmp_path, book_builder)
+    held = Split(load_finalization(o.fin), o.cfg.training.held_out_fraction, held_out=True)
+    reads = held_out_chunks(o.parts, 0, o.tok, held, 8, o.cfg)
+    pin = tmp_path / "wide-pin.json"
+    _write_pin(pin, _read_documents(reads))
+    header, manifest = o.source / "train.json", o.source / "manifest.json"
+    original = (header.read_bytes(), manifest.read_bytes())
+    replacement = _reshared(o)
+    real_read = train.checked_record
+    reads_seen: list[Path] = []
+
+    def replaced_during_the_first_read(path: Path) -> train.CheckedRecord:
+        reads_seen.append(path)
+        if not swap or len(reads_seen) > 1:
+            return real_read(path)
+        _ = header.write_bytes(replacement[0])
+        _ = manifest.write_bytes(replacement[1])
+        try:
+            return real_read(path)
+        finally:
+            _ = header.write_bytes(original[0])
+            _ = manifest.write_bytes(original[1])
+
+    monkeypatch.setattr(train, "checked_record", replaced_during_the_first_read)
+    out = tmp_path / "p2"
+    argv = [
+        "--source", str(o.source),
+        "--config", str(_by_sha256(tmp_path, o.loaded.config_sha256)),
+        "--pin", str(pin),
+        "--out", str(out),
+        "--data", str(o.data),
+        "--finalization", str(o.fin),
+        "--tokenizer", str(_by_sha256(tmp_path, o.loaded.identity["tokenizer_sha256"])),
+        "--depth-cost", "0.3", "--backbone", "frozen", "--updates", "2", "--rows", "1",
+        "--save-at", "0", "2", "--slices", "2", "--device", "cpu",
+    ]  # fmt: skip
+    code = halting_text.main(argv)
+    assert reads_seen == [o.source]  # main's resolution; load_text_source keeps its own read
+    if swap:
+        assert code == 1
+        assert "not the loaded source's recipe" in caplog.text
+        assert not out.exists()
+    else:
+        assert code == 0
+        assert (out / "result.json").is_file()
+
+
 def test_the_command_line_refuses_a_plan_before_reading_the_source(
     tmp_path: Path, book_builder: Builder
 ) -> None:
@@ -843,6 +1265,23 @@ def _paired_score_gradient(
 def test_the_command_line_s_dense_weight_follows_the_backbone_mode(
     extra: list[str], expected: tuple[str, float]
 ) -> None:
+    plan = _plan_from_command_line(extra)
+    assert (plan.backbone, plan.dense_weight) == expected
+    assert plan.backbone_lr_scale == 1.0
+
+
+def test_the_command_line_passes_the_backbone_rate_scale() -> None:
+    assert _plan_from_command_line(["--backbone-lr-scale", "0.1"]).backbone_lr_scale == 0.1
+
+
+def test_the_command_line_passes_the_evaluation_mode() -> None:
+    assert _plan_from_command_line([]).evaluation == "at_saves"
+    after = _plan_from_command_line(["--evaluation", "after_training"])
+    assert after.evaluation == "after_training"
+
+
+def _plan_from_command_line(extra: list[str]) -> Plan:
+    """The plan ``main`` hands to ``run`` for these options (nothing read or trained)."""
     argv = ["--source", "s", "--config", "c", "--pin", "p", "--out", "o", "--data", "d",
             "--finalization", "f", "--tokenizer", "t", "--depth-cost", "0.5", "--updates", "3",
             "--device", "cpu", *extra]  # fmt: skip
@@ -860,4 +1299,4 @@ def test_the_command_line_s_dense_weight_follows_the_backbone_mode(
         patch.object(halting_text, "run", capture),
     ):
         assert halting_text.main(argv) == 0
-    assert (plans[0].backbone, plans[0].dense_weight) == expected
+    return plans[0]
