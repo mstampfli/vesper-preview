@@ -9,12 +9,16 @@ a partial named by destination and pid let a nested call delete the outer call's
 published a crashed run's leftover).
 """
 
+import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+
+from vesper.keys import file_sha256
 
 
 @contextmanager
@@ -107,3 +111,34 @@ def contained(path: Path, inside: Path) -> None:
     if not path.resolve().is_relative_to(inside):
         msg = f"{path}: resolves outside {inside}"
         raise ValueError(msg)
+
+
+@contextmanager
+def copied_snapshot(source: Path, sha256: str, root: Path) -> Generator[Path, None, None]:
+    """PRIMITIVE: consume a large file only from an owned, digest-checked disk copy.
+
+    For long readers that reopen a path (parquet row groups): the source may change before,
+    during or after copying; only a copy with the expected hash is yielded. Copying and hashing
+    stream with bounded memory. Disk costs one file for this context. The caller must neither
+    mutate the copy nor publish it. Not a hard link (in-place writes would change both names),
+    and not a guarantee that the original path will still hold these bytes later.
+
+    Raises:
+        ValueError: when the copied bytes do not have the expected hash.
+        OSError: on a copy or read failure; owned staging is still released.
+    """
+    with owned_staging(root, "snapshot") as temporary:
+        copy = temporary / "input.parquet"
+        # Open once and nonblocking: replacement with a FIFO must refuse, not hang between
+        # a path-level is_file check and the copy. A path replacement cannot redirect this fd.
+        fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as reader:
+            if not stat.S_ISREG(os.fstat(reader.fileno()).st_mode):
+                msg = f"{source}: snapshot source must be a regular file"
+                raise ValueError(msg)
+            with copy.open("xb") as writer:
+                shutil.copyfileobj(reader, writer)
+        if file_sha256(copy) != sha256:
+            msg = f"{source}: snapshot hash differs from the recorded input"
+            raise ValueError(msg)
+        yield copy

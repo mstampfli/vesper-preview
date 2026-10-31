@@ -97,6 +97,49 @@ and the receipt stays pending. On a receipt that is already complete it changes 
 prints the selection that receipt recorded, with `current` saying whether that is still the
 selection in force (a later operator selection is not an error there).
 
+## Check finite training supply before launching
+
+Count once explicitly for the selected corpus, finalization, tokenizer and training split:
+
+    uv run python -m vesper.supply --config configs/vesper-s.yaml --data ROOT \
+        --finalization FINALIZATION --tokenizer TOKENIZER --out SUPPLY --workers 4
+
+Then use the same training command with `--supply SUPPLY --plan --out PLAN` to print warnings
+and save `PLAN/plan.json` without constructing a model. Launch into a different output
+directory with `--supply SUPPLY` and without `--plan`. The legacy layout uses the same
+`--legacy-layout --web WEBDIR --mix MIXDIR` arguments as training. Counting and planning
+require new output directories; completed caches and plans are never overwritten.
+
+The report separates finite encoded tokens, nonempty eligible documents and potential
+within-document loss positions. `share * total_tokens` is **nominal** whole-run demand, and its
+ratio to supply is nominal corpus-equivalent exposure, not predicted completed passes. A
+shortage prints a warning and is saved in the plan/run header. It does not reject an intentional
+finite run or turn on cycling. Completion remains `unassessed`, even at exact nominal supply:
+successors, buffers, ordering, batch rounding and prefetch affect actual consumed inputs.
+Zero supply for a positive share and an entirely zero-label mix refuse when checked; a
+zero-label component in an otherwise productive mix warns. The runtime no-label guard remains.
+
+`--resume` plans compare the same configured whole-run budget with the same finite inventory;
+they never subtract handed documents from supply. They check the checkpoint's metadata identity,
+recipe and layout, record its progress/hash, and leave tensor restoration unassessed. An actual
+resume still performs its normal full restoration. The run header's `supply_basis_progress`
+comes from that restored committed state, not speculative prefetched chunks.
+
+Without `--supply`, ordinary training records supply as unknown and warns; it does not count
+implicitly. Explicit `--plan` requires a checked cache. Missing, partial, corrupt or mismatched
+evidence refuses. Reuse checks actual input hashes (including legacy files), ordered component
+assignment, generation pins, finalization/drop set, tokenizer/rule, split, counting source and
+encoding dependencies. Shares, seed and budget can change without recounting; their assessment
+is bound separately to the run recipe. A plan does not certify other training prerequisites.
+
+Each count worker copies one file to private scratch disk, verifies that copy's digest, and
+reads only the copy through the normal corpus reader/filter/tokenizer. Source edits cannot
+alter that checked snapshot. Workers each retain a tokenizer/drop set and one row group plus
+an encoded document. Temporary disk is bounded by concurrently counted file sizes; choose
+`--workers` for available RAM and disk. Counting needs this copy/hash I/O as well as encoding.
+No speed or full-corpus runtime is promised by small-fixture tests. Counts publish together
+only when all required files finish; failed work cannot become a valid cache.
+
 ## Where things go
 
 - After a milestone that changes what the model can do or how the system works, add a short

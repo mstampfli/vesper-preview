@@ -78,6 +78,7 @@ from vesper.model import Vesper
 from vesper.provenance import environment, write_json
 from vesper.publish import staged
 from vesper.sample import components_for
+from vesper.supply import assess, prepare_supply, read_supply
 from vesper.tokenizer import Tokenizer
 
 LABEL = (
@@ -1371,6 +1372,12 @@ def _parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--finalization", type=Path, required=True)
     _ = parser.add_argument("--tokenizer", type=Path, required=True)
     _ = parser.add_argument("--out", type=Path, required=True)
+    _ = parser.add_argument("--supply", type=Path, default=None, help="checked finite supply cache")
+    _ = parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="require --supply, print warnings and save plan.json without constructing a model",
+    )
     _ = parser.add_argument("--micro-chunks", type=int, required=True)
     _ = parser.add_argument("--steps", type=int, default=None)
     _ = parser.add_argument("--resume", type=Path, default=None)
@@ -1425,6 +1432,99 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _supply_for_run(
+    cache: Path | None,
+    parts: Sequence[Component],
+    tokenizer: bytes,
+    split: Split,
+    digest: str,
+    budget: int,
+    *,
+    cycle: bool,
+) -> dict[str, object]:
+    """Check and announce supply before any model work, shared by planning and launch."""
+    if cache is None:
+        check_inputs(split.finalization, parts)
+        supply_report = assess(None, parts, budget, cycle=cycle)
+    else:
+        supply_inputs = prepare_supply(parts, tokenizer, split, digest)
+        supply_report = assess(read_supply(cache, supply_inputs), parts, budget, cycle=cycle)
+    for warning in cast("list[str]", supply_report["warnings"]):
+        log.warning("%s", warning)
+    if supply_report["errors"]:
+        raise ValueError("; ".join(cast("list[str]", supply_report["errors"])))
+    return supply_report
+
+
+def _check_run_options(
+    cfg: VesperConfig,
+    objective: str,
+    micro: int,
+    safety_seconds: float | None,
+    supply_cache: Path | None,
+    *,
+    plan_only: bool,
+) -> None:
+    """Refuse unsupported run/planning options before input reads or output creation."""
+    if plan_only and supply_cache is None:
+        msg = "--plan needs a checked --supply cache; counting must be explicit"
+        raise ValueError(msg)
+    check_mode(cfg.learning.mode)
+    _check_objective(objective)
+    if micro < 1 or cfg.training.batch_chunks % micro != 0:
+        msg = f"micro_chunks must divide batch_chunks ({cfg.training.batch_chunks}), got {micro}"
+        raise ValueError(msg)
+    _check_safety_seconds(safety_seconds)
+
+
+def _supply_plan(
+    out: Path,
+    supply_report: dict[str, object],
+    identity: Identity,
+    recipe: Recipe,
+    layout: Layout,
+    resume: Path | None,
+    expected: tuple[Identity, Recipe],
+) -> Path:
+    """Publish a whole-run nominal plan; resume checks metadata, not tensor restoration."""
+    parent, expected_recipe = expected
+    metadata: dict[str, object] | None = None
+    if resume is not None:
+        checked = checked_record(resume)
+        if (
+            checked.record.get("identity") != _plain(parent)
+            or checked.record.get("recipe") != _plain(expected_recipe)
+            or checked.record.get("layout") != _plain(layout)
+        ):
+            msg = f"{resume}: checkpoint metadata does not match this plan"
+            raise ValueError(msg)
+        metadata = {
+            "path": str(resume),
+            "train_sha256": checked.manifest["train.json"],
+            "progress": checked.record.get("progress"),
+            "tensor_restore": "unassessed",
+        }
+    if out.exists() or out.is_symlink():
+        msg = f"{out}: a plan needs a new output directory"
+        raise ValueError(msg)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with staged(out) as partial:
+        partial.mkdir()
+        write_json(
+            partial / "plan.json",
+            {
+                "identity": _plain(identity),
+                "recipe": _plain(recipe),
+                "layout": _plain(layout),
+                "supply": supply_report,
+                "checkpoint": metadata,
+                "model_execution": "not_started",
+                "training_admission": "unassessed",
+            },
+        )
+    return out / "plan.json"
+
+
 def run(  # noqa: C901, PLR0913, PLR0915
     cfg: VesperConfig,
     *,
@@ -1445,8 +1545,17 @@ def run(  # noqa: C901, PLR0913, PLR0915
     safety_seconds: float | None = None,
     cycle: bool = False,
     from_finite: bool = False,
+    supply_cache: Path | None = None,
+    plan_only: bool = False,
 ) -> Path:
     """The run: streams, schedule, steps, log lines, checkpoints with evaluations.
+
+    ``supply_cache`` adds a checked finite-inventory assessment before model construction.
+    Nominal shortfalls warn, zero supply or a wholly untrainable mix refuses, and completion
+    remains unassessed. None records unknown supply without counting. ``plan_only`` requires
+    a cache and writes a new ``out/plan.json`` with no model work. Resume plans check metadata
+    identity/layout only; nominal demand always covers the configured WHOLE run, never supply
+    minus handed tokens. Actual resumes retain their full checked restoration.
 
     ``cycle`` makes the training mix start a component that runs out again in a new order
     (``corpus.Mixer``, ``CYCLE_ORDER_RULE``) instead of dropping it, so the shares hold for any
@@ -1492,23 +1601,31 @@ def run(  # noqa: C901, PLR0913, PLR0915
             documents (their digest and the realized shares).
     """
     t = cfg.training
-    check_mode(cfg.learning.mode)  # an unsupported mode is refused before anything is read
-    _check_objective(objective)
-    if micro < 1 or t.batch_chunks % micro != 0:
-        msg = f"micro_chunks must divide batch_chunks ({t.batch_chunks}), got {micro}"
-        raise ValueError(msg)
-    _check_safety_seconds(safety_seconds)
+    _check_run_options(cfg, objective, micro, safety_seconds, supply_cache, plan_only=plan_only)
     _check_transition(cycle=cycle, from_finite=from_finite, resume=resume)
     tokenizer_bytes, finalization, files = _read_inputs(
         tokenizer_path, config_path, finalization_receipt, cfg
     )
-    check_inputs(finalization, parts)
+    split = Split(finalization, t.held_out_fraction)
+    supply_report = _supply_for_run(
+        supply_cache, parts, tokenizer_bytes, split, files[2], t.total_tokens, cycle=cycle
+    )
     recipe = recipe_of(parts, seed, cfg, objective, cycle=cycle)
     identity = identity_of(*files, recipe)
     # the identity the checkpoint must carry: the finite recipe's for the recorded transition
     finite = recipe_of(parts, seed, cfg, objective)
     parent = identity_of(*files, finite) if from_finite else identity
     layout = Layout(groups=t.batch_chunks // micro, slots=micro)
+    if plan_only:
+        return _supply_plan(
+            out,
+            supply_report,
+            identity,
+            recipe,
+            layout,
+            resume,
+            (parent, finite if from_finite else recipe),
+        )
     # every random choice goes through an explicit generator: the model's initialization here,
     # the corpus order through the seed; nothing reads torch's global generator. The scan is
     # chosen before anything is written, so a refused "fused" leaves no trace.
@@ -1526,7 +1643,6 @@ def run(  # noqa: C901, PLR0913, PLR0915
         msg = f"{log_path}: already holds a run; resume one of its checkpoints or use another out"
         raise ValueError(msg)
     tokenizer = Tokenizer.parse(tokenizer_bytes)
-    split = Split(finalization, t.held_out_fraction)
     held = Split(finalization, t.held_out_fraction, held_out=True)
     counts: dict[str, int] = {}
     mixer = Mixer(parts, seed, tokenizer, split, tokens_emitted=counts, cycle=cycle)
@@ -1580,6 +1696,8 @@ def run(  # noqa: C901, PLR0913, PLR0915
             "identity": _plain(identity),
             "recipe": _plain(recipe),
             "layout": _plain(layout),
+            "supply": supply_report,
+            "supply_basis_progress": _plain(progress),
             "config": str(config_path),
             "total_steps": total_steps(cfg),
             "micro_chunks": micro,
@@ -1714,10 +1832,10 @@ def run(  # noqa: C901, PLR0913, PLR0915
     # the components still in the mix: one leaving it (a finite run's run-out) is its own line,
     # since `exhausted` fires only when a whole group is dry (2026-10-27: the original days run
     # lost code, books and wiki one after another and no line said so); read from the mixer as
-    # of the chunks a step trained, so a component that leaves while groups draw ahead is
-    # reported with the step that trains its last chunk; a resume starts from its checkpoint's
-    # mixer, so nothing already out is reported again; an `exhausted` end means every
-    # component is out, whichever were reported before it
+    # of the chunks a step trained. Report the first completed step whose handed snapshot
+    # shows its departure; queued tokens may still train later. A resume starts from its
+    # checkpoint's mixer, so nothing already out is reported again; an `exhausted` end means
+    # every component is out, whichever were reported before it
     in_mix = set(handed_out()[0].active)
 
     def report_run_outs(state: MixerState) -> None:
@@ -1885,8 +2003,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             safety_seconds=None if safety_minutes is None else safety_minutes * 60,
             cycle=cast("bool", args.cycle_components),
             from_finite=cast("bool", args.from_finite_checkpoint),
+            supply_cache=cast("Path | None", args.supply),
+            plan_only=cast("bool", args.plan),
         )
-    except (RuntimeError, ValueError, TypeError):
+    except (OSError, RuntimeError, ValueError, TypeError):
         log.exception("stopped")
         return 1
     log.info("log at %s", log_path)

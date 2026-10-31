@@ -7,6 +7,24 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-10-31, 14:53Z: check training supply before launching
+
+A new explicit counter saves each component's finite training-token supply after the actual
+deduplication, split and tokenizer. Training can check that cache and print a warning when its
+nominal demand exceeds supply. `--plan` saves the same assessment without building a model.
+An intentional finite run can still proceed; the checker never enables cycling automatically.
+
+The ratio is nominal corpus-equivalent exposure, not a promise that a budget will finish or a
+forecast of completed passes. Missing evidence stays unknown; mismatched or corrupt evidence
+refuses. Zero-supply and entirely zero-label mixes refuse when checked. Resumed runs retain
+their buffers and use the same whole-run nominal comparison.
+
+Small CPU fixtures cover literal counts, real Mixer/Stream boundaries, parallel counting,
+changed inputs, failed and concurrent publication, warnings, and actual CLI training/resume.
+No full-corpus count or new model experiment was run. Independent peer review is next before
+merge. Usage and resource costs are in CONTRIBUTING's supply section; contracts and checks
+are in `vesper/supply.py`, the registry and `tests/test_supply.py`.
+
 ## 2026-10-30, 08:33Z: capped stopping is faster but fixed three still wins; distant facts leave a weak trace
 
 These are exploratory comparisons on reused validation. J1 and J2 each use one training

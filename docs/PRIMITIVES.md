@@ -6,6 +6,8 @@ raw pattern it forbids.
 
 | Primitive | Lives in | Replaces (forbidden raw form) | Tests |
 | --- | --- | --- | --- |
+| `copied_snapshot` | vesper/publish.py | hashing a large input and reopening its mutable path in a long reader; hard links presented as stable snapshots; whole-file RAM snapshots | tests/test_supply.py (source mutation, FIFO refusal, failure cleanup, changed worker input) |
+| `prepare_supply`, `read_supply` | vesper/supply.py | unbound cached token totals, partial counts used as evidence, nominal demand confused with completion | tests/test_supply.py (literal counts, Mixer exhaustion, strict identity/count parsing, actual CLI plan/train/resume) |
 | `check_shape` | vesper/contracts.py | inline `assert t.shape == ...`, `if t.ndim != ...`, unchecked dtype assumptions at a public boundary | tests/test_contracts.py |
 | `check_ids` | vesper/contracts.py | ad-hoc `.long()` casts and inline `(ids < 0) \| (ids >= V)` range checks at the embedding, the loss and the tokenizer's decode; the data stream's int32 meets the model's int64 in one place | tests/test_contracts.py |
 | `_Section.get_int / get_float / get_str / get_section / done` | vesper/config.py | raw `cfg["key"]` access, `yaml.load`, `int(value)` coercions, silently ignored keys | tests/test_config.py |

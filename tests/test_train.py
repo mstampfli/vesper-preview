@@ -2057,9 +2057,53 @@ def test_a_component_leaving_a_finite_mix_is_logged_once_with_its_tokens(
 
     again = [line for line in resumed if line["kind"] == "component_out"]  # both runs' lines
     assert fields(again) == fields(out_lines)  # the same run-outs, none reported twice
-    # a cycling run never takes a component out of its mix
+    # a productive cycling run never takes a component out of its mix
     cycling = train(tmp_path / "cycling", exhausted + 8, cycle=True)
     assert [line for line in cycling if line["kind"] == "component_out"] == []
+
+
+@pytest.mark.parametrize(("kind", "micro"), [("empty", 1), ("held_out_only", 2)])
+def test_a_cycling_component_with_no_eligible_documents_leaves_with_zero_tokens(
+    tmp_path: Path, book_builder: Builder, kind: str, micro: int
+) -> None:
+    # cycling cannot restart a component that never yields a document, so it leaves the mix
+    # once with zero tokens while the others train on (maintainer B's 5731965 review: an empty file
+    # and a file wholly on the held-out side; their Mixer/Stream walk gives step 2 for both layouts)
+    cfg, config_path, parts, _, tokenizer_path = run_fixture(tmp_path, book_builder, 100_000, 1)
+    held = next(f"held-{i}" for i in range(1000) if is_held_out(f"held-{i}", 0.2))
+    ids = [] if kind == "empty" else [held]
+    path = tmp_path / "books.parquet"
+    schema = pa.schema([pa.field("id", pa.string()), pa.field("text", pa.string())])
+    columns = {"id": ids, "text": ["a held out text"] * len(ids)}
+    pq.write_table(pa.Table.from_pydict(columns, schema=schema), str(path))
+    parts = [replace(c, paths=(path,)) if c.name == "books" else c for c in parts]
+    receipt = finalize(parts, tmp_path / "finalization").receipt
+    lines = read_log(
+        run(
+            cfg,
+            config_path=config_path,
+            parts=parts,
+            finalization_receipt=receipt,
+            tokenizer_path=tokenizer_path,
+            out=tmp_path / "run",
+            micro=micro,
+            steps=24,
+            resume=None,
+            seed=0,
+            device=CPU,
+            cycle=True,
+        )
+    )
+    events = [
+        (line["component"], line["step"], line["tokens_handed_out"])
+        for line in lines
+        if line["kind"] == "component_out"
+    ]
+    assert events == [("books", 2, 0)]
+    steps = steps_of(lines)
+    assert steps[-1]["step"] == 24  # the others kept training to the cap
+    first, last = (cast("dict[str, int]", steps[i]["shares"]) for i in (1, -1))
+    assert all(last[name] > first[name] for name in last if name != "books")
 
 
 def test_a_finite_checkpoint_enters_cycling_only_through_the_recorded_transition(
