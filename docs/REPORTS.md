@@ -21,8 +21,10 @@ their buffers and use the same whole-run nominal comparison.
 
 Small CPU fixtures cover literal counts, real Mixer/Stream boundaries, parallel counting,
 changed inputs, failed and concurrent publication, warnings, and actual CLI training/resume.
-No full-corpus count or new model experiment was run. Independent peer review is next before
-merge. Usage and resource costs are in CONTRIBUTING's supply section; contracts and checks
+No full-corpus count or new model experiment was run. Independent peer review is complete;
+its additional real-data count check covered code, wiki and books. Web and full cache
+publication were outside that check. Usage and resource costs are in CONTRIBUTING's supply
+section; contracts and checks
 are in `vesper/supply.py`, the registry and `tests/test_supply.py`.
 
 ## 2026-10-30, 08:33Z: capped stopping is faster but fixed three still wins; distant facts leave a weak trace
