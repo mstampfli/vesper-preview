@@ -7,6 +7,40 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-11, 14:06Z: on our best model, fixed depth 3 is faster and better than adaptive stopping
+
+The decisive test announced this morning, run on the development card on the best model so far
+(the large-update continuation with its trained stopping rule). Not yet reviewed by the second
+maintainer.
+
+**What was measured.** Real GPU time for 16 validation chunks, each from a cold start, four ways,
+five timed rounds each, every way captured as a CUDA graph; the stopping rule once running all 8
+passes and once with the code really skipping every pass after the third (its exits are only 2
+or 3, so nothing is lost; the two give bitwise identical outputs):
+
+    stopping rule, all passes run      loss 3.2082   2.61 passes   9,380 ms
+    stopping rule, passes skipped      loss 3.2082   2.61 passes   4,269 ms
+    fixed depth 2                      loss 3.2483   2 passes      3,171 ms
+    fixed depth 3                      loss 3.1881   3 passes      4,147 ms
+
+**What it means.** Fixed depth 3 is 3 % faster AND 0.020 better than the stopping rule: the rule
+is beaten on both. The same holds on the original model (measured 10-29: 4,283 against 4,165 ms).
+A mix of fixed depths 2 and 3 reaching the rule's loss would take about 3,820 ms by
+interpolation (not measured). The only way the rule could win is by dropping finished tokens
+from later passes inside a batch, and even a perfect version of that could buy at most its
+0.003 advantage over the fixed-depth mix. At this model size, adaptive depth has no practical
+case.
+
+**Joint training, last cell (A10).** The joint run with a doubled depth price did what the price
+should: its training-time depth fell to 3.1 passes by the end (A9: 4.0). Its rule beats its own
+fixed depths by 0.0027 and every random control, but it ends 0.0019 behind the two-stage model's
+fixed-depth frontier, the fourth joint run in a row level with or behind the cheaper two-stage
+path. Joint training adds nothing at this scale either.
+
+**Next.** No more stopping experiments at this size. Whether adaptive depth pays off at larger
+model sizes or much longer training is the one open question, and it costs money: a costed
+proposal with a stop condition follows. The memory run (B6) is running now.
+
 ## 2026-11-11, 08:39Z: big updates fixed the drift; stopping helps only a little; memory can be trained
 
 Eight days of experiments, 11-03 to 11-11, all on the development card, one or two seeds each,
