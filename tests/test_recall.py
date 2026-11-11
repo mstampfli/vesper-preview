@@ -324,6 +324,87 @@ def test_the_scorer_refuses_mixed_layouts_and_a_short_final_segment() -> None:
         _ = score_batch(model, mixed[:1], chunk=16, final=5, passes=2, graphs=None)
 
 
+# --- a state cut at the fact's end (which path carries the fact) ----------------------------
+
+
+def _cut_by_hand(model: Vesper, states: Sequence[ColumnState], cut: str) -> list[ColumnState]:
+    """The cut built from the model's own cold state, not through vesper.recall."""
+    cold = model.init_states(1, torch.float32, CPU)
+    recurrent, window = cut in {"recurrent", "both"}, cut in {"window", "both"}
+    return [
+        ColumnState(
+            h=c.h if recurrent else s.h,
+            kv=c.kv if window else s.kv,
+            key_history=c.key_history if recurrent else s.key_history,
+        )
+        for s, c in zip(states, cold, strict=True)
+    ]
+
+
+def _cut_oracle(model: Vesper, ep: Episode, j: int, cut: str) -> float:
+    """Candidate j's log-probability from TWO forwards: the fact, the hand cut, then the rest."""
+    f = ep.fact[1]
+    head = ep.tokens[:f][None]
+    rest = torch.cat([ep.tokens[f:], ep.candidates[j]])[None]
+    n = rest.shape[1]
+    with torch.no_grad():
+        states = model.init_states(1, torch.float32, CPU)
+        first = model.run(head, torch.arange(f)[None], states, passes=2, exit_rule=DenseRule())
+        states = _cut_by_hand(model, first.states, cut)
+        pos = torch.arange(f, f + n)[None]
+        result = model.run(rest, pos, states, passes=2, exit_rule=DenseRule())
+        targets = torch.cat([rest[:, 1:], torch.zeros(1, 1, dtype=torch.int32)], dim=1)
+        nll = model.position_losses(result.y, targets)[0].double()
+    c = ep.candidates.shape[1]
+    q_end = ep.tokens.numel() - f
+    return float(-nll[q_end - 1 : q_end - 1 + c].sum())
+
+
+@pytest.mark.parametrize("cut", ["split", "recurrent", "window", "both"])
+@pytest.mark.parametrize("gap", [3, 25, 40])
+def test_a_cut_scorer_equals_a_two_forward_oracle_with_the_state_cut_by_hand(
+    cut: str, gap: int
+) -> None:
+    model = _model()
+    eps = [_episode(_filler(gap, s), planted=s % 4) for s in range(2)]
+    with torch.no_grad():
+        got = score_batch(model, eps, chunk=16, final=8, passes=2, graphs=None, cut=cut)
+    for row, ep in enumerate(eps):
+        for j in range(CANDIDATES.shape[0]):
+            want = _cut_oracle(model, ep, j, cut)
+            assert got[row, j].item() == pytest.approx(want, rel=1e-5, abs=1e-5), (cut, row, j)
+
+
+def test_cutting_both_paths_at_the_fact_end_leaves_no_trace_of_the_fact() -> None:
+    # the pair differs only in the planted value: with every state cold after the fact, nothing
+    # about it can reach the candidates; uncut, it must (the control). Each episode in its own
+    # call: two rows of one batch may round differently (measured 4.8e-7), which is no trace
+    model = _model()
+    filler = _filler(25, 3)
+    pair = [_episode(filler, planted=1), _episode(filler, planted=2)]
+
+    def scored(ep: Episode, cut: str) -> Tensor:
+        return score_batch(model, [ep], chunk=16, final=8, passes=2, graphs=None, cut=cut)[0]
+
+    with torch.no_grad():
+        both = [scored(ep, "both") for ep in pair]
+        uncut = [scored(ep, "none") for ep in pair]
+    assert torch.equal(both[0], both[1])
+    assert not torch.equal(uncut[0], uncut[1])
+
+
+def test_a_cut_is_refused_for_an_unknown_name_or_differing_fact_spans() -> None:
+    model = _model()
+    ep = _episode(_filler(25, 0))
+    with pytest.raises(ValueError, match="cut"):
+        _ = score_batch(model, [ep], chunk=16, final=8, passes=2, graphs=None, cut="attention")
+    # same prefix length, query and candidates, but the fact ends one token later
+    longer = _build(fact_tail=ids(7, 7), filler=_filler(24, 0))
+    assert (longer.tokens.numel(), longer.query) == (ep.tokens.numel(), ep.query)
+    with pytest.raises(ValueError, match="fact"):
+        _ = score_batch(model, [ep, longer], chunk=16, final=8, passes=2, graphs=None, cut="both")
+
+
 # --- on CUDA: captured, and the saved states owned by the caller ---------------------------
 
 
@@ -362,9 +443,37 @@ def test_the_captured_scorer_equals_the_eager_one() -> None:
             got = score_batch(model, eps, chunk=16, final=8, passes=2, graphs=captured)
         want = score_batch(model, eps, chunk=16, final=8, passes=2, graphs=never)
     counts = captured.counts()
-    assert all(c[1] >= 1 and c[2] >= 1 for c in counts.values()), counts
+    used = ("first", "carried", "final")  # no cut: the resumed graph is never called
+    assert all(counts[g][1] >= 1 and counts[g][2] >= 1 for g in used), counts
+    assert counts["resumed"] == [0, 0, 0], counts
     assert all(c[1] == 0 for c in never.counts().values())
     assert torch.equal(got, want)
     # the captured graphs are bound: a depth-1 request is refused, not answered with depth-2 work
     with torch.no_grad(), pytest.raises(ValueError, match="another model or depth"):
         _ = score_batch(model, eps, chunk=16, final=8, passes=1, graphs=captured)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+@pytest.mark.parametrize("cut", ["recurrent", "window"])
+def test_the_captured_cut_scorer_equals_the_eager_one(cut: str) -> None:
+    # filler 40 at chunk 16: [8, 16, 16], so the resumed graph and the carried graph both run;
+    # the window (small config) fills within the first filler chunk plus what the cut keeps
+    model = _model().to(torch.device("cuda"))
+    _ = set_scan(model, "fused-fp32")
+    eps = [_episode(_filler(40, s), planted=s % 4) for s in range(2)]
+    captured = RecallGraphs()
+    never = RecallGraphs(
+        first=SignatureGraph(NEVER),
+        carried=SignatureGraph(NEVER),
+        final=SignatureGraph(NEVER),
+        resumed=SignatureGraph(NEVER),
+    )
+    with torch.no_grad():
+        got = score_batch(model, eps, chunk=16, final=8, passes=2, graphs=captured, cut=cut)
+        for _ in range(4):  # 3 warm, capture, replay for the graphs called once per call
+            got = score_batch(model, eps, chunk=16, final=8, passes=2, graphs=captured, cut=cut)
+        want = score_batch(model, eps, chunk=16, final=8, passes=2, graphs=never, cut=cut)
+    counts = captured.counts()
+    assert all(c[1] >= 1 and c[2] >= 1 for c in counts.values()), counts
+    assert all(c[1] == 0 for c in never.counts().values())
+    assert torch.equal(got, want)

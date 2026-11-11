@@ -4,7 +4,9 @@ The design is docs/reviews/2026-10-20-real-data-halting-pilot.md.
 
 The update is ``vesper.joint_update``'s, unchanged (score + pathwise + backbone-only dense, two
 rollouts with sampled stops and copy-forward); this module adapts it to text. A plan trains the
-backbone with the head (``"joint"``) or keeps it the source's (``"frozen"``: head only, from the
+backbone with the head (``"joint"``), trains it from the label terms only (``"pathwise"``: the
+score term trains the head alone), trains it on the dense term alone with no stopping
+objective (``"dense"``, a control), or keeps it the source's (``"frozen"``: head only, from the
 score term alone, no dense term). Its context
 contract (maintainer B 0617971): every row of a chunk is an INDEPENDENT context, read from cold
 states, in training and in every evaluation compared with it; a carried stream would need its
@@ -55,6 +57,7 @@ from vesper.corpus import (
     load_finalization,
 )
 from vesper.data import Chunk, Stream
+from vesper.distillation import Anchor
 from vesper.evals import EvalGraphs, depth_losses, run_chunks
 from vesper.graphs import (
     SignatureGraph,
@@ -471,6 +474,7 @@ def train_text_update(  # noqa: PLR0913
     plan: "Plan",
     *,
     graph: WarmedGraph | None = None,
+    anchor: Anchor | None = None,
 ) -> dict[str, object]:
     """One joint update from ``chunk``'s rows as independent contexts; its record.
 
@@ -480,6 +484,9 @@ def train_text_update(  # noqa: PLR0913
     The update is ``joint_update.update_step`` with the plan's memory options, captured on CUDA
     (``graph``), its record read after it.
     """
+    if plan.anchor_weight > 0.0 and (anchor is None or anchor.weight != plan.anchor_weight):
+        msg = "the update needs its configured anchor"
+        raise ValueError(msg)
     device = next(model.parameters()).device
     rates = set_learning_rates(opt, update)
     unique = pooled_weights(chunk.loss_mask)
@@ -501,6 +508,10 @@ def train_text_update(  # noqa: PLR0913
             recompute=plan.recompute,
             slices=plan.slices,
             pooled_depth=True,  # depth priced over pooled real tokens, as labels are
+            score_to_backbone=plan.backbone != "pathwise",
+            stopping=plan.backbone != "dense",
+            anchor=anchor if plan.anchor_weight > 0.0 else None,
+            parts=plan.parts,
         )
 
     out = step(values) if graph is None else Step(*graph(step, values))
@@ -522,6 +533,7 @@ def train_text_update(  # noqa: PLR0913
         "surrogate": float(out.score),
         "pathwise": float(out.pathwise),
         "dense": float(out.dense),
+        "anchor": float(out.anchor),
         "grad_norm": float(out.grad_norm),
         "grad_norm_groups": [float(norm) for norm in out.group_norms.unbind()],
         "stopped_early": float((out.n_iters[deciding] < t_max).double().mean()),
@@ -532,7 +544,7 @@ def train_text_update(  # noqa: PLR0913
     }
 
 
-BACKBONE_MODES = ("joint", "frozen")
+BACKBONE_MODES = ("joint", "pathwise", "dense", "frozen")
 # "at_saves": evaluate_text runs at every save, beside the live training state; "after_training":
 # the saves write weights only, and when training ends the run releases its training state and
 # evaluates every saved file (the joint update's graphs and the evaluation's did not fit
@@ -545,13 +557,29 @@ EVALUATION_MODES = ("at_saves", "after_training")
 class Plan:
     """What one phase-2 run follows: the price, the auxiliary, the budget, the memory options.
 
-    ``backbone`` is ``"joint"`` (the backbone trains with the head) or ``"frozen"`` (head only,
-    the backbone stays the source's: maintainer B 32e7587, the diagnostic that separates the head's
-    allocation from the backbone's drift; its dense weight is 0, the dense term trains only
-    the backbone). ``backbone_lr_scale`` multiplies a joint backbone's peak rate
+    ``backbone`` is ``"joint"`` (the backbone trains with the head), ``"pathwise"`` (it trains
+    too, but the score term gives it no credit: ``joint_update``'s ``score_to_backbone`` off,
+    so it learns from the label terms only; the diagnostic whether the score term's noise
+    drives the joint runs' fixed-depth regression, plans A2 of 11-03), ``"dense"`` (the backbone
+    trains on the dense term ALONE, ``joint_update``'s ``stopping`` off, the head stays at its
+    start; the control of the same fine-tuning setup without any stopping objective, plans A0
+    of 11-03; its dense weight must be above 0) or ``"frozen"`` (head
+    only, the backbone stays the source's: maintainer B 32e7587, the diagnostic that separates the
+    head's allocation from the backbone's drift; its dense weight is 0, the dense term trains
+    only the backbone). ``backbone_lr_scale`` multiplies a trained backbone's peak rate
     (``BACKBONE_LR``); maintainer B 32e7587's deferred remedy, "lower backbone rate alone first". A
     frozen backbone has no rate, so its scale must stay 1. ``evaluation`` is one of
     ``EVALUATION_MODES``.
+
+    ``anchor_weight`` adds matching-depth forward KL to the original model, independent
+    of ``dense_weight``. Zero is off; a frozen backbone refuses a positive value.
+    Positive weight also measures per-depth validation KL at each save. ``anchor_eval``
+    enables that same measurement with weight zero, for the dense-only control.
+
+    ``parts`` (plans A9, 2026-11-08) runs each update's ``rows`` in that many micro-batches
+    (``joint_update.update_step``'s ``parts``): the same update up to float rounding with one
+    part's activations in memory, so large updates fit; it must divide ``rows``; 1 is the
+    one-forward update.
     """
 
     seed: int
@@ -567,6 +595,9 @@ class Plan:
     backbone: str
     backbone_lr_scale: float
     evaluation: str
+    anchor_weight: float = 0.0
+    anchor_eval: bool = False
+    parts: int = 1
 
     def record(self) -> dict[str, object]:
         """Every field, for the result."""
@@ -584,6 +615,9 @@ class Plan:
             "backbone": self.backbone,
             "backbone_lr_scale": self.backbone_lr_scale,
             "evaluation": self.evaluation,
+            "anchor_weight": self.anchor_weight,
+            "anchor_eval": self.anchor_eval,
+            "parts": self.parts,
         }
 
 
@@ -624,6 +658,87 @@ def _evaluate_saves(
             raise
 
 
+def _load_start(model: Vesper, start: tuple[Path, str] | None, plan: Plan) -> None:
+    """Load the start file's weights into ``model`` from the bytes checked against its hash.
+
+    Nothing when ``start`` is None.
+
+    Raises:
+        ValueError: with an anchor in ``plan`` (its teacher is the source), on another hash, or
+            on tensors that are not exactly the model's (strict load).
+    """
+    if start is None:
+        return
+    if plan.anchor_weight > 0.0 or plan.anchor_eval:
+        msg = "start weights with an anchor: the anchor's teacher is the source, not the start"
+        raise ValueError(msg)
+    path, sha256 = start
+    data = verified_bytes(path, sha256, "the start weights")
+    state = cast(
+        "dict[str, Tensor]", torch.load(io.BytesIO(data), weights_only=True, map_location="cpu")
+    )
+    try:
+        _ = cast("object", model.load_state_dict(state))
+    except RuntimeError as error:
+        msg = f"the start weights {path} do not fit the source's model: {error}"
+        raise ValueError(msg) from error
+
+
+def _start_of(path: Path | None, sha256: str | None) -> tuple[Path, str] | None:
+    """The command line's start weights: both options or neither.
+
+    Raises:
+        ValueError: on one without the other.
+    """
+    if path is None and sha256 is None:
+        return None
+    if path is None or sha256 is None:
+        msg = "--start-weights and --start-weights-sha256 go together"
+        raise ValueError(msg)
+    return path, sha256
+
+
+def _start_record(start: tuple[Path, str] | None) -> dict[str, str] | None:
+    return None if start is None else {"path": str(start[0]), "sha256": start[1]}
+
+
+def _anchor_for(src: TextSource, plan: Plan) -> tuple[Anchor | None, dict[str, object] | None]:
+    """Copy the already checked original only when training or measurement needs it."""
+    if plan.anchor_weight == 0.0 and not plan.anchor_eval:
+        return None, None
+    anchor = Anchor(src.model, plan.anchor_weight)
+    anchor.to(torch.device(plan.device), TRAIN_SCAN[plan.device])
+    return anchor, {
+        "source_model_sha256": src.model_sha256,
+        "source_config_sha256": src.config_sha256,
+        "objective": "forward-kl-matching-dense-depth-v1",
+        "weight": plan.anchor_weight,
+        "temperature": 1.0,
+        "mask": "loss_mask",
+        "context": "cold",
+        "slices_per_depth": plan.slices,
+    }
+
+
+def _anchor_evaluation(
+    anchor: Anchor | None,
+    model: Vesper,
+    chunks: Sequence[Chunk],
+    slices: int,
+    after: int,
+    distances: dict[str, list[float]],
+    counts: dict[str, list[int] | None],
+) -> dict[str, object]:
+    """One saved model's distance, after its ordinary evaluation graphs are released."""
+    if anchor is None:
+        return {}
+    graph = SignatureGraph() if next(model.parameters()).is_cuda else None
+    distance = anchor.profile(model, chunks, slices=slices, graph=graph)
+    recorded = None if graph is None else [graph.eager, graph.captures, graph.replays]
+    distances[str(after)], counts[str(after)] = distance, recorded
+    return {"anchor_kl": distance, "anchor_graphs": recorded}
+
+
 def _check_modes(plan: Plan) -> None:
     """``check_plan``'s refusals of the modes and of combinations that would change nothing."""
     if plan.backbone not in BACKBONE_MODES:
@@ -637,6 +752,12 @@ def _check_modes(plan: Plan) -> None:
         raise ValueError(msg)
     if plan.backbone == "frozen" and plan.dense_weight > 0.0:
         msg = f"a frozen backbone takes no dense term: dense weight 0, not {plan.dense_weight}"
+        raise ValueError(msg)
+    if plan.backbone == "dense" and plan.dense_weight <= 0.0:
+        msg = (
+            "a dense backbone trains only on the dense term: weight above 0,"
+            f" not {plan.dense_weight}"
+        )
         raise ValueError(msg)
     if plan.backbone == "frozen" and plan.backbone_lr_scale != 1.0:
         msg = f"a frozen backbone has no rate to scale: scale 1, not {plan.backbone_lr_scale}"
@@ -653,9 +774,16 @@ def check_plan(plan: Plan) -> torch.device:
             that is not finite and above 0, or a frozen backbone with a dense weight above 0
             or a rate scale other than 1 (settings that would change nothing), an unknown
             evaluation mode, or an evaluation after training for a preflight (it saves
-            nothing).
+            nothing), or a nonfinite/negative anchor weight or a positive anchor
+            weight with a frozen backbone.
     """
     _check_modes(plan)
+    if not math.isfinite(plan.anchor_weight) or plan.anchor_weight < 0.0:
+        msg = "anchor weight must be finite and nonnegative"
+        raise ValueError(msg)
+    if plan.backbone == "frozen" and plan.anchor_weight > 0.0:
+        msg = "a frozen backbone cannot train an anchor"
+        raise ValueError(msg)
     if not (math.isfinite(plan.depth_cost) and plan.depth_cost >= 0.0):
         msg = f"the depth cost must be finite and at least 0, not {plan.depth_cost}"
         raise ValueError(msg)
@@ -670,6 +798,9 @@ def check_plan(plan: Plan) -> torch.device:
             f"updates, rows and slices must be at least 1"
             f" ({plan.updates}, {plan.rows}, {plan.slices})"
         )
+        raise ValueError(msg)
+    if plan.parts < 1 or plan.rows % plan.parts:
+        msg = f"parts must be at least 1 and divide the rows ({plan.parts}, {plan.rows})"
         raise ValueError(msg)
     if any(not 0 <= s <= plan.updates for s in plan.save_at):
         msg = f"every save point must lie within 0..{plan.updates}"
@@ -692,6 +823,7 @@ def run(  # noqa: PLR0913, PLR0915
     parts: Sequence[Component],
     finalization: Path,
     tokenizer_path: Path,
+    start_weights: tuple[Path, str] | None = None,
 ) -> dict[str, object]:
     """One phase-2 run: the phase-1 checkpoint ``source`` trained jointly on text; its result.
 
@@ -702,8 +834,10 @@ def run(  # noqa: PLR0913, PLR0915
     record snapshot it loaded: ``main`` resolves them from the source's own pins through
     ``train.resumed_components``, a separate read); the validation chunks are
     bound to the test ``pin`` (``validation_chunks``). The head starts at ``start_head``; a
-    ``"joint"`` plan releases the backbone (``joint_update``'s optimizer, rates and clipping),
-    a ``"frozen"`` one keeps it the source's (no backbone group, nothing else trains); each
+    ``"joint"``, ``"pathwise"`` or ``"dense"`` plan releases the backbone (``joint_update``'s
+    optimizer, rates and clipping; ``"pathwise"`` without score credit to it, ``"dense"`` from the
+    dense term alone with the head untrained), a ``"frozen"`` one keeps it
+    the source's (no backbone group, nothing else trains); each
     update reads the next chunk of the training stream (``plan.rows`` independent rows) and runs
     ``train_text_update``; the run stops early, recorded in ``stopped``, when the stream ends
     or a chunk has a row without a label (a trajectory needs one: its NLL and depth are means
@@ -720,10 +854,27 @@ def run(  # noqa: PLR0913, PLR0915
     with neither saves nor evaluations. On CUDA the update is captured (``WarmedGraph``) inside
     ``deterministic_algorithms``.
 
+    ``start_weights`` (a file and its sha256), when given, replaces the source's weights before
+    anything trains: the file is read once, checked against the hash and loaded strictly from
+    those bytes (a halting_text save of another run on this source, e.g. an anchored
+    fine-tuning's last weights, plans A8). The source still gives every binding (config,
+    tokenizer, finalization, recipe, components) and stays ``source_model_sha256``; the start
+    file is recorded beside it in inputs and result. Not with an anchor: its teacher is the
+    source by definition, which a moved start would silently change.
+
+    The optional anchor copies this already checked source before head initialization;
+    it never reloads the source path. Its provenance is in inputs/result, its weighted
+    training contribution in each update's ``anchor``, and its unweighted per-depth
+    validation means in ``anchor_kl`` at every save. Validation uses the same pinned
+    chunks, with a separate signature graph and recorded counts. The teacher stays
+    resident through deferred evaluation but retains no training graph or optimizer.
+
     Raises:
         ValueError: as ``check_plan``, on another finalization or tokenizer than the source's,
             components the finalization was not taken over or other than the source's recipe's,
-            or a validation document outside the pin; all before ``out`` exists.
+            or a validation document outside the pin; start weights with another hash or
+            another set or shape of tensors, or together with an anchor; all before ``out``
+            exists.
         FileExistsError: if ``out`` exists.
         FloatingPointError: on a non-finite update (the updates before it logged).
     """
@@ -731,11 +882,13 @@ def run(  # noqa: PLR0913, PLR0915
     src = load_text_source(source, config)
     fin, tokenizer = src.bind(parts, finalization, tokenizer_path, source)
     cfg, model = src.cfg, src.model
+    _load_start(model, start_weights, plan)
     fraction = cfg.training.held_out_fraction
     pinned = validation_chunks(parts, tokenizer, Split(fin, fraction, held_out=True), cfg, pin)
     stream = training_stream(
         parts, plan.seed, tokenizer, Split(fin, fraction), plan.rows, cfg.training.chunk_tokens
     )
+    anchor, anchor_record = _anchor_for(src, plan)
     out.mkdir(parents=True, exist_ok=False)
     # everything a separate evaluation must reproduce, recorded before training (maintainer B
     # 37b40b4)
@@ -743,9 +896,11 @@ def run(  # noqa: PLR0913, PLR0915
         out / "inputs.json",
         {
             "evaluation": plan.evaluation,
+            "anchor": anchor_record,
             "source": str(source),
             "source_model_sha256": src.model_sha256,
             "source_config_sha256": src.config_sha256,
+            "start_weights": _start_record(start_weights),
             "identity": src.identity,
             "components": [[c.name, c.share] for c in parts],
             "pin": str(pin),
@@ -764,7 +919,7 @@ def run(  # noqa: PLR0913, PLR0915
         },
     )
     head = start_head(model)
-    backbone = release_backbone(model) if plan.backbone == "joint" else []
+    backbone = release_backbone(model) if plan.backbone != "frozen" else []
     cuda = target.type == "cuda"
     precision = training_precision(cuda=cuda)
     model = model.to(target)
@@ -777,6 +932,8 @@ def run(  # noqa: PLR0913, PLR0915
     t_max = model.loop.t_max
     consumed, draws, training = "", "", 0.0
     evaluations: dict[str, TextEvaluation] = {}
+    anchor_kl: dict[str, list[float]] = {}
+    anchor_graphs: dict[str, list[int] | None] = {}
     # each save's evaluation graphs' [captures, replays] by graph (None on the CPU)
     evaluation_graphs: dict[str, dict[str, list[int]] | None] = {}
     saves: list[dict[str, object]] = []
@@ -825,6 +982,12 @@ def run(  # noqa: PLR0913, PLR0915
             counts = None if eval_graphs is None else eval_graphs.counts()
             evaluation_graphs[str(after)] = counts
             line: dict[str, object] = {"after": after, **evaluation, "graphs": counts}
+            del eval_graphs
+            line.update(
+                _anchor_evaluation(
+                    anchor, model, pinned.chunks, plan.slices, after, anchor_kl, anchor_graphs
+                )
+            )
             _ = evals.write(json.dumps(line) + "\n")
             evals.flush()
 
@@ -842,7 +1005,7 @@ def run(  # noqa: PLR0913, PLR0915
             draws = chained_digest(draws, [uniforms])
             tick = time.monotonic()
             record = train_text_update(
-                model, opt, params, chunk, uniforms, update, plan, graph=graph
+                model, opt, params, chunk, uniforms, update, plan, graph=graph, anchor=anchor
             )
             if cuda:
                 torch.cuda.synchronize(target)
@@ -875,11 +1038,15 @@ def run(  # noqa: PLR0913, PLR0915
     done = len(evaluations) and max(int(k) for k in evaluations)
     result: dict[str, object] = {
         "design": "docs/reviews/2026-10-20-real-data-halting-pilot.md (phase 2, exploratory)",
+        "anchor": anchor_record,
+        "anchor_kl": anchor_kl,
+        "anchor_graphs": anchor_graphs,
         "source": str(source),
         "source_model_sha256": src.model_sha256,
         "source_config_sha256": src.config_sha256,
         "source_objective": src.objective,
         "source_step": src.step,
+        "start_weights": _start_record(start_weights),
         "pin": str(pin),
         "pin_sha256": pinned.pin_sha256,
         "plan": plan.record(),
@@ -941,7 +1108,7 @@ def _parser() -> argparse.ArgumentParser:
         "--dense-weight", type=float, default=None, help="default 0.1 joint, 0 frozen"
     )
     _ = parser.add_argument(
-        "--backbone-lr-scale", type=float, default=1.0, help="joint backbone rate x this"
+        "--backbone-lr-scale", type=float, default=1.0, help="trained backbone rate x this"
     )
     _ = parser.add_argument(
         "--evaluation",
@@ -949,8 +1116,28 @@ def _parser() -> argparse.ArgumentParser:
         default="at_saves",
         help="after_training: save weights only, evaluate every save when training ends",
     )
+    _ = parser.add_argument(
+        "--anchor-weight",
+        type=float,
+        default=0.0,
+        help="matching-depth KL to the frozen original; also measures validation KL",
+    )
+    _ = parser.add_argument(
+        "--anchor-eval",
+        action="store_true",
+        help="measure validation KL even with training anchor off (A0 control)",
+    )
+    _ = parser.add_argument(
+        "--start-weights", type=Path, default=None, help="train from these weights (a save)"
+    )
+    _ = parser.add_argument(
+        "--start-weights-sha256", default=None, help="the start weights' sha256 (required with)"
+    )
     _ = parser.add_argument("--updates", type=int, required=True)
     _ = parser.add_argument("--rows", type=int, default=4, help="unique rows per update (E)")
+    _ = parser.add_argument(
+        "--parts", type=int, default=1, help="micro-batches per update (must divide --rows)"
+    )
     _ = parser.add_argument("--save-at", type=int, nargs="*", default=None)
     _ = parser.add_argument("--slices", type=int, default=4)
     _ = parser.add_argument("--no-recompute", action="store_true")
@@ -969,7 +1156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan = Plan(
         seed=cast("int", args.seed),
         depth_cost=cast("float", args.depth_cost),
-        dense_weight=dense if dense is not None else (0.1 if backbone == "joint" else 0.0),
+        dense_weight=dense if dense is not None else (0.0 if backbone == "frozen" else 0.1),
         updates=updates,
         rows=cast("int", args.rows),
         save_at=tuple(save_at if save_at is not None else (0, updates // 2, updates)),
@@ -980,12 +1167,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         backbone=backbone,
         backbone_lr_scale=cast("float", args.backbone_lr_scale),
         evaluation=cast("str", args.evaluation),
+        anchor_weight=cast("float", args.anchor_weight),
+        anchor_eval=cast("bool", args.anchor_eval),
+        parts=cast("int", args.parts),
     )
     source = cast("Path", args.source)
     try:
         # the plan is refused before the source is read: resolving the source's components
         # below reads its record (maintainer B's review of 72c9d31); run checks the plan again
         _ = check_plan(plan)
+        start = _start_of(
+            cast("Path | None", args.start_weights), cast("str | None", args.start_weights_sha256)
+        )
         _ = run(
             source,
             cast("Path", args.config),
@@ -995,6 +1188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parts=resumed_components(cast("Path", args.data), source),  # the source's pins
             finalization=cast("Path", args.finalization),
             tokenizer_path=cast("Path", args.tokenizer),
+            start_weights=start,
         )
     except ValueError:
         log.exception("refused")

@@ -24,6 +24,7 @@ from torch import Tensor, nn
 from torch.nn import functional
 
 from vesper.contracts import ContractError, Dims, check_shape, require
+from vesper.distillation import Anchor
 from vesper.loop import DenseRule, LoopResult, SampledRule
 from vesper.model import Vesper, token_losses
 
@@ -205,6 +206,7 @@ def _costs(  # noqa: PLR0913  # the update's inputs plus label_nll's memory opti
     *,
     slices: int = 1,
     pooled_depth: bool = False,
+    depth_scale: Tensor | None = None,
 ) -> Costs:
     """The trajectories' costs, ``[b]`` each, and the per-label NLL ``[b, n]``.
 
@@ -218,7 +220,9 @@ def _costs(  # noqa: PLR0913  # the update's inputs plus label_nll's memory opti
     maintainer B's review of 72c9d31): each trajectory's summed depth times ``b / V``, ``V`` the
     real tokens of all ``b`` rows, so the mean over a rollout's rows is the depth pooled over its
     real tokens. Both read only ``valid``, never a sampled action, so paired rollouts share
-    the normalization.
+    the normalization. ``depth_scale`` (pooled only) replaces this batch's ``b / V`` with a
+    given one: a micro-batch of an accumulated update (``update_step``'s ``parts``) passes
+    the WHOLE update's, so its depth is priced as in the one-batch update.
     """
     ce = label_nll(model, result.y, targets, mask, slices)
     with torch.no_grad():
@@ -226,13 +230,21 @@ def _costs(  # noqa: PLR0913  # the update's inputs plus label_nll's memory opti
         nll = plain_ce.sum(1) / mask.sum(1).double()
         objective = (plain_ce * weights).sum(1)
         summed = torch.where(valid, result.n_iters.double(), 0.0).sum(1)
+        if depth_scale is not None and not pooled_depth:
+            msg = "a depth_scale prices pooled depth: it needs pooled_depth"
+            raise ValueError(msg)
         depth = (
-            summed * (valid.shape[0] / valid.sum().double())
+            summed * (_depth_scale(valid) if depth_scale is None else depth_scale)
             if pooled_depth
             else summed / valid.sum(1).double()
         )
         t_max = int(result.per_pass.shape[0])
         return Costs(objective + depth_cost * depth / t_max, objective, nll, depth, ce)
+
+
+def _depth_scale(valid: Tensor) -> Tensor:
+    """``b / V``: the rows of ``valid [b, n]`` over its real tokens (float64 scalar)."""
+    return valid.shape[0] / valid.sum().double()
 
 
 def label_nll(model: Vesper, y: Tensor, targets: Tensor, mask: Tensor, slices: int = 1) -> Tensor:
@@ -300,7 +312,7 @@ class Dense(NamedTuple):
 
 
 class Loss(NamedTuple):
-    """One update's differentiable loss and its parts (``total = score + pathwise + dense``)."""
+    """Differentiable parts: stopping terms (when enabled), dense CE and original-model KL."""
 
     total: Tensor
     score: Tensor
@@ -309,6 +321,7 @@ class Loss(NamedTuple):
     costs: Costs
     rule: SampledRule
     result: LoopResult
+    anchor: Tensor
 
 
 def update_loss(  # noqa: PLR0913, PLR0917
@@ -327,6 +340,10 @@ def update_loss(  # noqa: PLR0913, PLR0917
     recompute: bool = False,
     slices: int = 1,
     pooled_depth: bool = False,
+    score_to_backbone: bool = True,
+    stopping: bool = True,
+    anchor: Anchor | None = None,
+    depth_scale: Tensor | None = None,
 ) -> Loss:
     """The loss whose gradient, in expectation, is the gradient of the expected trajectory cost.
 
@@ -343,13 +360,35 @@ def update_loss(  # noqa: PLR0913, PLR0917
     credit. ``recompute`` (the loop's activation recomputation, both forwards) and ``slices``
     (``label_nll``'s) change memory only; both off is the measured synthetic update.
     ``pooled_depth`` (``_costs``) prices depth over pooled real tokens; off is the synthetic
-    per-trajectory mean, unchanged.
+    per-trajectory mean, unchanged. ``score_to_backbone`` False gives the backbone no score
+    credit: the head reads detached features (``SampledRule``'s ``detach_features``), so
+    ``score`` trains the head alone and the backbone learns from the label terms only, every
+    value unchanged (a text run's ``"pathwise"`` backbone mode); True, the default, is maintainer
+    B's unbiased gradient of ``J`` above. ``stopping`` False makes ``total`` the dense term ALONE:
+    the sampled trajectories still run and their score and pathwise terms are still returned
+    for the record, but nothing trains on them and the head gets no gradient (a text run's
+    ``"dense"`` backbone mode: the control of the same fine-tuning setup without any stopping
+    objective); True, the default, trains on all three. ``anchor`` optionally adds
+    matching-depth forward KL to an owned frozen original. It shares the student
+    dense forward, uses the unique batch's mask/weights and trains no halting-head
+    parameter. It remains active when ``stopping=False``. None or weight zero
+    performs no teacher work and leaves the old total expression unchanged. ``depth_scale``
+    is ``_costs``': a micro-batch's pooled depth priced with the whole update's ``b / V``.
 
     Raises:
         RuntimeError: if the rule recorded no decisions.
-        ValueError: on ``slices < 1``.
+        ValueError: on ``slices < 1`` or an active anchor without a unique dense batch.
     """
-    rule = SampledRule(model.loop.halting_head(), epsilon, uniforms, valid)
+    if anchor is not None and anchor.weight > 0.0 and dense is None:
+        msg = "an anchor needs the unique dense batch"
+        raise ValueError(msg)
+    rule = SampledRule(
+        model.loop.halting_head(),
+        epsilon,
+        uniforms,
+        valid,
+        detach_features=not score_to_backbone,
+    )
     states = model.init_states(int(tokens.shape[0]), torch.float32, tokens.device)
     result = model.run(tokens, pos, states, recompute=recompute, exit_rule=rule)
     costs = _costs(
@@ -362,6 +401,7 @@ def update_loss(  # noqa: PLR0913, PLR0917
         depth_cost,
         slices=slices,
         pooled_depth=pooled_depth,
+        depth_scale=depth_scale,
     )
     if rule.log_prob is None or rule.decisions is None:
         msg = "the sampled rule recorded no decisions"
@@ -369,16 +409,26 @@ def update_loss(  # noqa: PLR0913, PLR0917
     score = actor_loss(costs.cost.view(ROLLOUTS, -1), rule.log_prob.sum(1).view(ROLLOUTS, -1))
     pathwise = (costs.ce * weights).sum(1).mean()
     dense_term = torch.zeros((), dtype=torch.float64, device=tokens.device)
-    if dense is not None and dense.weight > 0.0:
+    anchored = anchor is not None and anchor.weight > 0.0
+    anchor_term = torch.zeros_like(dense_term)
+    if dense is not None and (dense.weight > 0.0 or anchored):
         fresh = model.init_states(int(dense.tokens.shape[0]), torch.float32, tokens.device)
         passes = model.run(
             dense.tokens, dense.pos, fresh, recompute=recompute, exit_rule=DenseRule()
         ).per_pass
-        per_pass = (
-            label_nll(model, passes, dense.targets, dense.mask, slices) * dense.weights
-        ).sum(-1)
-        dense_term = dense.weight * per_pass.mean(0).mean()
-    return Loss(score + pathwise + dense_term, score, pathwise, dense_term, costs, rule, result)
+        if dense.weight > 0.0:
+            per_pass = (
+                label_nll(model, passes, dense.targets, dense.mask, slices) * dense.weights
+            ).sum(-1)
+            dense_term = dense.weight * per_pass.mean(0).mean()
+        if anchor is not None and anchored:
+            anchor_term = anchor.loss(
+                model, passes, dense.tokens, dense.pos, dense.mask, dense.weights, slices=slices
+            )
+    total = score + pathwise + dense_term if stopping else dense_term
+    if anchored:
+        total = total + anchor_term
+    return Loss(total, score, pathwise, dense_term, costs, rule, result, anchor_term)
 
 
 class Step(NamedTuple):
@@ -396,6 +446,7 @@ class Step(NamedTuple):
     group_norms: Tensor
     decisions: Tensor
     n_iters: Tensor
+    anchor: Tensor
 
 
 def update_step(  # noqa: PLR0913  # the six update inputs plus the cost and memory options
@@ -409,6 +460,10 @@ def update_step(  # noqa: PLR0913  # the six update inputs plus the cost and mem
     recompute: bool = False,
     slices: int = 1,
     pooled_depth: bool = False,
+    score_to_backbone: bool = True,
+    stopping: bool = True,
+    anchor: Anchor | None = None,
+    parts: int = 1,
 ) -> Step:
     """The update on the device, with no read-back: capturable as one CUDA graph.
 
@@ -416,17 +471,138 @@ def update_step(  # noqa: PLR0913  # the six update inputs plus the cost and mem
     ``[ROLLOUTS * E, n]``, rollout-major), the label weights (float64, the same), the uniforms
     and the floor (a float64 scalar). The unique sequences, for the dense auxiliary, are the
     first ``E`` rows. Its checks are device contracts (``require``). ``recompute`` and
-    ``slices`` are ``update_loss``'s memory options, ``pooled_depth`` its depth pricing.
+    ``slices`` are ``update_loss``'s memory options, ``pooled_depth`` its depth pricing,
+    ``score_to_backbone`` its score credit, ``stopping`` whether the stopping terms train,
+    and ``anchor`` its independent frozen teacher. One backward, clip and optimizer
+    step over the combined objective; the teacher is never an optimizer member.
+
+    ``parts`` (plans A9, 2026-11-08: large updates that do not fit one forward) splits the
+    ``E`` unique rows into that many consecutive micro-batches, both rollouts of a row in the
+    same one (each is the other's score baseline), and accumulates their backwards before the
+    one clip and step: every term is a row mean under the label weights, which the caller pools
+    over all ``E`` rows, so each part's loss is scaled by its share of the rows, and a pooled
+    depth is priced with the WHOLE update's rows over real tokens; the gradient is then the
+    one-forward update's up to float rounding (tests/test_accumulate.py). The outputs are the
+    whole update's: per-trajectory tensors back in rollout-major order, the loss parts summed
+    with their scales. ``parts`` 1 is the one-forward update, unchanged.
 
     Raises:
         FloatingPointError: eagerly, on a non-finite cost, surrogate or gradient, before the step.
         RuntimeError: if the rule recorded no decisions.
+        ValueError: unless ``parts`` is at least 1 and divides the unique rows.
+    """
+    split = _micro_batches(values, parts)
+    e = int(values[0].shape[0]) // ROLLOUTS
+    depth_scale = _depth_scale(values[4]) if pooled_depth and parts > 1 else None
+    opt.zero_grad(set_to_none=True)
+    outs = [
+        _accumulate(
+            model,
+            part,
+            depth_cost,
+            dense_weight,
+            scale=(int(part[0].shape[0]) // ROLLOUTS) / e,
+            depth_scale=depth_scale,
+            recompute=recompute,
+            slices=slices,
+            pooled_depth=pooled_depth,
+            score_to_backbone=score_to_backbone,
+            stopping=stopping,
+            anchor=anchor,
+        )
+        for part in split
+    ]
+    grad_norm, group_norms = _apply(opt, params)
+    if parts == 1:
+        (one,) = outs
+        return _step(list(one.scalars), list(one.rows), grad_norm, group_norms, one.anchor)
+    scalars = [torch.stack([o.scale * o.scalars[i] for o in outs]).sum() for i in range(3)]
+    rows = [_rollout_major([o.rows[i] for o in outs]) for i in range(len(outs[0].rows))]
+    anchor_sum = torch.stack([o.scale * o.anchor for o in outs]).sum()
+    return _step(scalars, rows, grad_norm, group_norms, anchor_sum)
+
+
+def _step(
+    scalars: Sequence[Tensor],
+    rows: Sequence[Tensor],
+    grad_norm: Tensor,
+    group_norms: Tensor,
+    anchor: Tensor,
+) -> Step:
+    """The update's ``Step`` from its parts.
+
+    ``scalars`` the loss parts (score, pathwise, dense), ``rows`` the per-trajectory tensors
+    (cost, objective, nll, depth, ce, decisions, n_iters), then the norms and the anchor.
+    """
+    score, pathwise, dense = scalars
+    cost, objective, nll, depth, ce, decisions, n_iters = rows
+    return Step(
+        score,
+        pathwise,
+        dense,
+        cost,
+        objective,
+        nll,
+        depth,
+        ce,
+        grad_norm,
+        group_norms,
+        decisions,
+        n_iters,
+        anchor,
+    )
+
+
+class _Part(NamedTuple):
+    """One micro-batch's outputs, detached.
+
+    ``scalars`` (score, pathwise, dense) and ``anchor`` are its own loss parts (unscaled),
+    ``rows`` (cost, objective, nll, depth, ce, decisions, n_iters) per trajectory,
+    rollout-major within the part; ``scale`` its share of the rows.
+    """
+
+    scalars: tuple[Tensor, Tensor, Tensor]
+    rows: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+    anchor: Tensor
+    scale: float
+
+
+def _rollout_major(pieces: Sequence[Tensor]) -> Tensor:
+    """The parts' per-trajectory tensors in the whole update's rollout-major order.
+
+    Each piece is rollout-major over its own rows; the result is rollout 0 of every part in
+    order, then rollout 1.
+    """
+    halves = [p.view(ROLLOUTS, -1, *p.shape[1:]) for p in pieces]
+    return torch.cat(halves, dim=1).flatten(0, 1)
+
+
+def _accumulate(  # noqa: PLR0913  # update_step's inputs plus the accumulation pair
+    model: Vesper,
+    values: Sequence[Tensor],
+    depth_cost: float,
+    dense_weight: float,
+    *,
+    scale: float,
+    depth_scale: Tensor | None,
+    recompute: bool,
+    slices: int,
+    pooled_depth: bool,
+    score_to_backbone: bool,
+    stopping: bool,
+    anchor: Anchor | None,
+) -> _Part:
+    """One micro-batch's forward and the backward of ``scale`` times its loss; no step.
+
+    The gradients add to what the parameters hold (``update_step`` zeroes them once per
+    update). ``scale`` 1.0 with ``depth_scale`` None is exactly the one-forward update's
+    backward.
     """
     tokens, pos, targets, mask, valid, weights, uniforms, epsilon = values
     e = int(tokens.shape[0]) // ROLLOUTS
     dense = (
         Dense(tokens[:e], pos[:e], targets[:e], mask[:e], weights[:e], dense_weight)
-        if dense_weight > 0.0
+        if dense_weight > 0.0 or (anchor is not None and anchor.weight > 0.0)
         else None
     )
     loss = update_loss(
@@ -443,35 +619,75 @@ def update_step(  # noqa: PLR0913  # the six update inputs plus the cost and mem
         dense,
         recompute=recompute,
         slices=slices,
-        pooled_depth=pooled_depth,
+        pooled_depth=pooled_depth or depth_scale is not None,
+        score_to_backbone=score_to_backbone,
+        stopping=stopping,
+        anchor=anchor,
+        depth_scale=depth_scale,
     )
     costs, rule = loss.costs, loss.rule
     if rule.decisions is None:
         msg = "the sampled rule recorded no decisions"
         raise RuntimeError(msg)
-    opt.zero_grad(set_to_none=True)
-    torch.autograd.backward([loss.total])
+    torch.autograd.backward([loss.total if scale == 1.0 else loss.total * scale])
+    try:
+        require(torch.isfinite(costs.cost).all() & torch.isfinite(loss.total), NON_FINITE)
+    except ContractError as error:
+        raise FloatingPointError(NON_FINITE) from error
+    return _Part(
+        (loss.score.detach(), loss.pathwise.detach(), loss.dense.detach()),
+        (
+            costs.cost,
+            costs.objective,
+            costs.nll,
+            costs.depth,
+            costs.ce.detach(),
+            rule.decisions,
+            loss.result.n_iters,
+        ),
+        loss.anchor.detach(),
+        scale,
+    )
+
+
+def _apply(opt: torch.optim.AdamW, params: Sequence[nn.Parameter]) -> tuple[Tensor, Tensor]:
+    """End an update: norms, clip, finiteness, one AdamW step.
+
+    Returns the total (before clipping) and per-group gradient norms; a non-finite gradient
+    raises ``FloatingPointError`` eagerly, before the step (a device contract when captured).
+    """
     group_norms = _group_grad_norms(opt)
     grad_norm = nn.utils.clip_grad_norm_(list(params), GRAD_CLIP)
-    finite = (
-        torch.isfinite(costs.cost).all() & torch.isfinite(loss.total) & torch.isfinite(grad_norm)
-    )
     try:
-        require(finite, NON_FINITE)
+        require(torch.isfinite(grad_norm), NON_FINITE)
     except ContractError as error:
         raise FloatingPointError(NON_FINITE) from error
     _ = cast("float | None", opt.step())  # pyright: ignore[reportUnknownMemberType]
-    return Step(
-        loss.score.detach(),
-        loss.pathwise.detach(),
-        loss.dense.detach(),
-        costs.cost,
-        costs.objective,
-        costs.nll,
-        costs.depth,
-        costs.ce.detach(),
-        grad_norm.detach(),
-        group_norms,
-        rule.decisions,
-        loss.result.n_iters,
-    )
+    return grad_norm.detach(), group_norms
+
+
+def _micro_batches(values: Sequence[Tensor], parts: int) -> list[list[Tensor]]:
+    """``values`` split into ``parts`` micro-batches of consecutive unique rows.
+
+    Each part holds those rows of EVERY rollout, rollout-major (the uniforms split on their
+    row dimension 1, the floor shared, the weights as given); one part is ``values`` itself,
+    untouched. ``ValueError`` unless ``parts`` is at least 1 and divides the unique rows.
+    """
+    e = int(values[0].shape[0]) // ROLLOUTS
+    if parts < 1 or e % parts:
+        msg = f"parts must divide the {e} unique rows, got {parts}"
+        raise ValueError(msg)
+    if parts == 1:
+        return [list(values)]
+    width = e // parts
+    out: list[list[Tensor]] = []
+    for i in range(parts):
+        rows = torch.cat(
+            [
+                torch.arange(r * e + i * width, r * e + (i + 1) * width, device=values[0].device)
+                for r in range(ROLLOUTS)
+            ]
+        )
+        part = [t.index_select(0, rows) for t in values[:6]]
+        out.append([*part, values[6].index_select(1, rows), values[7]])
+    return out

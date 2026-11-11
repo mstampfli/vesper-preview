@@ -140,6 +140,23 @@ an encoded document. Temporary disk is bounded by concurrently counted file size
 No speed or full-corpus runtime is promised by small-fixture tests. Counts publish together
 only when all required files finish; failed work cannot become a valid cache.
 
+## Original-model anchor for joint text training
+
+`vesper.halting_text --anchor-weight LAMBDA` adds forward KL from the frozen
+original to the student's matching dense depth, pooled over loss positions and
+averaged over passes. Dense CE keeps its separate `--dense-weight`. Default zero
+keeps the prior training path. Positive weight is supported with joint, pathwise
+and dense backbone modes; frozen mode refuses it. The teacher is a checked-source
+copy, with no gradients or optimizer state.
+
+Positive weight also measures per-depth KL on the same pinned validation chunks
+at each save. `--anchor-eval` requests that measurement with weight zero for the
+control. Results retain NLL and add `anchor_kl`; training records add the weighted
+`anchor` loss. `--slices` bounds each depth's transient vocabulary work. The
+teacher and extra forwards consume memory and time: measure the full lifecycle
+before inferring a throughput or full-model fit result. See
+`docs/reviews/2026-11-03-distillation-anchor.md` for the objective and checks.
+
 ## Where things go
 
 - After a milestone that changes what the model can do or how the system works, add a short

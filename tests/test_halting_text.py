@@ -73,6 +73,8 @@ PLAN = Plan(
     evaluation="at_saves",
 )
 FROZEN = dataclasses.replace(PLAN, backbone="frozen", dense_weight=0.0)
+PATHWISE = dataclasses.replace(PLAN, backbone="pathwise")
+DENSE = dataclasses.replace(PLAN, backbone="dense")
 
 
 def three_pass_config() -> VesperConfig:
@@ -306,7 +308,13 @@ class PhaseOne:
     parts: list[Component]
 
     def run(
-        self, out: Path, plan: Plan, *, pin: Path | None = None, tokenizer: Path | None = None
+        self,
+        out: Path,
+        plan: Plan,
+        *,
+        pin: Path | None = None,
+        tokenizer: Path | None = None,
+        start: tuple[Path, str] | None = None,
     ) -> dict[str, object]:
         return run_text(
             self.files["checkpoint"],
@@ -317,6 +325,7 @@ class PhaseOne:
             parts=self.parts,
             finalization=self.files["receipt"],
             tokenizer_path=tokenizer or self.files["tokenizer"],
+            start_weights=start,
         )
 
 
@@ -409,13 +418,17 @@ def test_the_plan_record_names_every_field() -> None:
         (dataclasses.replace(PLAN, device="tpu"), "device"),
         (dataclasses.replace(PLAN, backbone="partial"), "backbone"),
         (dataclasses.replace(FROZEN, dense_weight=0.1), "dense"),
+        (dataclasses.replace(FROZEN, anchor_weight=0.1), "frozen"),
         (dataclasses.replace(PLAN, backbone_lr_scale=0.0), "backbone rate scale"),
         (dataclasses.replace(PLAN, backbone_lr_scale=-0.1), "backbone rate scale"),
         (dataclasses.replace(PLAN, backbone_lr_scale=math.nan), "backbone rate scale"),
         (dataclasses.replace(PLAN, backbone_lr_scale=math.inf), "backbone rate scale"),
         (dataclasses.replace(FROZEN, backbone_lr_scale=0.1), "frozen"),
+        (dataclasses.replace(DENSE, dense_weight=0.0), "a dense backbone"),  # nothing trains
         (dataclasses.replace(PLAN, evaluation="never"), "evaluation"),
         (dataclasses.replace(PLAN, evaluation="after_training", preflight=True), "preflight"),
+        (dataclasses.replace(PLAN, parts=0), "parts"),
+        (dataclasses.replace(PLAN, rows=4, parts=3), "parts"),
     ],
 )
 def test_a_refused_plan_writes_nothing(
@@ -425,6 +438,43 @@ def test_a_refused_plan_writes_nothing(
     with pytest.raises(ValueError, match=message):
         _ = p1.run(tmp_path / "p2", plan)
     assert not (tmp_path / "p2").exists()
+
+
+def test_an_accumulated_run_trains_as_the_one_forward_run(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # parts reaches joint_update.update_step (whose arithmetic tests/test_accumulate.py holds):
+    # two updates of 2 rows in 2 parts against the same plan in one part; the same data, draws
+    # and records up to float rounding, and the plan recorded
+    p1 = _phase_one(tmp_path, book_builder)
+    one = dataclasses.replace(PLAN, rows=2)
+    two = dataclasses.replace(one, parts=2)
+    a = p1.run(tmp_path / "one", one)
+    # the real update runs; the mock records the parts each update was actually called with
+    with patch("vesper.halting_text.update_step", wraps=update_step) as spy:
+        b = p1.run(tmp_path / "two", two)
+    seen = [cast("dict[str, object]", c.kwargs)["parts"] for c in spy.call_args_list]
+    assert seen == [2, 2]  # both updates of the run, in two parts
+    assert cast("dict[str, object]", b["plan"])["parts"] == 2
+    assert cast("dict[str, object]", a["plan"])["parts"] == 1
+    for ra, rb in zip(
+        _lines(tmp_path / "one" / "train.jsonl"),
+        _lines(tmp_path / "two" / "train.jsonl"),
+        strict=True,
+    ):
+        for key in ("pooled_nll", "depth", "grad_norm", "labels"):
+            assert float(rb[key]) == pytest.approx(float(ra[key]), rel=1e-5)
+    wa = weights(tmp_path / "one" / "weights" / "after-000002.pt")
+    wb = weights(tmp_path / "two" / "weights" / "after-000002.pt")
+    moved = [
+        k
+        for k in wa
+        if not torch.equal(wa[k], weights(tmp_path / "one" / "weights" / "after-000000.pt")[k])
+    ]
+    assert moved
+    for k in wa:
+        diff = float((wa[k].double() - wb[k].double()).abs().max())
+        assert diff <= 1e-5 * max(float(wa[k].double().abs().max()), 1.0), k
 
 
 def _backbone_step(source: dict[str, Tensor], after: dict[str, Tensor]) -> float:
@@ -848,6 +898,71 @@ def test_the_text_update_prices_depth_over_pooled_real_tokens() -> None:
     assert record["cost"] == pytest.approx(pooled_nll + 1.0 * 1.5 / 3, abs=1e-12)
 
 
+@pytest.mark.parametrize(("plan", "stopping"), [(PLAN, True), (PATHWISE, True), (DENSE, False)])
+def test_the_text_update_trains_the_stopping_terms_unless_the_mode_is_dense(
+    plan: Plan, *, stopping: bool
+) -> None:
+    # dense: the A0 control, the backbone trained on the dense all-pass term alone
+    # (tests/test_dense_control.py shows what the switch does inside the update)
+    model, chunk, uniforms = _unequal_rows()
+    head, backbone = start_head(model), release_backbone(model)
+    plan = dataclasses.replace(plan, rows=2, recompute=False, slices=1, dense_weight=0.1)
+    with patch("vesper.halting_text.update_step", wraps=update_step) as spy:
+        _ = train_text_update(
+            model, optimizer(head, backbone), head + backbone, chunk, uniforms, 0, plan
+        )
+    kwargs = cast("dict[str, object]", spy.call_args.kwargs)
+    assert kwargs["stopping"] is stopping
+
+
+def test_a_dense_control_run_trains_the_backbone_and_leaves_the_head(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    result = p1.run(tmp_path / "p2", DENSE)
+    assert cast("dict[str, object]", result["plan"])["backbone"] == "dense"
+    saved = weights(p1.files["checkpoint"] / "model.pt")
+    start = weights(tmp_path / "p2" / "weights" / "after-000000.pt")
+    after = weights(tmp_path / "p2" / "weights" / "after-000002.pt")
+    head = [k for k in start if k.startswith("loop.halting")]
+    assert head
+    assert all(torch.equal(start[k], after[k]) for k in head)  # the head keeps its start
+    assert any(not torch.equal(saved[k], after[k]) for k in saved if k not in head)
+
+
+@pytest.mark.parametrize(("plan", "credit"), [(PLAN, True), (PATHWISE, False)])
+def test_the_text_update_gives_the_backbone_score_credit_by_its_mode(
+    plan: Plan, *, credit: bool
+) -> None:
+    # joint: the score term reaches the backbone (every earlier joint run); pathwise: the head
+    # only, the backbone learns from the label terms (plans A2, 11-03; tests/test_score_credit.py
+    # shows what the switch does inside the update)
+    model, chunk, uniforms = _unequal_rows()
+    head, backbone = start_head(model), release_backbone(model)
+    plan = dataclasses.replace(plan, rows=2, recompute=False, slices=1, dense_weight=0.0)
+    with patch("vesper.halting_text.update_step", wraps=update_step) as spy:
+        _ = train_text_update(
+            model, optimizer(head, backbone), head + backbone, chunk, uniforms, 0, plan
+        )
+    assert spy.call_count == 1
+    kwargs = cast("dict[str, object]", spy.call_args.kwargs)
+    assert kwargs["score_to_backbone"] is credit
+
+
+def test_a_pathwise_run_trains_the_head_and_the_backbone(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    result = p1.run(tmp_path / "p2", PATHWISE)
+    assert cast("dict[str, object]", result["plan"])["backbone"] == "pathwise"
+    assert cast("dict[str, object]", result["optimizer"])["backbone_peak_lr"] == BACKBONE_LR
+    saved = weights(p1.files["checkpoint"] / "model.pt")
+    after = weights(tmp_path / "p2" / "weights" / "after-000002.pt")
+    changed = {k for k in saved if not torch.equal(saved[k], after[k])}
+    assert any("halting" in k for k in changed)
+    assert any("halting" not in k for k in changed)
+
+
 def test_the_joint_core_keeps_the_per_trajectory_depth_mean_by_default() -> None:
     # the synthetic calibration's cost is unchanged: without pooled_depth each trajectory's
     # depth is the mean over its own real tokens; with it, its summed depth times b / V
@@ -1163,6 +1278,27 @@ def test_a_frozen_backbone_run_changes_only_the_head_across_captured_updates(
     assert result["update_graph"] == {"warm": 3, "captures": 1, "replays": 3}
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_an_accumulated_joint_run_on_cuda_is_captured_and_trains_as_one_forward(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    # The project owner's rule (every GPU path captured): the accumulated update is ONE training
+    # graph, warmed, captured and replayed like the one-forward update, and it trains as the
+    # one-forward run on every update, eager warm-ups and captured replays alike (float rounding of
+    # the batching)
+    p1 = _phase_one(tmp_path, book_builder)
+    one = dataclasses.replace(PLAN, device="cuda", rows=2, updates=6, save_at=(0, 6))
+    two = dataclasses.replace(one, parts=2)
+    a, b = p1.run(tmp_path / "one", one), p1.run(tmp_path / "two", two)
+    assert a["update_graph"] == b["update_graph"] == {"warm": 3, "captures": 1, "replays": 3}
+    rows_a = _lines(tmp_path / "one" / "train.jsonl")
+    rows_b = _lines(tmp_path / "two" / "train.jsonl")
+    assert len(rows_a) == len(rows_b) == 6
+    for ra, rb in zip(rows_a, rows_b, strict=True):
+        for key in ("pooled_nll", "depth", "grad_norm", "labels"):
+            assert float(rb[key]) == pytest.approx(float(ra[key]), rel=1e-4), key
+
+
 def test_the_frozen_update_s_head_gradient_is_the_paired_score_gradient() -> None:
     # independent of the update's own cost and rule code: the trajectories are re-derived from
     # the uniforms and the head's logits (with the hazard baseline), the costs from each token's
@@ -1259,6 +1395,8 @@ def _paired_score_gradient(
     [
         ([], ("joint", 0.1)),
         (["--backbone", "frozen"], ("frozen", 0.0)),  # the dense term trains only the backbone
+        (["--backbone", "pathwise"], ("pathwise", 0.1)),  # a trained backbone, as joint
+        (["--backbone", "dense"], ("dense", 0.1)),  # the dense term is all it trains on
         (["--backbone", "joint", "--dense-weight", "0.3"], ("joint", 0.3)),
     ],
 )
@@ -1274,10 +1412,24 @@ def test_the_command_line_passes_the_backbone_rate_scale() -> None:
     assert _plan_from_command_line(["--backbone-lr-scale", "0.1"]).backbone_lr_scale == 0.1
 
 
+def test_the_command_line_passes_the_part_count() -> None:
+    assert _plan_from_command_line([]).parts == 1
+    assert _plan_from_command_line(["--rows", "4", "--parts", "2"]).parts == 2
+
+
 def test_the_command_line_passes_the_evaluation_mode() -> None:
     assert _plan_from_command_line([]).evaluation == "at_saves"
     after = _plan_from_command_line(["--evaluation", "after_training"])
     assert after.evaluation == "after_training"
+
+
+def test_the_command_line_passes_anchor_settings() -> None:
+    plain = _plan_from_command_line([])
+    assert plain.anchor_weight == 0.0
+    assert not plain.anchor_eval
+    measured = _plan_from_command_line(["--anchor-eval", "--anchor-weight", "0.7"])
+    assert measured.anchor_eval
+    assert measured.anchor_weight == 0.7
 
 
 def _plan_from_command_line(extra: list[str]) -> Plan:
@@ -1300,3 +1452,100 @@ def _plan_from_command_line(extra: list[str]) -> Plan:
     ):
         assert halting_text.main(argv) == 0
     return plans[0]
+
+
+# --- start weights: a stopping rule on another run's saved weights (plans A8) ----------------
+
+
+def _start_file(p1: PhaseOne, path: Path, *, drop: str | None = None) -> tuple[Path, str]:
+    """The source's weights with every backbone tensor shifted (so a run that ignored the file
+    would start from different values), saved as halting_text saves its weights."""
+    state = weights(p1.files["checkpoint"] / "model.pt")
+    shifted = {
+        k: (v + 0.01 if v.is_floating_point() and not k.startswith("loop.halting") else v)
+        for k, v in state.items()
+        if k != drop
+    }
+    buffer = io.BytesIO()
+    torch.save(shifted, buffer)
+    _ = path.write_bytes(buffer.getvalue())
+    return path, hashlib.sha256(buffer.getvalue()).hexdigest()
+
+
+def test_a_run_trains_from_the_given_start_weights_and_records_them(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    start = _start_file(p1, tmp_path / "start.pt")
+    result = p1.run(tmp_path / "p2", FROZEN, start=start)
+    given = weights(start[0])
+    source = weights(p1.files["checkpoint"] / "model.pt")
+    begin = weights(tmp_path / "p2" / "weights" / "after-000000.pt")
+    end = weights(tmp_path / "p2" / "weights" / f"after-{FROZEN.updates:06d}.pt")
+    backbone = [k for k in given if not k.startswith("loop.halting")]
+    shifted = [k for k in backbone if given[k].is_floating_point()]
+    assert shifted
+    assert all(not torch.equal(given[k], source[k]) for k in shifted)
+    _assert_only_the_head_moved(given, begin, end)  # held at the START weights, not the source's
+    record = {"path": str(start[0]), "sha256": start[1]}
+    inputs = cast("dict[str, object]", json.loads((tmp_path / "p2" / "inputs.json").read_text()))
+    assert inputs["start_weights"] == record
+    assert result["start_weights"] == record
+    assert (
+        result["source_model_sha256"]
+        == hashlib.sha256((p1.files["checkpoint"] / "model.pt").read_bytes()).hexdigest()
+    )  # the source stays the identity the bindings come from
+
+
+def test_a_run_without_start_weights_records_none_and_starts_from_the_source(
+    tmp_path: Path, book_builder: Builder
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    result = p1.run(tmp_path / "p2", FROZEN)
+    assert result["start_weights"] is None
+    inputs = cast("dict[str, object]", json.loads((tmp_path / "p2" / "inputs.json").read_text()))
+    assert inputs["start_weights"] is None
+    source = weights(p1.files["checkpoint"] / "model.pt")
+    begin = weights(tmp_path / "p2" / "weights" / "after-000000.pt")
+    assert all(torch.equal(source[k], begin[k]) for k in source if not k.startswith("loop.halting"))
+
+
+@pytest.mark.parametrize("case", ["hash", "shape", "anchor"])
+def test_start_weights_are_refused_before_anything_is_written(
+    tmp_path: Path, book_builder: Builder, case: str
+) -> None:
+    p1 = _phase_one(tmp_path, book_builder)
+    path, sha = _start_file(
+        p1, tmp_path / "start.pt", drop="norm_out.weight" if case == "shape" else None
+    )
+    plan = dataclasses.replace(PLAN, anchor_weight=1.0) if case == "anchor" else FROZEN
+    given = (path, "0" * 64) if case == "hash" else (path, sha)
+    message = {"hash": "start weights", "shape": "start weights", "anchor": "anchor"}[case]
+    with pytest.raises(ValueError, match=message):
+        _ = p1.run(tmp_path / "p2", plan, start=given)
+    assert not (tmp_path / "p2").exists()
+
+
+def test_the_command_line_passes_start_weights_only_as_a_pair(tmp_path: Path) -> None:
+    starts: list[object] = []
+
+    def capture(*_: object, **kwargs: object) -> dict[str, object]:
+        starts.append(kwargs.get("start_weights"))
+        return {}
+
+    def no_components(*_: object) -> list[Component]:
+        return []
+
+    base = ["--source", "s", "--config", "c", "--pin", "p", "--out", str(tmp_path / "o"),
+            "--data", "d", "--finalization", "f", "--tokenizer", "t", "--depth-cost", "0.5",
+            "--updates", "3", "--device", "cpu"]  # fmt: skip
+    with (
+        patch.object(halting_text, "resumed_components", no_components),
+        patch.object(halting_text, "run", capture),
+    ):
+        assert halting_text.main(base) == 0
+        pair = ["--start-weights", "w.pt", "--start-weights-sha256", "a" * 64]
+        assert halting_text.main([*base, *pair]) == 0
+        assert halting_text.main([*base, "--start-weights", "w.pt"]) == 1
+        assert halting_text.main([*base, "--start-weights-sha256", "a" * 64]) == 1
+    assert starts == [None, (Path("w.pt"), "a" * 64)]

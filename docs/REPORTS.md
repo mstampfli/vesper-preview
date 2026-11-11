@@ -7,6 +7,68 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-11, 08:39Z: big updates fixed the drift; stopping helps only a little; memory can be trained
+
+Eight days of experiments, 11-03 to 11-11, all on the development card, one or two seeds each,
+on reused validation. None of them is reviewed by the second maintainer yet (they were blocked
+from 11-06 to 11-11 by a session restart after a machine crash). Numbers are nats per token.
+
+**The drift was the update size.** Every joint run since 10-28 made the model worse the longer it
+trained. A dense-only control drifted the same way, so the stopping objective was not the cause.
+Large updates (64 rows per step instead of 4) fixed it: continuing the final days model with
+large updates lowers the loss on unseen text by about 0.15 at every depth (two seeds), where the
+small-update recipe raised it by 0.13. Small updates at a higher rate raised it by 0.67.
+
+**The best model so far is two-stage**: continue with large updates, then train the stopping
+rule on the frozen result. Its rule stops after 2.6 passes on average and is 0.16 below the
+original model's best fixed-depth mixture at that budget (repeated over two backbone seeds and
+two rule seeds). Almost all of that is the better backbone: the rule beats its OWN model's
+fixed depths by only 0.002 to 0.005, and its own fixed depth 3 (3.188) is better than the rule
+(3.208), just at 0.4 more passes.
+
+**Joint training adds nothing measurable yet.** Training the rule and the model together with
+large updates no longer drifts, but at matched inputs it ends level with the two-stage path
+(within 0.0005) or behind it (by up to 0.008) at about three times the training cost, from the final
+checkpoint and from an earlier one (step 237223). A run with a doubled depth price is training
+now and ends this afternoon.
+
+**Memory can be trained, but not far.** Mixing synthetic "remember this fact" episodes into
+training, with the learning signal allowed to cross 4 text chunks, makes the model's recall of
+a fact 1,000 tokens later about 3.3 times stronger than without (repeated at a second seed).
+At 16,000 tokens it is still weak (the right answer is the top choice about 18 % of the time).
+Half the episodes keep about a third of the gain. Episodes with longer gaps (to 7,000 tokens) lost
+almost all of it; a run with twice the training, to separate amount from difficulty, follows.
+The cost on ordinary text is about 0.003-0.004 nats.
+
+**What it means.** Better training helped far more than adaptive stopping. The stopping itself is
+real but small, and these pass counts are logical: the code still runs every pass. On 10-29 a
+version that really skips passes was slower than plain fixed depth 3 and no better. So the
+claim "adaptive depth saves compute" is not demonstrated on text at this size.
+
+**Next.** The decisive test: real wall-clock time of the stopping rule against fixed depths 2
+and 3 on this best model (queued right after the running job). If fixed depth still wins, the
+honest conclusion is that adaptive depth has no practical case at 64M parameters, and the only
+remaining question is whether it grows with model size or training, which needs a costed
+proposal. Code of the period: `--chunks-per-step`/`--credit-across-chunks`, `--recall-mix`,
+`--cold-rows`, `--init-weights`, `--start-weights`, `--parts` (update accumulation), the one-cast
+memory fix (and `--keep-start-head`, on its own branch, not yet in this snapshot); details in the
+registry and the channel exports.
+
+## 2026-11-03, 08:50Z: original-model anchor available for testing
+
+Joint text training can now compare each dense depth with a frozen original
+through a separate distillation loss. The student shares its dense
+forward between label loss and retention; the original is a frozen independent
+copy. Zero weight preserves prior training, and validation can report per-depth
+KL beside NLL for both the dense-only control and the anchored model.
+
+The CPU checks compare full distributions, gradients, teacher isolation and a
+complete small saved run. CUDA execution and full-model memory/time measurement
+remain pending, as does independent review; no learning improvement is claimed.
+Next is the bounded dense-only comparison with and without the anchor, followed
+by the joint line. Details: `docs/reviews/2026-11-03-distillation-anchor.md`,
+`tests/test_distillation.py`, `tests/test_distillation_graph.py`.
+
 ## 2026-10-31, 14:53Z: check training supply before launching
 
 A new explicit counter saves each component's finite training-token supply after the actual

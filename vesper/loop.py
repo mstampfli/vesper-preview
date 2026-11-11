@@ -555,6 +555,11 @@ class SampledRule:
     inactive tokens contribute exactly zero; ``decisions [b, n]`` counts the decisions made.
     Not the deployed policy: a floor of zero still samples (``CdfRule`` is the deterministic
     one). One rule object serves one forward (``begin`` resets its record).
+
+    ``detach_features`` makes the head read the passes' outputs detached, so ``log_prob``'s
+    graph reaches the head's parameters only: a score term built on it gives the backbone no
+    credit for the decisions. Every decision and value is unchanged (the head's output is only
+    sampled from); off, the default, is every earlier run.
     """
 
     def __init__(
@@ -563,12 +568,15 @@ class SampledRule:
         epsilon: float | Tensor,
         uniforms: Tensor,
         deciding: Tensor,
+        *,
+        detach_features: bool = False,
     ) -> None:
         """Keep the policy's parts; nothing is checked until ``begin`` knows the forward."""
         self.head: HaltingHead = head
         self.epsilon: float | Tensor = epsilon
         self.uniforms: Tensor = uniforms
         self.deciding: Tensor = deciding
+        self.detach_features: bool = detach_features
         self.log_prob: Tensor | None = None
         self.decisions: Tensor | None = None
 
@@ -601,7 +609,8 @@ class SampledRule:
             if last:  # the forced exit: no decision, no log-probability
                 halts = active
                 return halts, halts.to(dtype)
-            z = self.head.logit(h, t).to(torch.float64) + baseline[t]
+            features = h.detach() if self.detach_features else h
+            z = self.head.logit(features, t).to(torch.float64) + baseline[t]
             log_stop, log_continue = floored_stop_log_probs(z, self.epsilon)
             deciders = active & deciding
             stop = active & (uniforms[t] < log_stop.detach().exp())

@@ -16,10 +16,18 @@ carried the fact: stacked columns and passes relay through attention further tha
 Attributing recall to a component needs its own ablation or a receptive-field bound. A failure
 does not show that the model's memory does nothing on text either.
 
-Design and review: maintainer B 85543e6 (channel), maintainer A 2bb7b3a.
+The ablation (``score_batch(..., cut=...)``): the prefix is split where the fact ends and the
+state there is cut before the filler runs: ``recurrent`` makes every column's recurrent states
+and key histories cold (the attention windows keep the fact), ``window`` empties the windows
+(the recurrent state keeps it), ``both`` does both (nothing of the fact survives), ``split``
+cuts nothing (the control for the split itself). Neither single cut is a clean causal split:
+the two paths interact, and an emptied window is itself out of distribution.
+
+Design and review: maintainer B 85543e6 (channel), maintainer A 2bb7b3a; the cut: maintainer A
+4dcd823.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -27,13 +35,15 @@ from torch import Tensor
 
 from vesper.column import ColumnState, state_tensors
 from vesper.data import Chunk
-from vesper.evals import run_carried
+from vesper.evals import PassFn, run_carried
 from vesper.graphs import SignatureGraph
 from vesper.loop import DenseRule
 from vesper.model import Vesper
 
 MIN_CANDIDATES = 2  # a rank among fewer than two values says nothing
 KEY_OCCURRENCES = 2  # once in the fact, once in the query
+CUTTING: tuple[str, ...] = ("split", "recurrent", "window", "both")  # cut_states' names
+CUTS: tuple[str, ...] = ("none", *CUTTING)  # what score_batch's cut may name
 
 
 @dataclass(frozen=True)
@@ -193,6 +203,7 @@ class RecallGraphs:
     first: SignatureGraph = field(default_factory=SignatureGraph)
     carried: SignatureGraph = field(default_factory=SignatureGraph)
     final: SignatureGraph = field(default_factory=SignatureGraph)
+    resumed: SignatureGraph = field(default_factory=SignatureGraph)  # first chunk after a cut
     bound: tuple[Vesper, int] | None = None
 
     def bind(self, model: Vesper, passes: int) -> None:
@@ -212,8 +223,100 @@ class RecallGraphs:
 
     def counts(self) -> dict[str, list[int]]:
         """Each graph's ``[eager, captures, replays]``, measured, never assumed."""
-        graphs = {"first": self.first, "carried": self.carried, "final": self.final}
+        graphs = {
+            "first": self.first,
+            "carried": self.carried,
+            "final": self.final,
+            "resumed": self.resumed,
+        }
         return {name: [g.eager, g.captures, g.replays] for name, g in graphs.items()}
+
+
+def cut_states(model: Vesper, states: Sequence[ColumnState], cut: str) -> list[ColumnState]:
+    """``states`` with the fields ``cut`` names replaced by the model's own cold values.
+
+    ``recurrent``: every pass's recurrent state and key history; ``window``: every pass's
+    attention window (empty); ``both``: all three; ``split``: nothing. The cold values come from
+    ``model.init_states`` (the same definition a document start uses), on the states' device.
+
+    Raises:
+        ValueError: on ``none`` or any other name (``none`` never splits, so it never cuts).
+    """
+    if cut not in CUTTING:
+        msg = f"cut must be one of {CUTTING}, got {cut!r}"
+        raise ValueError(msg)
+    b = int(states[0].h[0].shape[0])
+    window_dtype = states[0].kv[0].k.dtype  # the activation dtype the windows were written in
+    cold = model.init_states(b, window_dtype, states[0].h[0].device)
+    recurrent, window = cut in {"recurrent", "both"}, cut in {"window", "both"}
+    return [
+        ColumnState(
+            h=c.h if recurrent else s.h,
+            kv=c.kv if window else s.kv,
+            key_history=c.key_history if recurrent else s.key_history,
+        )
+        for s, c in zip(states, cold, strict=True)
+    ]
+
+
+def _cut_prefix(
+    model: Vesper,
+    episodes: Sequence[Episode],
+    chunks: Callable[[int, int], list[Chunk]],
+    advance: PassFn,
+    graphs: RecallGraphs | None,
+    cut: str,
+) -> list[ColumnState]:
+    """The states at the query after the fact, the cut at its end, and the filler."""
+    fact_end, query = episodes[0].fact[1], episodes[0].query
+    if any(e.fact[1] != fact_end for e in episodes):
+        msg = "every episode of a cut batch must end its fact at the same index"
+        raise ValueError(msg)
+    if query <= fact_end:
+        msg = "a cut needs at least one filler token between the fact and the query"
+        raise ValueError(msg)
+    fact, filler = chunks(0, fact_end), chunks(fact_end, query)
+    if graphs is not None:
+        window = model.shape.window
+        kept = 0 if cut in {"window", "both"} else min(fact_end, window)
+        filling = len(filler) > 1 and kept + filler[0].tokens.shape[1] < window
+        if len(fact) > 1 or filling:
+            msg = (
+                "with graphs, the fact must fit one chunk and the filler's first chunk must fill"
+                " the window before the next: otherwise one graph would see two signatures"
+            )
+            raise ValueError(msg)
+    first_graph = None if graphs is None else graphs.first
+    carried_graph = None if graphs is None else graphs.carried
+    resumed_graph = None if graphs is None else graphs.resumed
+    _, at_fact = run_carried(model, fact, carried_graph, 0, advance, first=first_graph)
+    state = cut_states(model, at_fact, cut)
+    _, state = run_carried(model, filler[:1], resumed_graph, 0, advance, first=None, initial=state)
+    if len(filler) > 1:
+        _, state = run_carried(
+            model, filler[1:], carried_graph, 0, advance, first=None, initial=state
+        )
+    return state
+
+
+def _batch_shape(episodes: Sequence[Episode], final: int, cut: str) -> tuple[int, int, int, int]:
+    """``(prefix length, query index, K, c)`` shared by the batch, or the refusal."""
+    if not episodes:
+        msg = "score_batch needs at least one episode"
+        raise ValueError(msg)
+    if cut not in CUTS:
+        msg = f"cut must be one of {CUTS}, got {cut!r}"
+        raise ValueError(msg)
+    head = episodes[0]
+    shape = (head.tokens.numel(), head.query, tuple(head.candidates.shape))
+    if any((e.tokens.numel(), e.query, tuple(e.candidates.shape)) != shape for e in episodes):
+        msg = "every episode of a batch must share prefix length, query index and candidate shape"
+        raise ValueError(msg)
+    length, query, (k, c) = shape
+    if length - query + c > final:
+        msg = f"query ({length - query}) plus candidate ({c}) exceed the final segment ({final})"
+        raise ValueError(msg)
+    return length, query, k, c
 
 
 def score_batch(
@@ -224,6 +327,7 @@ def score_batch(
     final: int,
     passes: int,
     graphs: RecallGraphs | None,
+    cut: str = "none",
 ) -> Tensor:
     """``float64 [b, K]``: every candidate's summed log-probability, one row per episode.
 
@@ -234,25 +338,21 @@ def score_batch(
     minus the summed loss of the positions that predict its tokens (the query's last position
     predicts the first). Positions are the stream's own, consecutive from 0.
 
+    Any ``cut`` but ``none`` splits the prefix where the fact ends (the episodes must share that
+    point), cuts the state there (``cut_states``) and carries on through the filler: the fact
+    under ``graphs.first``, the filler's first chunk under ``graphs.resumed``, the rest under
+    ``graphs.carried``. A fresh ``RecallGraphs`` per cut: the cut changes the states' shapes.
+
     Raises:
-        ValueError: on no episodes, episodes of different layouts, a query plus candidate
-            longer than ``final``, or ``graphs`` bound to another model or depth.
+        ValueError: on no episodes, episodes of different layouts or fact ends under a cut, an
+            unknown cut, a query plus candidate longer than ``final``, ``graphs`` bound to
+            another model or depth, or (with graphs) a filler whose second chunk would meet a
+            window still filling, which one graph cannot hold.
     """
-    if not episodes:
-        msg = "score_batch needs at least one episode"
-        raise ValueError(msg)
+    length, query, k, c = _batch_shape(episodes, final, cut)
     if graphs is not None:
         graphs.bind(model, passes)
-    head = episodes[0]
-    shape = (head.tokens.numel(), head.query, tuple(head.candidates.shape))
-    if any((e.tokens.numel(), e.query, tuple(e.candidates.shape)) != shape for e in episodes):
-        msg = "every episode of a batch must share prefix length, query index and candidate shape"
-        raise ValueError(msg)
-    length, query, (k, c) = shape
     q = length - query
-    if q + c > final:
-        msg = f"query ({q}) plus candidate ({c}) exceed the final segment ({final})"
-        raise ValueError(msg)
     b = len(episodes)
     rows = torch.stack([e.tokens for e in episodes])  # [b, P]
     zeros = torch.zeros(b, 1, dtype=torch.int32)
@@ -261,22 +361,25 @@ def score_batch(
         result = model.run(inputs[0], inputs[1], states, passes=passes, exit_rule=DenseRule())
         return state_tensors(result.states)
 
-    prefix: list[Chunk] = []
-    start = 0
-    for n in layout(query, chunk):
-        tokens = rows[:, start : start + n].contiguous()
-        pos = torch.arange(start, start + n, dtype=torch.int64).expand(b, n).contiguous()
-        none = torch.zeros(b, n, dtype=torch.bool)
-        prefix.append(_chunk(tokens, pos, torch.zeros_like(tokens), ~none, none))
-        start += n
-    _, saved = run_carried(
-        model,
-        prefix,
-        None if graphs is None else graphs.carried,
-        0,
-        advance,
-        first=None if graphs is None else graphs.first,
-    )
+    def chunks(begin: int, end: int) -> list[Chunk]:
+        out: list[Chunk] = []
+        start = begin
+        for n in layout(end - begin, chunk):
+            tokens = rows[:, start : start + n].contiguous()
+            pos = torch.arange(start, start + n, dtype=torch.int64).expand(b, n).contiguous()
+            none = torch.zeros(b, n, dtype=torch.bool)
+            out.append(_chunk(tokens, pos, torch.zeros_like(tokens), ~none, none))
+            start += n
+        return out
+
+    first_graph = None if graphs is None else graphs.first
+    carried_graph = None if graphs is None else graphs.carried
+    if cut == "none":
+        _, saved = run_carried(
+            model, chunks(0, query), carried_graph, 0, advance, first=first_graph
+        )
+    else:
+        saved = _cut_prefix(model, episodes, chunks, advance, graphs, cut)
 
     def score(inputs: Sequence[Tensor], states: list[ColumnState]) -> list[Tensor]:
         result = model.run(inputs[0], inputs[1], states, passes=passes, exit_rule=DenseRule())
