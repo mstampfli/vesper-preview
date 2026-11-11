@@ -7,6 +7,29 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-11, 19:54Z: memory: more recall training stops helping after a point
+
+Not yet reviewed by the second maintainer. One seed per point (a second seed is running).
+
+The short-gap recall training from the entries above, at three amounts of training episodes
+(recall strength after a gap, higher is better; top choice correct in brackets):
+
+    episode tokens        1,000 tokens   4,000 tokens   16,000 tokens
+    none                  2.01 (38 %)    0.73 (21 %)    0.14 (12 %)
+    58 thousand           3.73 (54 %)    1.46 (23 %)    0.33 (13 %)
+    112 thousand          6.51 (74 %)    2.75 (35 %)    0.74 (21 %)
+    227 thousand          6.47 (74 %)    2.85 (34 %)    0.69 (16 %)
+
+**What it means.** Recall grows with training up to about 112 thousand episode tokens, then stops:
+twice as many give the same result (the differences are smaller than the spread between two
+seeds measured earlier). So, like adaptive stopping, the memory hits a limit at this model size
+that more training on this recipe does not move. What limits it, how much the recurrent state
+can hold, is a design question, not a training setting.
+
+**Next.** A second seed of the last row runs tonight to put an error bar on "it stops". Then the
+design question: measure how much the state holds (several facts at once, at different gaps)
+before changing anything, so a redesign aims at the real limit.
+
 ## 2026-11-11, 17:04Z: memory: training on longer gaps does not teach longer recall
 
 Not yet reviewed by the second maintainer. One seed.
