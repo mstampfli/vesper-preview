@@ -7,6 +7,32 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-11, 17:04Z: memory: training on longer gaps does not teach longer recall
+
+Not yet reviewed by the second maintainer. One seed.
+
+This morning's entry said episodes with gaps up to 7,000 tokens lost almost all of the recall
+gain, but those runs also saw half as many episodes. B6 trained on the long gaps with the full
+number of episodes (111,134 episode tokens, against 112,148 for the short-gap run). How strongly
+the model points to the right answer after a gap (higher is better), and how often it is the
+model's top choice:
+
+                               1,000 tokens   4,000 tokens   16,000 tokens
+    no episodes                2.01 (38 %)    0.73 (21 %)    0.14 (12 %)
+    short gaps (to 3,072)      6.51 (74 %)    2.75 (35 %)    0.74 (21 %)
+    long gaps (to 7,000)       5.14 (65 %)    2.04 (29 %)    0.46 (11 %)
+
+**What it means.** With enough episodes, long gaps recover most of the gain (54-70 % of the
+short-gap run's), so the earlier collapse was mainly too few episodes. But long-gap training
+is worse at every distance, including 16,000 tokens, which is further than either trained:
+teaching the model longer gaps does not make it remember further. Short episodes are the better
+signal per token.
+
+**Next (running now, ends about 20:10Z).** The short-gap recipe trained twice as long, about
+twice the episodes: does recall at 4,000 and 16,000 tokens keep rising with more training? If
+it does, the lever is more training; if it stays flat, the memory's capacity at this size is the
+limit, which is a design question rather than a training one.
+
 ## 2026-11-11, 14:06Z: on our best model, fixed depth 3 is faster and better than adaptive stopping
 
 The decisive test announced this morning, run on the development card on the best model so far
