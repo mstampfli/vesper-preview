@@ -7,6 +7,52 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-12, 10:22Z: memory: a memory written by few words keeps a fact 10 to 40 times longer
+
+Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
+
+Before building the separate memory named in the entry below, replayed the memory's arithmetic
+with only some words allowed to write. When only the 2 % most surprising words write, a fact keeps
+a third to three quarters of its strength after 1000 words and 17 to 59 % after 4000; as the model
+is, it keeps 0.4 to 6 % after 4000, so 10 to 40 times more, and the gap grows with distance. What
+matters is how FEW words write, not which: letting the least surprising tenth write instead of the
+most surprising tenth leaves about the same. Surprising words do a bit more of the erasing than
+their share (the top tenth 15 to 30 %), but not most of it. Both models behave the same. As before,
+this is a replay of the storage, not a trained model.
+
+**What it means.** The separate memory needs a write gate that opens rarely, and opens for facts;
+surprise is one such gate because a planted fact is surprising. Being built now as an experiment:
+extra memory heads whose gate starts almost closed and whose output starts at exactly zero, so the
+model starts identical to today's and training decides what to write there. It runs on this
+machine at no cost; whether it becomes part of Vesper is your decision.
+
+Details: export sparse-write-70664fc.
+
+## 2026-11-12, 10:07Z: memory: spreading the keys out would make forgetting worse; the fix has to be a separate place
+
+Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
+
+Before building the fix named in the entry below (spread the memory's keys over more directions),
+checked whether it could work. The keys turn out to be tightly packed: in the first column almost
+every word writes along the same two to four of 64 directions, and a stored fact sits in those same
+busy directions, which is why later text erases it. Replaying the same text with the keys spread
+out evenly (or with the busiest directions removed) leaves LESS of the fact after 1000 words in 19
+of 20 places, often several times less: the packing is what protects the rest of the memory, and
+spreading it spreads the damage everywhere. Moving only the fact out of the busy directions, with
+the rest of the text unchanged, keeps 2 to 8 times more of it, but still not all of it, because the
+quiet directions get some writes too. Both models behave the same. This is a replay of the memory's
+arithmetic, not a trained model, so it says what each change would do to storage, not whether the
+model could still read it.
+
+**What it means.** The "spread the keys" fix from the entry below is dropped before anything was
+built: it predicts faster forgetting. What the numbers point to instead is a separate place that
+ordinary text cannot write to at all: a second, slow memory written only at surprising words, the
+kind a planted fact is. It can start as an exact copy of the current model (the new part reads as
+zero at first) and be trained on this machine at no cost; it changes the architecture, so you
+decide before it becomes part of Vesper. Next: its design, then a trial run.
+
+Details: export key-spectrum-70664fc.
+
 ## 2026-11-12, 09:29Z: memory: facts are erased by text that lands on the same "addresses"
 
 Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
