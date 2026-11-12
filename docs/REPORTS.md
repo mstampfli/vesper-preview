@@ -7,6 +7,51 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-12, 07:01Z: memory: the limit is how fast a fact fades with distance, not how many fit
+
+Not yet reviewed by the second maintainer. Measurements on the existing models only, no training,
+except a repeat of the last training run at a second seed.
+
+**The repeat.** The 227-thousand-token row of the entry below, trained again with another seed:
+6.39 / 2.85 / 0.60 at 1,000 / 4,000 / 16,000 tokens (first seed 6.47 / 2.85 / 0.69). The plateau
+holds: more of this training does not help.
+
+**How many facts fit.** Several facts planted one after another, then one of them asked for after
+1,000 or 4,000 tokens of other text (recall strength per fact, higher is better):
+
+    facts at once                  1      2      4      8
+    trained model, 1,000 tokens    6.47   6.21   5.24   4.28
+    trained model, 4,000 tokens    2.85   2.63   2.11   1.65
+    untrained model, 1,000 tokens  2.01   1.92   1.67   1.40
+    untrained model, 4,000 tokens  0.73   0.68   0.58   0.47
+
+Each fact gets somewhat weaker with more facts, by about the same share in the model never trained
+on recall, and far less than in proportion: eight facts together carry about five times what one
+does. So one fact does not fill the memory. The entry below guessed that the memory's size was the
+limit; this says it is not.
+
+**How a fact fades.** One fact, asked for after more and more text:
+
+    tokens later        1,000  2,000  3,000  4,000  6,000  8,000  12,000  16,000
+    trained model       6.47   4.39   3.35   2.85   1.93   1.51   0.99    0.69
+    untrained model     2.01   1.28   0.94   0.73   0.48   0.34   0.21    0.14
+
+Each doubling of the distance keeps roughly half of what was left (about two thirds early, under
+half late). There is no sudden cut-off. Recall training slows the fading, and its lead grows with
+distance (3 times the untrained model at 1,000 tokens, almost 5 times at 16,000).
+
+**What it means.** The memory's reach is set by how much of a fact survives each doubling of the
+distance, about half. Training the memory helps, but does not change that pattern. Reaching further
+needs a design change that protects a stored fact from later text, not more training or a bigger
+memory.
+
+**Next.** A written design question: candidate ways to protect a stored fact (for example storing
+only surprising text, or memory slots that fade more slowly), what each predicts for the
+"half per doubling" number, and its cost. Reviewed before anything is built; anything that needs a
+bigger model or a new architecture goes to you first.
+
+Details: export memory-capacity-70664fc (both measurements, their exact checks, the runner).
+
 ## 2026-11-11, 19:54Z: memory: more recall training stops helping after a point
 
 Not yet reviewed by the second maintainer. One seed per point (a second seed is running).
