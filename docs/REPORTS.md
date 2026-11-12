@@ -7,6 +7,37 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-12, 18:16Z: memory: the first separate-memory test could not open its gate; the next one starts tonight
+
+Not yet reviewed by the second maintainer. Two training runs on this machine, no cost.
+
+The separate memory from the entry below was built and trained: four extra memory heads beside
+the ordinary ones, their write gate starting almost closed and their output starting at exactly
+zero, so the model began identical to B7 (checked: the same output to the last digit). One run
+continued B7 with these heads (B10), one continued B7 the same way without them (B11), the fair
+comparison. Result: no difference. Recall of a fact after 1000 / 4000 / 16000 words: 6.17 / 2.83 /
+0.77 with the extra heads, 6.19 / 2.80 / 0.75 without, far inside the difference between two seeds
+of the same run. Measured at eight distances from 1000 to 16000 words, the two curves lie on top of
+each other; both fade a little more slowly than B7's did, which is the extra training, not the heads.
+
+The reason is in the heads themselves: their gate never opened. After training it lets through
+0.02 to 0.26 % of a write, no more at the fact than on ordinary text, and its setting moved by 0.04
+where opening needed several units. Two design mistakes of mine: (1) an almost closed start cannot
+open in a run this short, because the optimizer moves each setting only a small step per update;
+the zero output alone already made the start identical, the closed gate was not needed for that;
+(2) the training facts sat at most about 3000 words before their question, a distance the ordinary
+memory already covers, so nothing rewarded a slower store.
+
+**What it means.** The question "does a separate, rarely written memory keep facts longer" is still
+open: this run could not answer it. The next run started tonight fixes both mistakes: the gate
+starts where training can move it (letting through about 5 %), and the training facts sit 600 to
+7000 words before their question, where the ordinary memory weakens. It is again compared with the
+same run without the extra heads. Results tomorrow morning. Building it also turned up two bugs of
+mine, each caught by the checks before it cost a run (a test that had never run on the graphics
+card, and the new parameters missing a setting the trainer requires); both fixed with tests.
+
+Details: exports slow-heads-b10-b11-6ceb7a2 and code-evidence-1e719da-6ceb7a2.
+
 ## 2026-11-12, 10:22Z: memory: a memory written by few words keeps a fact 10 to 40 times longer
 
 Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
