@@ -7,6 +7,30 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-12, 07:32Z: memory: training made the model read facts better, not keep them longer
+
+Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
+
+Looked directly inside the memory: how much of a planted fact is still in the recurrent state
+after more and more text (share of what was written, both models):
+
+    tokens later        1,000   2,000   4,000   8,000   16,000
+    trained model       42 %    31 %    21 %    14 %    10 %
+    untrained model     42 %    31 %    21 %    14 %    10 %
+
+**What it means.** The state keeps a fact equally long whether or not the model was trained on
+recall; training writes a little more of it (about 7 %) and, above all, reads it back much better
+(3 to 5 times the recall strength). So the fading itself is a property of how the memory is built.
+Inside the state, most of a fact lands in the parts that lose it fastest (in one of the two layers
+of memory only 3 % is left after 16,000 tokens), while other parts keep a third or more of what they
+received. Reaching further therefore needs a change in where facts are stored and how those places
+are overwritten, which is an architecture question; more training will not do it.
+
+**Next.** A costed proposal for that change (what each option should do to the numbers above),
+reviewed before anything is built and brought to you first if it changes the architecture.
+
+Details: export state-retention-70664fc.
+
 ## 2026-11-12, 07:01Z: memory: the limit is how fast a fact fades with distance, not how many fit
 
 Not yet reviewed by the second maintainer. Measurements on the existing models only, no training,
