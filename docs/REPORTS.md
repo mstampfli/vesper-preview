@@ -7,6 +7,50 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-12, 09:29Z: memory: facts are erased by text that lands on the same "addresses"
+
+Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
+
+The memory stores each fact under a direction (a key). Recorded every write the model makes while
+reading text after a fact, and asked which writes remove the fact. In the first passes through the
+memory, the loss is almost entirely explained by later text written under keys that point along the fact's
+own direction: those keys line up with it 2 to 16 times more often than random directions would,
+and a tenth of the words do most of the damage. How strongly a word is written matters much less
+than where it is written, which is why the surprise signal (entry below) did not help. The deepest
+passes keep a fact longer for a different reason: they keep rewriting it from what the earlier
+passes still hold. Both models (recall-trained and not) behave the same.
+
+**What it means.** Facts fade because different text collides in the same memory directions. The
+fix to try is architectural: make the memory spread its keys over more directions so unrelated text
+collides less. A version of that can start as an exact copy of the current model and be trained
+further on this machine, so it costs no money; it is being discussed before anything is built.
+
+Details: export erasure-70664fc.
+
+## 2026-11-12, 09:15Z: memory: the design's built-in "write unsurprising text weaker" does not help
+
+Not yet reviewed by the second maintainer. A measurement on the trained model, no training.
+
+The design always included a surprise signal: text the model finds predictable should be written
+into memory more weakly, so it overwrites less. The code for it existed but was never switched on
+in any run. Switched on for this measurement (half and full strength), on the recall-trained model:
+
+    share of a fact still in memory   1,000   2,000   4,000   8,000 tokens later
+    signal off                        40 %    29 %    18 %    11 %
+    half strength                     40 %    28 %    18 %    11 %
+    full strength                     43 %    30 %    19 %    11 %
+
+**What it means.** The signal makes the fact itself be written harder (it is surprising text, up to
+about 13 % more), but it does not slow the fading: after 8,000 tokens the same share is left. So the
+fading is not caused by how strongly ordinary text is written. One limit: this model was never
+trained with the signal on; a model trained with it might use it differently, but there is no sign
+here that it would reach further.
+
+**Next.** Measure which writes actually erase a stored fact (inside each part of the memory), then
+bring the architecture question to you with numbers: where facts should be stored, and how.
+
+Details: export modulated-write-a0-70664fc.
+
 ## 2026-11-12, 07:32Z: memory: training made the model read facts better, not keep them longer
 
 Not yet reviewed by the second maintainer. A measurement on the existing models, no training.
