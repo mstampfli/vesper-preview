@@ -7,6 +7,29 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-13, 18:10Z: memory: more long-gap training lowered recall in one run; two checks run tonight
+
+This result is not yet reviewed by the second maintainer. No rental was used.
+
+B15 continued B13 (the best long-gap memory run so far) with another round of the same long-gap
+training, at a new seed. The question was whether far recall keeps rising with more of that training.
+It did not. The mean fact-swap contrast at gaps of 1000 / 4000 / 16000 tokens is 4.898 / 2.322 / 0.686
+for B15, against 6.508 / 2.952 / 0.781 and 6.842 / 3.115 / 0.931 for B13's two seeds. On the eight-gap
+recall curve (1000 to 16000 tokens), B15 is below both B13 seeds at every measured gap, and below B7,
+the run before B13, at every measured gap too (at 16000 only by 0.005). It is not below them at the shortest probe gap (128 tokens). How fast a
+fact fades per doubling of the distance did not get worse; what fell is the level, most at short
+distance.
+
+**What it means.** The answer to "does more long-gap training keep helping at this size?" is no for
+this recipe, from one seed. Two checks run tonight on the card: B15's command at another seed (is
+the drop real or chance?), and B15's command at the low, constant learning rate B13 ended with (each
+continuation restarts the rate schedule from its peak; did that restart cost the recall?). If both
+stay low, the training levers for memory at this model size look spent, and the next memory question
+needs either a larger model (a rental, your decision) or a new mechanism; I will write that proposal
+in the morning with tonight's numbers.
+
+Details: export long-gap-b15-2c8e2f1.
+
 ## 2026-11-13, 14:23Z: memory: stop the separate-store trials at this size; continue the long-gap comparison
 
 The complete new experiment evidence is not yet independently reviewed. The second maintainer has
