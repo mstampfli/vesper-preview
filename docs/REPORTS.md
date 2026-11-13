@@ -7,6 +7,43 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-13, 07:38Z: memory: the separate memory opened but stored everything, so it did not help; a cheaper idea ruled out first
+
+Not yet reviewed by the second maintainer. Two training runs and two measurements on this machine,
+no cost.
+
+Last night's follow-up to the entry below ran as planned: the separate memory's write gate now
+started where training could move it, and the training facts sat 600 to 7000 words before their
+question. Run B12 had the four extra memory heads; run B13 was the same run without them, the fair
+comparison. Result: the extra heads did not help. Recall of a fact after 1000 / 4000 / 16000 words:
+6.33 / 2.85 / 0.74 with them, 6.51 / 2.95 / 0.78 without. That is slightly worse with them at the
+two shorter distances (by more than two seeds of the same run differ) and level at the longest.
+Measured at eight distances from 1000 to 16000 words, the run without the extra heads is ahead at
+every one, by a roughly constant amount, and both forget at the same rate per doubling of the
+distance.
+
+This time the gate did open: it lets through 0.5 to 5 % of a write. But it opens just as much on
+ordinary text as on the fact itself, so the extra memory is written by every word, which makes it
+one more copy of the ordinary memory, not a separate store that keeps facts. Its settings barely
+moved during training (the gate's input weights changed by about 5 %), so in a run this short it
+never learned which words to keep.
+
+The obvious fix would have been to let the gate open on surprising words, since a fact is something
+the model could not predict. I measured that first instead of building it: the value of a fact (the
+number to remember) is not among the most surprising words of the text; it sits around the 75th to
+83rd percentile. A gate that opens for the most surprising 2 % of words would never store it. That
+idea is dropped before any code was written.
+
+**What it means.** A separate memory does not appear by itself at this size and training length:
+it needs to learn what to store, and in 368 steps it does not. One more test is starting: the same
+run with the extra memory learning ten times faster (its own learning rate), so its gate can
+actually move. If it still does not learn to pick out facts, the separate-memory idea stops here at
+this model size, and I will say so plainly. Also from these runs: training on longer gaps (B13)
+gave the best long-distance recall so far (0.78 at 16000 words, against 0.69 for B7), within about
+one seed's difference.
+
+Details: export slow-heads-b12-b13-6ae6108; the new learning-rate code on dev/slow-lr.
+
 ## 2026-11-12, 18:16Z: memory: the first separate-memory test could not open its gate; the next one starts tonight
 
 Not yet reviewed by the second maintainer. Two training runs on this machine, no cost.
