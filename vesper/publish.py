@@ -9,6 +9,7 @@ a partial named by destination and pid let a nested call delete the outer call's
 published a crashed run's leftover).
 """
 
+import errno
 import os
 import shutil
 import stat
@@ -89,13 +90,22 @@ def publish(partial: Path, final: Path) -> None:
 
     Raises:
         ValueError: when nothing exists at ``partial``.
-        OSError: when the rename cannot be done in one step (another filesystem, a non-empty
-            directory at ``final``).
+        FileExistsError: when a non-empty directory is at ``final``. rename(2) reports that as
+            EEXIST or ENOTEMPTY depending on the filesystem (this box's overlay gives the first,
+            GitHub's runner the second); callers see one error either way.
+        OSError: when the rename cannot be done in one step for another reason (another
+            filesystem).
     """
     if not partial.exists() and not partial.is_symlink():
         msg = f"{partial}: nothing was written there, nothing to publish at {final}"
         raise ValueError(msg)
-    _ = partial.replace(final)
+    try:
+        _ = partial.replace(final)
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            msg = "a non-empty directory is there"
+            raise FileExistsError(errno.EEXIST, msg, str(final)) from exc
+        raise
 
 
 def contained(path: Path, inside: Path) -> None:

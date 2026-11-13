@@ -7,6 +7,46 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-13, 14:23Z: memory: stop the separate-store trials at this size; continue the long-gap comparison
+
+The complete new experiment evidence is not yet independently reviewed. The second maintainer has
+checked the selected summary arithmetic and the wording below. No new rental was used.
+
+B14 gave the extra memory heads ten times the learning rate of B12. Their parameters moved, but the
+small CPU gate diagnostic still shows low absolute write strengths. One location writes the fact
+about 33 times more strongly than ordinary text, at about 0.00036; two other locations have smaller
+relative preferences too. Most locations do not prefer the fact.
+
+The reported mean fact-swap score contrast at gaps of 1000 / 4000 / 16000 tokens is 6.900 / 3.065 /
+0.786 for B14. B13, the continuation without the extra heads, gives 6.508 / 2.952 / 0.781 at seed 3
+and 6.842 / 3.115 / 0.931 at seed 4. B14 is 0.058 above the higher control at 1000, and between them at
+4000 and 16000. Two control seeds show variation; they do not establish that B14's difference was
+caused by chance or that it is a repeatable benefit.
+
+A more direct check switches off the extra heads' readout in the trained B14 checkpoint. The mean
+contrast changes by less than 0.004 at all eight measured gaps. This finds no useful net recall
+contribution from that readout on these probes. It does not establish exact output equality, rule
+out effects on individual examples, or isolate what those heads changed during training.
+
+**What it means.** I stop the planned separate-memory trials at this model size on the lack of a
+clear practical gain. That is a decision about the tested variants and budgets, not proof that a
+learned separate store cannot help. The reported 16000-token mean is 0.856 across B13's two seeds
+versus 0.643 across B7's two seeds. B13 adds long-gap training to B7, so extra training and the changed
+gap recipe travel together in that comparison. B15 is already running: another continuation of
+B13 on long gaps, followed by its recall curve. Its result will inform the next proposal; a plateau
+would not by itself exhaust every memory approach. Any larger rental remains a separate decision.
+
+Also today: the second maintainer accepted the A8x terminal and runtime evidence. On the timed
+seed, fixed three passes per token predicts better and runs faster than the capped learned rule
+(4.147 versus 4.269 seconds per 16 cold chunks). Both agree to park stopping experiments at this
+size. The result measures these implementations; the small logical-depth margin does not bound
+what a future packing implementation could save.
+
+Also today: the directory-publication fix handles both "directory not empty" and "file exists"
+errors, and the new GitHub check is reported green. Its independent source review remains queued.
+
+Details: exports slow-heads-b14-2c8e2f1 and code-evidence-57d4a20; the fix on dev/publish-exists.
+
 ## 2026-11-13, 07:38Z: memory: the separate memory opened but stored everything, so it did not help; a cheaper idea ruled out first
 
 Not yet reviewed by the second maintainer. Two training runs and two measurements on this machine,

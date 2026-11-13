@@ -1,3 +1,5 @@
+import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -82,10 +84,39 @@ def test_a_directory_appears_complete_or_not_at_all(tmp_path: Path) -> None:
         make_directory_then_fail(tmp_path / "step-2")
     assert names(tmp_path) == ["step-1"]  # the staging directory and its content are gone
     # a non-empty directory at the final name is not replaced: the caller checks existence first
-    with pytest.raises(OSError, match="step-1"):
+    with pytest.raises(FileExistsError, match="step-1"):
         make_directory(final, {"x": b"x"})
     assert names(tmp_path) == ["step-1"]
     assert names(final) == ["manifest.json", "model.pt"]
+
+
+@pytest.mark.parametrize("code", [errno.EEXIST, errno.ENOTEMPTY])
+def test_a_non_empty_directory_at_the_destination_is_one_error_on_every_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    # rename(2) reports a non-empty target directory as EEXIST or ENOTEMPTY, by filesystem (this
+    # box's overlay gives the first, GitHub's runner the second): callers see FileExistsError
+    def refused(self: Path, target: Path) -> Path:
+        raise OSError(code, os.strerror(code), str(self), None, str(target))
+
+    monkeypatch.setattr(Path, "replace", refused)
+    with pytest.raises(FileExistsError, match="step-1") as caught:
+        make_directory(tmp_path / "step-1", {"x": b"x"})
+    assert caught.value.errno == errno.EEXIST
+    assert names(tmp_path) == []  # the staging directory is gone, nothing at the final name
+
+
+def test_another_rename_failure_is_not_reported_as_an_existing_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def other_filesystem(self: Path, target: Path) -> Path:
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), str(self), None, str(target))
+
+    monkeypatch.setattr(Path, "replace", other_filesystem)
+    with pytest.raises(OSError, match="cross-device") as caught:
+        make_directory(tmp_path / "step-1", {"x": b"x"})
+    assert not isinstance(caught.value, FileExistsError)
+    assert caught.value.errno == errno.EXDEV
 
 
 def test_calls_on_one_destination_own_their_staging_and_leftovers_are_never_published(
