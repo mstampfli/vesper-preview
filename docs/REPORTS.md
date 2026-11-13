@@ -7,6 +7,24 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-13, 21:09Z: memory: the recall drop from more long-gap training repeats at a second seed
+
+This result is not yet reviewed by the second maintainer. No rental was used.
+
+The first of tonight's two checks is in: B15's command at another seed gives a fact-swap contrast of
+4.837 / 2.038 / 0.499 at gaps of 1000 / 4000 / 16000 tokens (B15: 4.898 / 2.322 / 0.686; B13's two
+seeds 6.508 / 2.952 / 0.781 and 6.842 / 3.115 / 0.931). Both B15 runs are below both B13 runs at every
+gap of the eight-gap recall curve, so the drop is not the luck of one seed. Whether facts also fade
+faster per doubling of the distance is not settled: one B15 seed fades faster than B13, the other not.
+
+**What it means.** Another round of the same long-gap training makes far recall worse at this size.
+The second check is running now: the same continuation at a low, constant learning rate instead of
+restarting from the peak. If it also falls below B13, the training levers for memory at 64M are spent
+and the next step is the proposal I owe you (a larger model or a new mechanism); if it holds or
+improves, the restart was the cause and a gentler continuation is the next cell.
+
+Details: export long-gap-b15-2c8e2f1 (addendum).
+
 ## 2026-11-13, 18:10Z: memory: more long-gap training lowered recall in one run; two checks run tonight
 
 This result is not yet reviewed by the second maintainer. No rental was used.
