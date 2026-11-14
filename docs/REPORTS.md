@@ -7,6 +7,33 @@ capabilities or changes how it works, in simple words to understand quickly"). T
 evidence stays where it is (docs/reviews, the registry, the channel); this file is the summary.
 Each entry: what changed, what it means for you, what is next, where the details are.
 
+## 2026-11-14, 07:01Z: memory: training no longer extends recall at this size
+
+This result is not yet reviewed by the second maintainer. No rental was used.
+
+The second check of last night is in, at two seeds. B16 continued B13 with the same long-gap training as
+B15, but at the low, constant learning rate B13 ended with instead of restarting the schedule from its
+peak. Its mean fact-swap contrast at gaps of 1000 / 4000 / 16000 tokens is 5.596 / 2.713 / 0.840 (seed 5)
+and 5.782 / 2.584 / 0.715 (seed 6). Over both seeds: B16 is above both B15 runs at every gap of the
+eight-gap recall curve, and below both B13 runs from 1000 to 8000 tokens; at 12000 and 16000 only one B16
+seed lies above one B13 seed. The two-seed means are B13 6.675 / 3.033 / 0.856, B16 5.689 / 2.649 / 0.777,
+B15 4.868 / 2.180 / 0.592.
+
+**What it means.** Restarting the rate schedule accounts for about half of B15's drop. The rest, and the
+fact that no continuation beat B13, says more long-gap training past B13 does not raise recall at this
+model size. With the earlier results (more recall practice, longer credit windows, longer gaps, a
+separate slow store), the training levers for memory at 64M are spent; the best run is B13. What limits
+the memory is measured: a stored fact fades by about half each time the distance doubles, because later
+text overwrites it along the same directions in the recurrent state.
+
+**Where this leaves Vesper.** At this size, neither idea that sets Vesper apart has a practical advantage:
+adaptive depth saves no real time (11-11: a fixed three passes was faster and better), and the memory does
+not reach further with training. Two parts of the design were never built or tested: the ledger, a
+key-value store meant to carry facts across 100,000 tokens (spec sections 3c and 5), and a larger model.
+Whether to continue is the project owner's decision; until then no new experiments run.
+
+Details: export long-gap-b15-2c8e2f1 (second addendum).
+
 ## 2026-11-13, 21:09Z: memory: the recall drop from more long-gap training repeats at a second seed
 
 This result is not yet reviewed by the second maintainer. No rental was used.
