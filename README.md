@@ -1,5 +1,11 @@
 # Vesper
 
+> [!WARNING]
+> ## Vesper is dropped.
+>
+> Development stopped because the results were not good enough. The code and notes stay here
+> as a record; nothing will be added or fixed.
+
 A language model that thinks in time instead of depth, learns while it runs, and sleeps to
 remember. A small core (the column) is iterated until a token's answer settles; a fast-weight
 state carries the session; an episodic store (the ledger) holds what fell out of the attention
